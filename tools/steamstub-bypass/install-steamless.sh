@@ -9,21 +9,37 @@
 #   <script dir>/../steamless-bin
 #
 # Usage:
-#   install-steamless.sh [--user-local]
+#   install-steamless.sh                        # next to this script
+#   install-steamless.sh --user-local           # ~/.local/share/SLSsteam/steamless-bin
+#   install-steamless.sh --target <absolute>    # explicit destination
 #
-# Flags:
-#   --user-local   install to ~/.local/share/SLSsteam/steamless-bin
-#                  instead of next to this script. Use this when the
-#                  SLSsteam install dir is read-only (system package).
+# --target wins over --user-local if both are passed.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="$SCRIPT_DIR/../steamless-bin"
 
-if [ "${1:-}" = "--user-local" ]; then
-    TARGET_DIR="$HOME/.local/share/SLSsteam/steamless-bin"
-fi
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --user-local)
+            TARGET_DIR="$HOME/.local/share/SLSsteam/steamless-bin"
+            shift
+            ;;
+        --target)
+            if [ -z "${2:-}" ]; then
+                echo "[install-steamless] --target needs a path" >&2
+                exit 2
+            fi
+            TARGET_DIR="$2"
+            shift 2
+            ;;
+        *)
+            echo "[install-steamless] unknown arg: $1" >&2
+            exit 2
+            ;;
+    esac
+done
 
 mkdir -p "$TARGET_DIR"
 
@@ -65,3 +81,17 @@ if [ ! -f "$TARGET_DIR/Steamless.API.dll" ] \
 fi
 
 echo "[install-steamless] installed at $TARGET_DIR"
+
+# Soft check: Steamless runs under Wine (or a Proton runtime).  We
+# don't require either at install time because run-steamless.sh
+# resolves them lazily, but a friendly heads-up saves debugging
+# later when nothing is available.
+if ! command -v wine >/dev/null 2>&1 \
+   && ! ls -d "$HOME/.steam/steam/steamapps/common/Proton"* >/dev/null 2>&1 \
+   && ! ls -d "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/common/Proton"* >/dev/null 2>&1; then
+    echo "[install-steamless] note: no system 'wine' and no installed Proton found."
+    echo "                         Install one before launching Steam-Stub-wrapped apps."
+    echo "                         Steamless requires .NET-on-Wine to run; the wrapper"
+    echo "                         helper falls back to a Proton runtime if 'wine' is"
+    echo "                         missing, but at least one must be present."
+fi

@@ -133,6 +133,32 @@ install_slssteam()
 	cp -v ./bin/* "$SLSDIR/"
 }
 
+# Bundles the Steam Stub bypass helper + Steamless binaries into
+# the SLSsteam install dir.  feats/steamstub.cpp probes for both
+# steamstub-bypass/run-steamless.sh and steamless-bin/Steamless.CLI.exe
+# under the .so's directory at runtime; this layout matches.
+# Idempotent: install-steamless.sh skips its download when the
+# binaries are already in place.
+install_steamstub()
+{
+	TARGET="$1"
+	HELPERSRC="./tools/steamstub-bypass"
+
+	if [ ! -d "$HELPERSRC" ]; then
+		echo "Helper scripts not found at $HELPERSRC! Skipping Steam Stub setup"
+		return 1
+	fi
+
+	mkdir -p "$TARGET/steamstub-bypass"
+	cp -v "$HELPERSRC/run-steamless.sh"     "$TARGET/steamstub-bypass/"
+	cp -v "$HELPERSRC/install-steamless.sh" "$TARGET/steamstub-bypass/"
+	chmod u+x "$TARGET/steamstub-bypass/run-steamless.sh" \
+	          "$TARGET/steamstub-bypass/install-steamless.sh"
+
+	bash "$TARGET/steamstub-bypass/install-steamless.sh" \
+		--target "$TARGET/steamless-bin"
+}
+
 install_flatpak()
 {
 	if [ ! -f "./bin/SLSsteam.so" ]; then
@@ -160,6 +186,8 @@ install_flatpak()
 
 	cp -v ./bin/* "$FLATPAK_SLSDIR/"
 
+	install_steamstub "$FLATPAK_SLSDIR"
+
 	flatpak override --user --env=LD_AUDIT="$FLATPAK_LD_AUDIT" --env=SHARED_LIBRARY_GUARD=0 "$FLATPAK_APP_ID"
 
 	echo "Flatpak install done!"
@@ -168,6 +196,7 @@ install_flatpak()
 install_all()
 {
 	install_slssteam
+	install_steamstub "$SLSDIR"
 
 	install_path
 	if [[ $? -eq 0 ]]; then
