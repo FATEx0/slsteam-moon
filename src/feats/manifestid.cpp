@@ -430,7 +430,7 @@ void importLuaScripts()
 	}
 	if (imported > 0)
 	{
-		g_pLog->once("ManifestId: imported %d Lua-script manifest pins from %s\n",
+		g_pLog->infoOnce("ManifestId: imported %d Lua-script manifest pins from %s\n",
 		             imported, stplug.c_str());
 	}
 }

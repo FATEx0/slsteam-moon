@@ -20,7 +20,7 @@ bool Misc::shouldFakeOffline()
 		return false;
 	}
 
-	g_pLog->once("Faking offline mode for %u\n", appId);
+	g_pLog->infoOnce("Faking offline mode for %u\n", appId);
 	return true;
 }
 

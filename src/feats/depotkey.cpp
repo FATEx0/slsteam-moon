@@ -185,7 +185,7 @@ bool saveKeyToCache(uint32_t appId, uint32_t depotId, const std::string& key)
 	}
 	ofs.write(node.c_str(), node.size());
 
-	g_pLog->once("DepotKey: cached key for app=%u depot=%u\n", finalAppId, depotId);
+	g_pLog->infoOnce("DepotKey: cached key for app=%u depot=%u\n", finalAppId, depotId);
 
 	SavedKey k;
 	k.appId = finalAppId;
@@ -243,7 +243,7 @@ void importLuaScripts()
 	}
 	if (imported > 0)
 	{
-		g_pLog->once("DepotKey: imported %d Lua-script depot keys from %s\n",
+		g_pLog->infoOnce("DepotKey: imported %d Lua-script depot keys from %s\n",
 		             imported, stplug.c_str());
 	}
 }
@@ -289,7 +289,7 @@ void provisionManifests()
 	}
 	if (copied > 0)
 	{
-		g_pLog->once("DepotKey: provisioned %d manifest(s) from %s -> %s\n",
+		g_pLog->infoOnce("DepotKey: provisioned %d manifest(s) from %s -> %s\n",
 		             copied, src.c_str(), dst.c_str());
 	}
 }
@@ -339,7 +339,7 @@ void recvDepotKey(CMsgClientGetDepotDecryptionKeyResponse* resp)
 		              resp->depot_id(), resp->eresult());
 		return;
 	}
-	g_pLog->once("DepotKey: substituting cached key for depot %u (Steam said eresult=%u)\n",
+	g_pLog->infoOnce("DepotKey: substituting cached key for depot %u (Steam said eresult=%u)\n",
 	             resp->depot_id(), resp->eresult());
 
 	CMsgClientGetDepotDecryptionKeyResponse fresh;

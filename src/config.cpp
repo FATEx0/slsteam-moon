@@ -304,7 +304,7 @@ bool CConfig::shouldExcludeAppId(uint32_t appId)
 		exclude = !isAddedAppId(appId) && ((useWhiteList.get() && !found) || (!useWhiteList.get() && found));
 	}
 
-	g_pLog->once("shouldExcludeAppId(%u) -> %i\n", appId, exclude);
+	g_pLog->debugOnce("shouldExcludeAppId(%u) -> %i\n", appId, exclude);
 	return exclude;
 }
 

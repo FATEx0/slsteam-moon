@@ -219,7 +219,7 @@ static void hkSteamEngine_Init(void* pSteamEngine)
 	Hooks::CSteamEngine_Init.tramp.fn(pSteamEngine);
 
 	g_pSteamEngine = reinterpret_cast<CSteamEngine*>(pSteamEngine);
-	g_pLog->once("g_pSteamEngine at %p\n", pSteamEngine);
+	g_pLog->debugOnce("g_pSteamEngine at %p\n", pSteamEngine);
 }
 
 static uint32_t hkSteamEngine_SetAppIdForCurrentPipe(void* pSteamEngine, uint32_t appId, bool a2)
@@ -294,7 +294,7 @@ static uint32_t hkUser_CheckAppOwnership(void* pClientUser, uint32_t appId, CApp
 {
 	const uint32_t ret = Hooks::CUser_CheckAppOwnership.tramp.fn(pClientUser, appId, pOwnershipInfo);
 
-	g_pLog->once
+	g_pLog->debugOnce
 	(
 		"%s(%p, %u) -> %i\n",
 
@@ -352,7 +352,7 @@ static void* hkClientAppManager_LaunchApp(void* pClientAppManager, uint32_t* pAp
 {
 	if (pAppId)
 	{
-		g_pLog->once
+		g_pLog->debugOnce
 		(
 			"%s(%p, %u, %p, %p, %p)\n",
 
@@ -375,7 +375,7 @@ static void* hkClientAppManager_LaunchApp(void* pClientAppManager, uint32_t* pAp
 static bool hkClientAppManager_IsAppDlcInstalled(void* pClientAppManager, uint32_t appId, uint32_t dlcId)
 {
 	const bool ret = Hooks::IClientAppManager_IsAppDlcInstalled.originalFn.fn(pClientAppManager, appId, dlcId);
-	g_pLog->once
+	g_pLog->debugOnce
 	(
 		"%s(%p, %u, %u) -> %i\n",
 
@@ -397,7 +397,7 @@ static bool hkClientAppManager_IsAppDlcInstalled(void* pClientAppManager, uint32
 static bool hkClientAppManager_BIsDlcEnabled(void* pClientAppManager, uint32_t appId, uint32_t dlcId, void* a3)
 {
 	const bool ret = Hooks::IClientAppManager_BIsDlcEnabled.originalFn.fn(pClientAppManager, appId, dlcId, a3);
-	g_pLog->once
+	g_pLog->debugOnce
 	(
 		"%s(%p, %u, %u, %p) -> %i\n",
 
@@ -421,11 +421,11 @@ static bool hkClientAppManager_BIsDlcEnabled(void* pClientAppManager, uint32_t a
 static bool hkClientAppManager_GetUpdateInfo(void* pClientAppManager, uint32_t appId, uint32_t* a2)
 {
 	const bool success = Hooks::IClientAppManager_GetAppUpdateInfo.originalFn.fn(pClientAppManager, appId, a2);
-	g_pLog->once("IClientAppManager::GetUpdateInfo(%p, %u, %p) -> %i\n", pClientAppManager, appId, a2, success);
+	g_pLog->debugOnce("IClientAppManager::GetUpdateInfo(%p, %u, %p) -> %i\n", pClientAppManager, appId, a2, success);
 
 	if (Apps::shouldDisableUpdates(appId))
 	{
-		g_pLog->once("Disabled updates for %u\n", appId);
+		g_pLog->infoOnce("Disabled updates for %u\n", appId);
 		return false;
 	}
 
@@ -460,7 +460,7 @@ static int32_t hkClientApps_GetAppData(void* pClientApps, uint32_t appId, const 
 {
 	const int32_t ret = Hooks::IClientApps_GetAppData.originalFn.fn(pClientApps, appId, name, pChOut, outSize);
 
-	g_pLog->once
+	g_pLog->debugOnce
 	(
 		"%s(%u, %s, len=%u) -> %i\n",
 		Hooks::IClientApps_GetAppData.name.c_str(),
@@ -476,7 +476,7 @@ static int32_t hkClientApps_GetAppData(void* pClientApps, uint32_t appId, const 
 static unsigned int hkClientApps_GetDLCCount(void* pClientApps, uint32_t appId)
 {
 	uint32_t count = Hooks::IClientApps_GetDLCCount.originalFn.fn(pClientApps, appId);
-	g_pLog->once
+	g_pLog->debugOnce
 	(
 		"%s(%p, %u) -> %u\n",
 
@@ -505,7 +505,7 @@ static bool hkClientApps_GetDLCDataByIndex(void* pClientApps, uint32_t appId, in
 		|| Hooks::IClientApps_GetDLCDataByIndex.originalFn.fn(pClientApps, appId, dlcIndex, pDlcId, pIsAvailable, pChDlcName, dlcNameLen);
 
 
-	g_pLog->once
+	g_pLog->debugOnce
 	(
 		"%s(%p, %u, %i, %p, %p, %s, %i) -> %i\n",
 
@@ -553,7 +553,7 @@ static void hkClientApps_RunIPCFrame(void* pClientApps, void* a1, void* a2, void
 static bool hkClientRemoteStorage_IsCloudEnabledForApp(void* pClientRemoteStorage, uint32_t appId)
 {
 	const bool enabled = Hooks::IClientRemoteStorage_IsCloudEnabledForApp.originalFn.fn(pClientRemoteStorage, appId);
-	g_pLog->once
+	g_pLog->debugOnce
 	(
 		"%s(%p, %u) -> %i\n",
 
@@ -565,7 +565,7 @@ static bool hkClientRemoteStorage_IsCloudEnabledForApp(void* pClientRemoteStorag
 
 	if (Apps::shouldDisableCloud(appId))
 	{
-		g_pLog->once("Disabled cloud for %u\n", appId);
+		g_pLog->infoOnce("Disabled cloud for %u\n", appId);
 		return false;
 	}
 
@@ -709,7 +709,7 @@ static uint32_t hkClientUser_GetAppOwnershipTicketExtendedData(
 
 {
 	const uint32_t ret = Hooks::IClientUser_GetAppOwnershipTicketExtendedData.tramp.fn(pClientUser, appId, pTicket, ticketSize, a4, a5, a6, a7);
-	g_pLog->once("%s(%u)->%u\n", Hooks::IClientUser_GetAppOwnershipTicketExtendedData.name.c_str(), appId, ret);
+	g_pLog->debugOnce("%s(%u)->%u\n", Hooks::IClientUser_GetAppOwnershipTicketExtendedData.name.c_str(), appId, ret);
 
 	Ticket::getTicketOwnershipExtendedData(appId);
 
@@ -765,7 +765,7 @@ static uint32_t hkClientUser_GetSteamId(uint32_t steamId)
 static bool hkClientUser_RequiresLegacyCDKey(void* pClientUser, uint32_t appId, uint32_t* a2)
 {
 	const bool requiresKey = Hooks::IClientUser_RequiresLegacyCDKey.tramp.fn(pClientUser, appId, a2);
-	g_pLog->once
+	g_pLog->debugOnce
 	(
 		"%s(%p, %u, %u) -> %i\n",
 
@@ -778,7 +778,7 @@ static bool hkClientUser_RequiresLegacyCDKey(void* pClientUser, uint32_t appId, 
 
 	if (Apps::shouldDisableCDKey(appId))
 	{
-		g_pLog->once("Disable CD Key for %u\n", appId);
+		g_pLog->infoOnce("Disable CD Key for %u\n", appId);
 		return false;
 	}
 

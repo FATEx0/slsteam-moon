@@ -99,7 +99,7 @@ bool Ticket::saveTicketToCache(CMsgClientGetAppOwnershipTicketResponse* resp)
 
 	ofs.write(node.c_str(), node.size());
 
-	g_pLog->once("Saved ticket for %u\n", appId);
+	g_pLog->infoOnce("Saved ticket for %u\n", appId);
 
 	//TODO: Skip copy
 	SavedTicket ticket {};
@@ -118,7 +118,7 @@ void Ticket::launchApp(uint32_t appId)
 	}
 
 	g_pSteamEngine->getUser(0)->updateAppOwnershipTicket(appId, reinterpret_cast<void*>(ticket.ticket.data()), ticket.ticket.size());
-	g_pLog->once("Force loaded AppOwnershipTicket for %i\n", appId);
+	g_pLog->infoOnce("Force loaded AppOwnershipTicket for %i\n", appId);
 }
 
 void Ticket::getTicketOwnershipExtendedData(uint32_t appId)
@@ -150,7 +150,7 @@ Ticket::SavedTicket Ticket::getCachedEncryptedTicket(uint32_t appId)
 
 	if (realAppId && fakeAppId && appId != realAppId)
 	{
-		g_pLog->once("Returning empty cached encrypted ticket for %u because it's set to %u\n", realAppId, fakeAppId);
+		g_pLog->infoOnce("Returning empty cached encrypted ticket for %u because it's set to %u\n", realAppId, fakeAppId);
 		return ticket;
 	}
 
@@ -210,7 +210,7 @@ bool Ticket::saveEncryptedTicketToCache(CMsgClientRequestEncryptedAppTicketRespo
 
 	ofs.write(node.c_str(), node.size());
 
-	g_pLog->once("Saved encrypted ticket for %u\n", appId);
+	g_pLog->infoOnce("Saved encrypted ticket for %u\n", appId);
 
 	//TODO: Skip copy
 	SavedTicket ticket {};

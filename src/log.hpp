@@ -116,6 +116,22 @@ class CLog
 		ofstream.flush();
 	}
 
+	// Per-(level,message) deduplication state used by the *Once
+	// helpers below.  We can't piggy-back on msgHist because that
+	// set holds raw strings and is also touched by LogLevel::Once
+	// — we want suppression scoped to the helper, not to literal
+	// equality across levels.
+	std::unordered_set<std::string> dedupHist {};
+
+	bool seenBefore(LogLevel lvl, const std::string& formatted)
+	{
+		std::unique_lock lock(mutex);
+		const std::string key =
+			std::string(logLvlToStr(lvl)) + "|" + formatted;
+		auto [_, inserted] = dedupHist.emplace(key);
+		return !inserted;
+	}
+
 public:
 	std::string path;
 
@@ -138,6 +154,34 @@ public:
 	constexpr void info(const char* msg, Args... args)
 	{
 		__log(LogLevel::Info, msg, args...);
+	}
+
+	// Variants of debug/info that suppress repeated messages with
+	// identical formatted text.  Use these for diagnostics that fire
+	// per-app/per-depot/etc. — the first occurrence is logged, the
+	// rest are squelched, so a hot loop doesn't drown the file.
+	template<typename ...Args>
+	void infoOnce(const char* msg, Args... args)
+	{
+		if (LogLevel::Info < getMinLevel()) return;
+		size_t size = snprintf(nullptr, 0, msg, args...) + 1;
+		std::string formatted;
+		formatted.resize(size);
+		snprintf(formatted.data(), size, msg, args...);
+		if (seenBefore(LogLevel::Info, formatted)) return;
+		__log(LogLevel::Info, "%s", formatted.c_str());
+	}
+
+	template<typename ...Args>
+	void debugOnce(const char* msg, Args... args)
+	{
+		if (LogLevel::Debug < getMinLevel()) return;
+		size_t size = snprintf(nullptr, 0, msg, args...) + 1;
+		std::string formatted;
+		formatted.resize(size);
+		snprintf(formatted.data(), size, msg, args...);
+		if (seenBefore(LogLevel::Debug, formatted)) return;
+		__log(LogLevel::Debug, "%s", formatted.c_str());
 	}
 
 	template<typename ...Args>

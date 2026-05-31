@@ -41,7 +41,7 @@ bool Apps::unlockApp(uint32_t appId, CAppOwnershipInfo* info, uint32_t ownerId)
 	info->freeLicense = info->familyShared;
 	info->siteLicense = false;
 
-	g_pLog->once("Unlocked %u\n", appId);
+	g_pLog->infoOnce("Unlocked %u\n", appId);
 	return true;
 }
 
@@ -61,7 +61,7 @@ bool Apps::checkAppOwnership(uint32_t appId, CAppOwnershipInfo* pInfo)
 
 	if (denuvoOwner && denuvoOwner != g_currentSteamId)
 	{
-		g_pLog->once("Skipping %u because it's a Denuvo game from someone else\n", appId);
+		g_pLog->infoOnce("Skipping %u because it's a Denuvo game from someone else\n", appId);
 		return false;
 	}
 
@@ -73,12 +73,12 @@ bool Apps::checkAppOwnership(uint32_t appId, CAppOwnershipInfo* pInfo)
 	if (pInfo->lowViolence)
 	{
 		pInfo->lowViolence = false;
-		g_pLog->once("Decensoring %u\n", appId);
+		g_pLog->infoOnce("Decensoring %u\n", appId);
 	}
 	if (pInfo->regionRestricted)
 	{
 		pInfo->regionRestricted = false;
-		g_pLog->once("Bypassing region restriction for %u\n", appId);
+		g_pLog->infoOnce("Bypassing region restriction for %u\n", appId);
 	}
 
 	const auto times = g_config.subscriptionTimestamps.get();
