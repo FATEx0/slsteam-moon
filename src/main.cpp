@@ -10,6 +10,7 @@
 #include "feats/appinfo_vdf.hpp"
 #include "feats/depotkey.hpp"
 #include "feats/packagepatch.hpp"
+#include "feats/steamstub.hpp"
 
 #include "libmem/libmem.h"
 
@@ -231,6 +232,36 @@ static void load()
 	}
 
 	SLSAPI::init();
+
+	// Steamtools-Linux: Steam Stub bypass.  Detect SLSsteam.so's own
+	// path via libmem so we can locate the bundled helper script and
+	// Steamless binaries.  Falls back to a no-op silently when those
+	// aren't shipped (e.g. development builds running from the obj
+	// tree).
+	{
+		lm_module_t selfMod {};
+		const char* candidates[] = {
+			"SLSsteam.so", "libSLSsteam.so", nullptr
+		};
+		bool found = false;
+		for (const char** name = candidates; *name; ++name)
+		{
+			if (LM_FindModule(*name, &selfMod))
+			{
+				found = true;
+				break;
+			}
+		}
+		if (found)
+		{
+			auto root = std::filesystem::path(selfMod.path).parent_path().string();
+			SteamStub::setup(root.c_str());
+		}
+		else
+		{
+			g_pLog->debug("SteamStub: could not resolve SLSsteam.so path; feature disabled\n");
+		}
+	}
 
 	// Steamtools-Linux: import Lua scripts and provision manifest files.
 	// Must run AFTER setup so g_config.getDir() is valid and AFTER hooks

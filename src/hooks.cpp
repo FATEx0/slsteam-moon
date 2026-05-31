@@ -25,6 +25,7 @@
 #include "feats/fakeappid.hpp"
 #include "feats/packagepatch.hpp"
 #include "feats/pics.hpp"
+#include "feats/steamstub.hpp"
 #include "feats/ticket.hpp"
 
 #include "libmem/libmem.h"
@@ -365,6 +366,7 @@ static void* hkClientAppManager_LaunchApp(void* pClientAppManager, uint32_t* pAp
 
 		FakeAppIds::launchApp(*pAppId);
 		Ticket::launchApp(*pAppId);
+		SteamStub::onLaunchApp(*pAppId);
 	}
 
 	return Hooks::IClientAppManager_LaunchApp.originalFn.fn(pClientAppManager, pAppId, a2, a3, a4);
