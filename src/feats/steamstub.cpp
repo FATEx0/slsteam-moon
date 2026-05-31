@@ -9,6 +9,7 @@
 #include "../log.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 #include <mutex>
 #include <string>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_set>
 #include <vector>
@@ -25,9 +27,9 @@
 
 namespace
 {
-	// 4-byte signature at file offset 0x40 in Steam-Stub-wrapped PE
-	// files.  Identifies the wrapper before we pay the Wine startup
-	// cost.  Big-endian here because we read raw bytes from disk.
+	// 4-byte signature at file offset 0x40 in PE files that go
+	// through the wrapper.  Identifies them before we pay the Wine
+	// startup cost.
 	constexpr uint8_t kVlvSig[4] = { 'V', 'L', 'V', 0x00 };
 	constexpr off_t   kVlvSigOff = 0x40;
 
@@ -37,6 +39,17 @@ namespace
 
 	std::mutex g_processedMu;
 	std::unordered_set<std::string> g_processedExes;
+
+	// Warmup synchronisation.  warmupAsync() spawns a detached
+	// thread that runs `run-steamless.sh --prewarm` once; subsequent
+	// calls are no-ops via g_warmupStarted.  onLaunchApp() blocks
+	// on g_warmupCV until g_warmupDone flips, then proceeds. If the
+	// prewarm fails we still let the launch attempt run — the
+	// helper script will report the same error in-line.
+	std::atomic<bool> g_warmupStarted{false};
+	std::atomic<bool> g_warmupDone{false};
+	std::mutex g_warmupMu;
+	std::condition_variable g_warmupCV;
 
 	// Returns true when the file at `path` carries the VLV signature
 	// at offset 0x40.  Returns false on any I/O error or short reads
@@ -170,6 +183,37 @@ namespace
 		g_pLog->warn("SteamStub: helper terminated abnormally (status=%d)\n", status);
 		return -1;
 	}
+
+	// Run `<script> --prewarm` synchronously (in a worker thread,
+	// not the calling thread).  Same env, same waitpid, just no exe.
+	int runPrewarm()
+	{
+		const pid_t pid = fork();
+		if (pid < 0)
+		{
+			g_pLog->warn("SteamStub: prewarm fork() failed (errno=%d)\n", errno);
+			return -1;
+		}
+		if (pid == 0)
+		{
+			setenv("STEAMLESS_HOME", g_steamlessHome.c_str(), 1);
+			setenv("QUIET", "1", 1);
+			execlp("/bin/bash", "bash", g_helperScript.c_str(),
+			       "--prewarm", nullptr);
+			_exit(127);
+		}
+		int status = 0;
+		if (waitpid(pid, &status, 0) < 0)
+		{
+			g_pLog->warn("SteamStub: prewarm waitpid failed (errno=%d)\n", errno);
+			return -1;
+		}
+		if (WIFEXITED(status))
+		{
+			return WEXITSTATUS(status);
+		}
+		return -1;
+	}
 }
 
 namespace SteamStub
@@ -243,6 +287,43 @@ void setup(const char* installRoot)
 	);
 }
 
+void warmupAsync()
+{
+	if (!g_enabled.load(std::memory_order_acquire)) return;
+
+	// First call wins; everyone else early-outs.
+	bool expected = false;
+	if (!g_warmupStarted.compare_exchange_strong(expected, true,
+	        std::memory_order_acq_rel))
+	{
+		return;
+	}
+
+	std::thread([]
+	{
+		g_pLog->debug("SteamStub: prewarming Wine prefix in background\n");
+		const int rc = runPrewarm();
+		if (rc == 0)
+		{
+			g_pLog->debug("SteamStub: prewarm complete\n");
+		}
+		else
+		{
+			g_pLog->debug
+			(
+				"SteamStub: prewarm exited with rc=%d "
+				"(launch-time unpack will pay the cost)\n",
+				rc
+			);
+		}
+		{
+			std::lock_guard<std::mutex> lk(g_warmupMu);
+			g_warmupDone.store(true, std::memory_order_release);
+		}
+		g_warmupCV.notify_all();
+	}).detach();
+}
+
 void onLaunchApp(uint32_t appId)
 {
 	if (!g_enabled.load(std::memory_order_acquire)) return;
@@ -303,22 +384,40 @@ void onLaunchApp(uint32_t appId)
 			continue;
 		}
 
-		g_pLog->info("SteamStub: stripping %s\n", pathStr.c_str());
+		// We have a real victim — wait for the background prewarm
+		// to finish before invoking the helper for real.  If the
+		// caller never invoked warmupAsync(), or the prewarm
+		// failed, this is a noop and we pay the wineboot cost
+		// inline.
+		{
+			std::unique_lock<std::mutex> lk(g_warmupMu);
+			if (g_warmupStarted.load(std::memory_order_acquire)
+			    && !g_warmupDone.load(std::memory_order_acquire))
+			{
+				g_pLog->debug("SteamStub: waiting for prewarm to finish\n");
+				g_warmupCV.wait(lk, []
+				{
+					return g_warmupDone.load(std::memory_order_acquire);
+				});
+			}
+		}
+
+		g_pLog->info("SteamStub: processing %s\n", pathStr.c_str());
 		const int rc = runHelper(pathStr);
 		switch (rc)
 		{
 			case 0:
-				g_pLog->info("SteamStub: stripped successfully (%s)\n", pathStr.c_str());
+				g_pLog->info("SteamStub: processed (%s)\n", pathStr.c_str());
 				break;
 			case 2:
-				// Already naked — race between sig check and helper
-				// invocation.  Harmless.
-				g_pLog->debug("SteamStub: helper reported already-naked (%s)\n", pathStr.c_str());
+				// Already in target shape — race between sig check
+				// and helper invocation.  Harmless.
+				g_pLog->debug("SteamStub: helper reported nothing to do (%s)\n", pathStr.c_str());
 				break;
 			default:
 				g_pLog->warn
 				(
-					"SteamStub: helper failed for %s (rc=%d); launch may fail at error 6\n",
+					"SteamStub: helper failed for %s (rc=%d)\n",
 					pathStr.c_str(), rc
 				);
 				break;

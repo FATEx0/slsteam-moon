@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Steamtools-Linux: package patch feature.
+// Package patch feature.
 //
-// Mirrors LumaCore's `PackagePatch` (see
-// .kiro/research/lumacore/PackagePatch.cpp): hooks Steam's LoadPackage
-// so that, when Steam loads PackageId 0 (the default anonymous package
-// every account has), our AdditionalApps from the SLSsteam config get
-// appended to `pInfo->AppIdVec` via the resolved `CUtlMemoryGrow`
-// helper.
+// Hooks Steam's LoadPackage so that, when Steam loads PackageId 0
+// (the default anonymous package every account has), our
+// AdditionalApps from the SLSsteam config get appended to
+// `pInfo->AppIdVec` via the resolved `CUtlMemoryGrow` helper.
 //
-// Why: Steam's depot eligibility filter walks every package the user
-// has and looks for the appid in `AppIdVec`. For unowned apps the
-// filter returns "no eligible depots", which is what makes the
-// install-dialog show 0 B and Steam declare "Fully Installed" without
-// downloading anything. By making package 0 contain Skyrim-AE's depot
-// list, the filter returns the real depots, the download size becomes
-// non-zero, and our existing depot-key + manifest hooks finish the
+// Why: Steam's depot eligibility filter walks every package and
+// looks for an appid in `AppIdVec`. Without an entry in package 0
+// the filter can return "no eligible depots" — the install dialog
+// then shows 0 B and Steam declares the app installed without
+// downloading anything. Adding the appid to package 0 makes the
+// filter return the real depot list, the install size becomes
+// correct, and existing depot-key + manifest paths finish the
 // pipeline.
 
 #pragma once

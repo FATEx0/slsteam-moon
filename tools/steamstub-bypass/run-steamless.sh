@@ -1,21 +1,32 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# run-steamless.sh — strips Steam Stub DRM from a Windows .exe.
+# run-steamless.sh — wrapper-integration helper.  Invokes the
+# bundled Steamless build under Wine to process a Windows
+# executable. Designed to be called by the SLSsteam .so right
+# before Steam launches a configured-AdditionalApps binary.
 #
-# Designed to be invoked by the SLSsteam .so right before Steam launches
-# an unowned-app Windows binary. Mirrors Accela's flow but without the
-# Qt/Python overhead.
+# Mirrors Accela's direct-Wine invocation pattern (cleaner than
+# `proton run` for this case).
 #
 # Usage:
-#   run-steamless.sh <exe-path>
+#   run-steamless.sh <exe-path>            # full unpack + swap
+#   run-steamless.sh --prewarm             # initialise the Wine prefix
+#                                          #   only; no exe required
+#
+# The --prewarm form is meant to be called once at SLSsteam startup
+# in the background so the slow first-time Wine boot (~30s) completes
+# before the user clicks Play. Subsequent unpacks finish in ~3s
+# because the prefix is already initialised and the wineserver is
+# still warm.
 #
 # Exit codes:
-#   0  unpack succeeded, original.exe.original.exe is the backup,
-#      original.exe is now the unpacked (naked) binary
+#   0  helper succeeded (or prewarm finished); when run with an exe
+#      argument, original.exe.original.exe is the backup and the
+#      processed binary now lives at original.exe
 #   1  invalid arguments
-#   2  exe doesn't carry the Steam Stub VLV signature — already naked,
-#      no work needed
+#   2  exe doesn't carry the wrapper signature — already in target
+#      shape, no work needed
 #   3  no usable Wine binary (system wine missing, no Proton installed)
 #   4  Steamless run failed (compile/dependency/timeout)
 #   5  Steamless ran but produced no .unpacked.exe
@@ -33,36 +44,50 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXE_PATH="${1:-}"
+PREWARM=0
+EXE_PATH=""
+
+case "${1:-}" in
+    --prewarm)
+        PREWARM=1
+        ;;
+    *)
+        EXE_PATH="${1:-}"
+        ;;
+esac
 
 log()  { [ -z "${QUIET:-}" ] && echo "[steamless-bypass] $*"; return 0; }
 warn() { echo "[steamless-bypass] WARN: $*" >&2; }
 die()  { echo "[steamless-bypass] ERROR: $*" >&2; exit "${2:-1}"; }
 
 # ── 1. validate args ────────────────────────────────────────────────────
-[ -n "$EXE_PATH" ] || die "usage: $0 <exe-path>" 1
-[ -f "$EXE_PATH" ] || die "exe not found: $EXE_PATH" 1
+if [ "$PREWARM" -eq 0 ]; then
+    [ -n "$EXE_PATH" ] || die "usage: $0 <exe-path>  |  $0 --prewarm" 1
+    [ -f "$EXE_PATH" ] || die "exe not found: $EXE_PATH" 1
 
-# ── 2. probe Steam Stub VLV signature at offset 0x40 ────────────────────
-# Quick exit if the exe isn't packed. Saves 5-30s of Wine startup.
-sig=$(dd if="$EXE_PATH" bs=1 skip=64 count=4 2>/dev/null | xxd -p)
-if [ "$sig" != "564c5600" ]; then
-    log "exe is not Steam-Stub-wrapped (sig=$sig); skipping"
-    exit 2
+    # ── 2. probe Steam Stub VLV signature at offset 0x40 ────────────────
+    # Quick exit if the exe isn't packed. Saves 5-30s of Wine startup.
+    sig=$(dd if="$EXE_PATH" bs=1 skip=64 count=4 2>/dev/null | xxd -p)
+    if [ "$sig" != "564c5600" ]; then
+        log "exe is not Steam-Stub-wrapped (sig=$sig); skipping"
+        exit 2
+    fi
+    log "Steam Stub VLV signature detected — proceeding"
 fi
-log "Steam Stub VLV signature detected — proceeding"
 
-# ── 3. resolve Steamless home ────────────────────────────────────────────
-STEAMLESS_HOME="${STEAMLESS_HOME:-$SCRIPT_DIR/../steamless-bin}"
-STEAMLESS_CLI="$STEAMLESS_HOME/Steamless.CLI.exe"
-[ -f "$STEAMLESS_CLI" ] || die "Steamless.CLI.exe not found at $STEAMLESS_CLI" 4
+# ── 3. resolve Steamless home (skipped in --prewarm) ───────────────────
+if [ "$PREWARM" -eq 0 ]; then
+    STEAMLESS_HOME="${STEAMLESS_HOME:-$SCRIPT_DIR/../steamless-bin}"
+    STEAMLESS_CLI="$STEAMLESS_HOME/Steamless.CLI.exe"
+    [ -f "$STEAMLESS_CLI" ] || die "Steamless.CLI.exe not found at $STEAMLESS_CLI" 4
 
-# Steamless's CLI exe loads Steamless.API.dll from the working
-# directory. Plugins live in Plugins/. If the API dll is only in
-# Plugins/, copy it up so the CLI can find it. Idempotent.
-if [ ! -f "$STEAMLESS_HOME/Steamless.API.dll" ] \
-   && [ -f "$STEAMLESS_HOME/Plugins/Steamless.API.dll" ]; then
-    cp "$STEAMLESS_HOME/Plugins/Steamless.API.dll" "$STEAMLESS_HOME/Steamless.API.dll"
+    # Steamless's CLI exe loads Steamless.API.dll from the working
+    # directory. Plugins live in Plugins/. If the API dll is only in
+    # Plugins/, copy it up so the CLI can find it. Idempotent.
+    if [ ! -f "$STEAMLESS_HOME/Steamless.API.dll" ] \
+       && [ -f "$STEAMLESS_HOME/Plugins/Steamless.API.dll" ]; then
+        cp "$STEAMLESS_HOME/Plugins/Steamless.API.dll" "$STEAMLESS_HOME/Steamless.API.dll"
+    fi
 fi
 
 # ── 4. locate wine binary ───────────────────────────────────────────────
@@ -135,6 +160,14 @@ if [ ! -f "$WINEPREFIX/system.reg" ]; then
     "$WINESERVER" -w 2>/dev/null || true
 fi
 
+# Prewarm path stops here — the prefix is now initialised, the wineserver
+# is warm, and the next call with a real exe path can run Steamless
+# immediately.
+if [ "$PREWARM" -eq 1 ]; then
+    log "prewarm complete"
+    exit 0
+fi
+
 # ── 7. invoke Steamless ─────────────────────────────────────────────────
 # Steamless writes <exe>.unpacked.exe next to the input. Wine paths
 # need to be drive-mapped — Z:\ maps to /. Everything else is just
@@ -177,5 +210,5 @@ chmod +x "$EXE_PATH"
 # Marker so we don't reprocess the same exe forever.
 touch "$EXE_PATH.steamless_done"
 
-log "done — $EXE_PATH is now Stub-free"
+log "done — $EXE_PATH processed"
 exit 0

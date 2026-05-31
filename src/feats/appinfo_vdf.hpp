@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Steamtools-Linux: appinfo.vdf v41 reader/writer.
+// appinfo.vdf v41 reader/writer.
 //
 // Steam keeps its product info cache at `<Steam>/appcache/appinfo.vdf`.
 // On boot it reads the entire file into RAM (`ThreadedReadFromDisk`) and

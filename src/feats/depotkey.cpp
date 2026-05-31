@@ -205,6 +205,7 @@ void importLuaScripts()
 	const auto stplug = steamRoot + "/config/stplug-in";
 	if (!std::filesystem::exists(stplug.c_str())) return;
 
+
 	static const std::regex addappidWithKeyRe(
 		"addappid\\s*\\(\\s*(\\d+)\\s*,\\s*\\d+\\s*,\\s*\"([0-9A-Fa-f]{64})\"\\s*\\)"
 	);

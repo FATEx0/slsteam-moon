@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Steamtools-Linux: in-process Steam structures for the LoadPackage hook.
+// In-process Steam structures for the LoadPackage hook.
 //
 // Mirrors LumaCore's struct definitions but with Linux i386 (4-byte
 // pointer) layout. Field offsets verified against the Linux Steam build

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Steamtools-Linux: depot decryption key feature.
+// Depot decryption key feature.
 //
 // Intercepts CMsgClientGetDepotDecryptionKey requests/responses inside the
 // existing CProtoBufMsgBase hooks (already provided by SLSsteam).
@@ -11,12 +11,12 @@
 //   - Incoming responses: if Steam returned a key, persist it; if Steam
 //     returned an error AND we have a key in our local catalog, substitute
 //     it so the downloader proceeds.
-//   - On startup: import any SteamTools-Windows-style Lua scripts from
+//   - On startup: import any community-format Lua scripts from
 //     `<Steam>/config/stplug-in/*.lua` and ingest `addappid(d, 1, "hex")`
 //     entries into our catalog.
 //   - On startup: provision manifest files from `<Steam>/config/depotcache`
 //     into `<Steam>/depotcache` so Steam's downloader skips the manifest
-//     fetch step (matches SteamTools-Windows behaviour).
+//     fetch step.
 //
 // Catalog layout (mirrors Ticket cache):
 //   <SLSsteam config dir>/cache/depotkey_<depot_id>.yaml
@@ -53,7 +53,7 @@ namespace DepotKey
 	SavedKey getCachedKey(uint32_t depotId);
 	bool saveKeyToCache(uint32_t appId, uint32_t depotId, const std::string& key);
 
-	// Importer for SteamTools-Windows-format Lua scripts.  Called at startup;
+	// Importer for community-format Lua scripts.  Called at startup;
 	// scans `config/stplug-in/*.lua` (under Steam) and ingests every
 	// `addappid(depotId, 1, "<64 hex chars>")` into our cache, idempotently.
 	void importLuaScripts();

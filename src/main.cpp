@@ -128,11 +128,11 @@ static void setup()
 		return;
 	}
 
-	// Steamtools-Linux: splice cached PICS buffers into appcache/appinfo.vdf
-	// before Steam opens the file.  Each buffer was captured during a
-	// previous session by `feats/pics.cpp::recvProductInfoResponse`.  This
-	// is path A.5: the cache must already exist on disk; first-run
-	// installs need a Steam restart so the buffers can be picked up.
+	// Splice cached PICS buffers into appcache/appinfo.vdf before
+	// Steam opens the file.  Each buffer was captured during a
+	// previous session by `feats/pics.cpp::recvProductInfoResponse`.
+	// The cache must already exist on disk; first-run installs need
+	// a Steam restart so the buffers can be picked up.
 	{
 		const char* home = std::getenv("HOME");
 		if (home)
@@ -233,11 +233,11 @@ static void load()
 
 	SLSAPI::init();
 
-	// Steamtools-Linux: Steam Stub bypass.  Detect SLSsteam.so's own
-	// path via libmem so we can locate the bundled helper script and
-	// Steamless binaries.  Falls back to a no-op silently when those
-	// aren't shipped (e.g. development builds running from the obj
-	// tree).
+	// Resolve SLSsteam.so's own install root via libmem so the
+	// runtime helpers (wrapper integration script + bundled tools)
+	// can be located relative to the .so. Falls back to a no-op
+	// silently when those aren't shipped (e.g. development builds
+	// running from the obj tree).
 	{
 		lm_module_t selfMod {};
 		const char* candidates[] = {
@@ -256,6 +256,12 @@ static void load()
 		{
 			auto root = std::filesystem::path(selfMod.path).parent_path().string();
 			SteamStub::setup(root.c_str());
+			// Background-warm the dedicated Wine prefix so the user
+			// doesn't pay the first-run wineboot cost when launching
+			// an app that goes through the wrapper-integration helper.
+			// Detached worker; onLaunchApp will join on this before
+			// invoking the helper.
+			SteamStub::warmupAsync();
 		}
 		else
 		{
@@ -263,14 +269,14 @@ static void load()
 		}
 	}
 
-	// Steamtools-Linux: import Lua scripts and provision manifest files.
-	// Must run AFTER setup so g_config.getDir() is valid and AFTER hooks
-	// so g_pLog is alive.
+	// Import Lua scripts and provision manifest files.  Must run
+	// AFTER setup so g_config.getDir() is valid and AFTER hooks so
+	// g_pLog is alive.
 	DepotKey::onStartup();
 
-	// Steamtools-Linux: re-inject AdditionalApps into package 0 in case
-	// Steam already loaded it before our hook was placed.  No-op when
-	// the LoadPackage detour has already seeded the same ids.
+	// Re-inject AdditionalApps into package 0 in case Steam already
+	// loaded it before our hook was placed.  No-op when the
+	// LoadPackage detour has already seeded the same ids.
 	{
 		const auto added = g_config.addedAppIds.get();
 		if (!added.empty())

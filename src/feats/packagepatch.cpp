@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// Steamtools-Linux: package patch feature implementation.
+// Package patch feature implementation.
 
 #include "packagepatch.hpp"
 
@@ -225,11 +225,11 @@ namespace
 			return result;
 		}
 
-		// Mirror LumaCore's PR-style guard: skip injection if Steam
-		// reports the package as not Available.  Injecting into a
-		// stale/Invalid package gets the vector clobbered when Steam
-		// re-loads it, costing us every fake appid.  Save the pointer
-		// so a later re-inject (after Steam settles) can pick up.
+		// Skip injection if Steam reports the package as not
+		// Available.  Injecting into a stale/Invalid package gets
+		// the vector clobbered when Steam re-loads it, costing us
+		// every appid we added.  Stash the pointer so a later
+		// re-inject (after Steam settles) can pick up.
 		g_pPackage0.store(pInfo, std::memory_order_release);
 
 		if (pInfo->Status != EPackageStatus::Available)
