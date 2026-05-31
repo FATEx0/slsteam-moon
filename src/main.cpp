@@ -9,6 +9,7 @@
 
 #include "feats/appinfo_vdf.hpp"
 #include "feats/depotkey.hpp"
+#include "feats/manifestid.hpp"
 #include "feats/packagepatch.hpp"
 #include "feats/steamstub.hpp"
 
@@ -273,6 +274,7 @@ static void load()
 	// AFTER setup so g_config.getDir() is valid and AFTER hooks so
 	// g_pLog is alive.
 	DepotKey::onStartup();
+	ManifestId::importLuaScripts();
 
 	// Re-inject AdditionalApps into package 0 in case Steam already
 	// loaded it before our hook was placed.  No-op when the

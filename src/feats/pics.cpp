@@ -6,6 +6,8 @@
 #include "../log.hpp"
 #include "../sdk/CProtoBufMsgBase.hpp"
 
+#include "manifestid.hpp"
+
 #include "base64/base64.hpp"
 #include "yaml-cpp/emitter.h"
 #include "yaml-cpp/yaml.h"
@@ -137,22 +139,27 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	const auto added = g_config.addedAppIds.get();
 	for (int i = 0; i < resp->apps_size(); ++i)
 	{
-		const auto& app = resp->apps(i);
+		auto* app = resp->mutable_apps(i);
 		g_pLog->debug
 		(
 			"PICS: app=%u change=%u missing_token=%i only_public=%i sha_size=%zu buffer_size=%zu\n",
-			app.appid(),
-			app.change_number(),
-			app.missing_token() ? 1 : 0,
-			app.only_public() ? 1 : 0,
-			app.sha().size(),
-			app.buffer().size()
+			app->appid(),
+			app->change_number(),
+			app->missing_token() ? 1 : 0,
+			app->only_public() ? 1 : 0,
+			app->sha().size(),
+			app->buffer().size()
 		);
 
-		if (added.count(app.appid()) && app.buffer().size() > 0)
+		if (added.count(app->appid()) && app->buffer().size() > 0)
 		{
-			persistAppBuffer(app.appid(), app.change_number(),
-			                 app.sha(), app.buffer());
+			std::string pinned = ManifestId::applyToWireBuffer(app->buffer());
+			if (pinned.size() != app->buffer().size() || pinned != app->buffer())
+			{
+				app->set_buffer(pinned);
+			}
+			persistAppBuffer(app->appid(), app->change_number(),
+			                 app->sha(), app->buffer());
 		}
 	}
 
