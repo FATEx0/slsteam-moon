@@ -79,9 +79,18 @@ void loadCatalogLocked()
 		std::smatch m;
 		if (!std::regex_match(name, m, fileRe)) continue;
 
+		// Defensive: skip empty/truncated files outright.  A prior
+		// crash-mid-write could leave a zero-byte placeholder; YAML
+		// parsing would lob a TypedBadConversion that we'd catch,
+		// but the noise isn't worth it.
+		std::error_code ec;
+		const auto sz = std::filesystem::file_size(entry.path(), ec);
+		if (ec || sz == 0) continue;
+
 		try
 		{
 			auto node = YAML::LoadFile(entry.path().string());
+			if (!node["depotId"] || !node["gid"]) continue;
 			const auto depotId = node["depotId"].as<uint32_t>();
 			const auto gid     = node["gid"].as<std::string>();
 			if (depotId && !gid.empty())
@@ -331,8 +340,8 @@ bool savePin(uint32_t depotId, const std::string& gid)
 			    node["gid"].as<std::string>() == gid)
 			{
 				std::lock_guard<std::mutex> lk(g_catalogMu);
-				loadCatalogLocked();
 				g_catalog[depotId] = gid;
+				g_catalogLoaded = true;
 				return true;
 			}
 		}
@@ -345,17 +354,25 @@ bool savePin(uint32_t depotId, const std::string& gid)
 	em << YAML::Key << "gid"     << YAML::Value << gid;
 	em << YAML::EndMap;
 
-	std::ofstream ofs(path.c_str(), std::ios::out | std::ios::trunc);
-	if (!ofs.is_open())
 	{
-		g_pLog->debug("ManifestId: cannot write %s\n", path.c_str());
-		return false;
-	}
-	ofs.write(em.c_str(), em.size());
+		std::ofstream ofs(path.c_str(), std::ios::out | std::ios::trunc);
+		if (!ofs.is_open())
+		{
+			g_pLog->debug("ManifestId: cannot write %s\n", path.c_str());
+			return false;
+		}
+		ofs.write(em.c_str(), em.size());
+	}  // close + flush before any reader sees the file
 
+	// Update the in-memory catalog directly.  We don't need to
+	// re-iterate the cache directory: the YAML we just wrote is the
+	// authoritative entry for `depotId`, and any stale catalog state
+	// is irrelevant because every saver path goes through this
+	// function.  This also avoids the trap of loadCatalogLocked()
+	// racing with a not-yet-flushed ofstream from this very call.
 	std::lock_guard<std::mutex> lk(g_catalogMu);
-	loadCatalogLocked();
 	g_catalog[depotId] = gid;
+	g_catalogLoaded = true;
 	return true;
 }
 
