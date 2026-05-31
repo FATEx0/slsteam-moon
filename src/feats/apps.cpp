@@ -12,12 +12,13 @@
 
 #include "fakeappid.hpp"
 
+#include <sstream>
+
 bool Apps::applistRequested;
 std::map<uint32_t, int> Apps::appIdOwnerOverride;
 
 bool Apps::unlockApp(uint32_t appId, CAppOwnershipInfo* info, uint32_t ownerId)
 {
-	//Changing the purchased field is enough, but just for nicety in the Steamclient UI we change the owner too
 	info->owner = ownerId;
 	info->realOwner = 0;
 	info->familyShared = ownerId != g_currentSteamId;
@@ -51,8 +52,6 @@ bool Apps::unlockApp(uint32_t appId, CAppOwnershipInfo* info)
 
 bool Apps::checkAppOwnership(uint32_t appId, CAppOwnershipInfo* pInfo)
 {
-	//Wait Until GetSubscribedApps gets called once to let Steam request and populate legit data first.
-	//Afterwards modifying should hopefully not affect false positives anymore
 	if (!applistRequested || !pInfo || !g_currentSteamId)
 	{
 		return false;
@@ -60,10 +59,8 @@ bool Apps::checkAppOwnership(uint32_t appId, CAppOwnershipInfo* pInfo)
 
 	const uint32_t denuvoOwner = g_config.getDenuvoGameOwner(appId);
 
-	//Do not modify Denuvo enabled Games
 	if (denuvoOwner && denuvoOwner != g_currentSteamId)
 	{
-		//Would love to log the SteamId, but for users anonymity I won't
 		g_pLog->once("Skipping %u because it's a Denuvo game from someone else\n", appId);
 		return false;
 	}
@@ -98,7 +95,6 @@ bool Apps::checkAppOwnership(uint32_t appId, CAppOwnershipInfo* pInfo)
 
 	if (!manualUnlock && g_config.automaticFilter.get())
 	{
-		//Returning false after we modify data shouldn't cause any problems because it should just get discarded
 		if (!g_pClientApps)
 		{
 			return false;
@@ -128,14 +124,12 @@ bool Apps::checkAppOwnership(uint32_t appId, CAppOwnershipInfo* pInfo)
 
 void Apps::getSubscribedApps(uint32_t* appList, size_t size, uint32_t& count)
 {
-	//Valve calls this function twice, once with size of 0 then again
 	if (!size || !appList)
 	{
 		count = count + g_config.addedAppIds.get().size();
 		return;
 	}
 
-	//TODO: Maybe Add check if AppId already in list before blindly appending
 	for(auto& appId : g_config.addedAppIds.get())
 	{
 		appList[count++] = appId;
@@ -161,7 +155,6 @@ bool Apps::shouldDisableCDKey(uint32_t appId)
 
 bool Apps::shouldDisableUpdates(uint32_t appId)
 {
-	//Using AdditionalApps here aswell so users can manually block updates
 	return g_config.isAddedAppId(appId) || !g_pSteamEngine->getUser(0)->isSubscribed(appId);
 }
 
@@ -223,13 +216,63 @@ void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
 		{
 			game->set_owner_id(1);
 		}
-		//game->set_game_flags(EGAMEFLAG_MULTIPLAYER);
 	}
 }
 
 void Apps::sendPICSInfoRequest(CMsgClientPICSProductInfoRequest* msg)
 {
 	const auto tokens = g_config.appTokens.get();
+	const auto added = g_config.addedAppIds.get();
+
+	std::unordered_set<uint32_t> alreadyRequested;
+	for (int i = 0; i < msg->apps_size(); ++i)
+	{
+		alreadyRequested.insert(msg->apps(i).appid());
+	}
+
+	int injected = 0;
+	for (uint32_t appId : added)
+	{
+		if (!appId)
+		{
+			g_pLog->debug("PICS-request: skip injection for appId=0\n");
+			continue;
+		}
+		if (alreadyRequested.count(appId))
+		{
+			g_pLog->debug("PICS-request: skip injection for %u (already in request)\n", appId);
+			continue;
+		}
+
+		auto* entry = msg->add_apps();
+		entry->set_appid(appId);
+		if (tokens.contains(appId))
+		{
+			entry->set_access_token(tokens.at(appId));
+		}
+		++injected;
+		g_pLog->debug("PICS-request: injected %u\n", appId);
+	}
+	g_pLog->debug("PICS-request: addedAppIds.size=%zu, injected=%d\n", added.size(), injected);
+	if (injected > 0)
+	{
+		g_pLog->debug("PICS-request: injected %d AdditionalApps into outgoing request\n", injected);
+
+		if (msg->meta_data_only())
+		{
+			msg->set_meta_data_only(false);
+			g_pLog->debug("PICS-request: forced meta_data_only=false to get full buffers\n");
+		}
+	}
+
+	std::stringstream sentIds;
+	for (int i = 0; i < msg->apps_size(); ++i)
+	{
+		if (i) sentIds << ',';
+		sentIds << msg->mutable_apps(i)->appid();
+	}
+	g_pLog->debug("PICS-request: apps=%d packages=%d ids=[%s]\n",
+	              msg->apps_size(), msg->packages_size(), sentIds.str().c_str());
 
 	for(int i = 0; i < msg->apps_size(); i++)
 	{

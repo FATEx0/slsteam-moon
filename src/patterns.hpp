@@ -21,7 +21,6 @@ public:
 
 	Pattern_t(const char* name, const char* pattern, MemHlp::SigFollowMode followMode, lm_module_t* module = nullptr);
 	Pattern_t(const char* name, const char* pattern, MemHlp::SigFollowMode followMode, std::vector<uint8_t> prologue, lm_module_t* module = nullptr);
-	//~CPattern();
 
 	bool find();
 };
@@ -60,7 +59,6 @@ namespace Patterns
 
 	namespace CUser
 	{
-		//TODO: Order & Convert old patterns
 		extern Pattern_t CheckAppOwnership;
 		extern Pattern_t GetSubscribedApps;
 		extern Pattern_t PostCallback;
@@ -105,6 +103,16 @@ namespace Patterns
 		extern Pattern_t RunIPCFrame;
 	}
 
+	namespace CPackageInfoCache
+	{
+		extern Pattern_t LoadPackage;
+	}
+
+	namespace CUtlMemory
+	{
+		extern Pattern_t Grow;
+	}
+
 	namespace IClientUtils
 	{
 		extern Pattern_t RunIPCFrame;
@@ -112,7 +120,6 @@ namespace Patterns
 	}
 
 
-	//steamui.so
 	namespace ISteamMatchmakingPingResponse
 	{
 		extern Pattern_t ServerResponded;

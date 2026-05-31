@@ -239,7 +239,6 @@ namespace Patterns
 		Pattern_t GetSteamId
 		{
 			"IClientUser::GetSteamID",
-			//Not unique. All matches point to correct function though
 			"E8 ? ? ? ? 89 D8 83 C4 0C 83 C4 08 5B C2 04 00 ? 83 EC 08 50 53 FF D2 89 D8 83 C4 0C 83 C4 08 5B C2 04 00",
 			SigFollowMode::Relative
 		};
@@ -280,6 +279,26 @@ namespace Patterns
 		};
 	}
 
+	namespace CPackageInfoCache
+	{
+		Pattern_t LoadPackage
+		{
+			"CPackageInfoCache::LoadPackage",
+			"E8 ? ? ? ? 83 C4 10 84 C0 0F 84 ? ? ? ? 8B 95 ? ? FF FF 8B 7A 18 83 FF FF",
+			SigFollowMode::Relative
+		};
+	}
+
+	namespace CUtlMemory
+	{
+		Pattern_t Grow
+		{
+			"CUtlMemory::Grow",
+			"E8 ? ? ? ? 8B 85 ? ? FF FF 83 C4 10 8B 40 44 89 85 ? ? FF FF 83 C0 01 E9",
+			SigFollowMode::Relative
+		};
+	}
+
 	namespace IClientUtils
 	{
 		Pattern_t RunIPCFrame
@@ -297,7 +316,6 @@ namespace Patterns
 		};
 	}
 
-	//steamui.so
 	namespace ISteamMatchmakingPingResponse
 	{
 		Pattern_t ServerResponded

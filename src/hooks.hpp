@@ -20,12 +20,10 @@ union FunctionUnion_t
 	lm_address_t address;
 };
 
-//TODO: Look up if there's an interface kinda thing for C++
 template<typename T>
 class Hook
 {
 public:
-	//TODO: Add base setup fn to set hookFn
 	std::string name;
 	FunctionUnion_t<T> originalFn;
 	FunctionUnion_t<T> hookFn;
@@ -141,6 +139,7 @@ namespace Hooks
 	typedef bool(*IClientAppManager_IsAppDlcInstalled_t)(void*, uint32_t, uint32_t);
 	typedef unsigned int(*IClientApps_GetDLCCount_t)(void*, uint32_t);
 	typedef bool(*IClientApps_GetDLCDataByIndex_t)(void*, uint32_t, int, uint32_t*, bool*, char*, size_t);
+	typedef int32_t(*IClientApps_GetAppData_t)(void*, uint32_t, const char*, char*, uint32_t);
 	typedef bool(*IClientRemoteStorage_IsCloudEnabledForApp_t)(void*, uint32_t);
 	typedef uint32_t(*IClientUtils_GetAppId_t)(void*);
 
@@ -151,6 +150,7 @@ namespace Hooks
 
 	extern VFTHook<IClientApps_GetDLCDataByIndex_t> IClientApps_GetDLCDataByIndex;
 	extern VFTHook<IClientApps_GetDLCCount_t> IClientApps_GetDLCCount;
+	extern VFTHook<IClientApps_GetAppData_t> IClientApps_GetAppData;
 
 	extern VFTHook<IClientRemoteStorage_IsCloudEnabledForApp_t> IClientRemoteStorage_IsCloudEnabledForApp;
 
@@ -160,11 +160,9 @@ namespace Hooks
 	typedef void(*ISteamMatchmakingPingResponse_ServerResponded_t)(void*, gameserverdetails_t*);
 
 
-	//steamui.so
 	extern DetourHook<ISteamMatchmakingPingResponse_ServerResponded_t> ISteamMatchmakingPingResponse_ServerResponded;
 
 
-	//Naked
 	extern lm_address_t IClientUser_GetSteamId;
 
 	bool setup();

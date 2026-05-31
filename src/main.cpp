@@ -7,6 +7,10 @@
 #include "update.hpp"
 #include "utils.hpp"
 
+#include "feats/appinfo_vdf.hpp"
+#include "feats/depotkey.hpp"
+#include "feats/packagepatch.hpp"
+
 #include "libmem/libmem.h"
 
 #include <chrono>
@@ -123,6 +127,33 @@ static void setup()
 		return;
 	}
 
+	// Steamtools-Linux: splice cached PICS buffers into appcache/appinfo.vdf
+	// before Steam opens the file.  Each buffer was captured during a
+	// previous session by `feats/pics.cpp::recvProductInfoResponse`.  This
+	// is path A.5: the cache must already exist on disk; first-run
+	// installs need a Steam restart so the buffers can be picked up.
+	{
+		const char* home = std::getenv("HOME");
+		if (home)
+		{
+			static const char* steamRoots[] = {
+				"/.steam/steam",
+				"/.steam/debian-installation",
+				"/.local/share/Steam",
+			};
+			for (const char* suffix : steamRoots)
+			{
+				const auto candidate = std::string(home) + suffix +
+				    "/appcache/appinfo.vdf";
+				if (std::filesystem::exists(candidate))
+				{
+					AppInfoVdf::injectAllCached(candidate);
+					break;
+				}
+			}
+		}
+	}
+
 	//Since we can't statically link everything and some distros seem to respect LD_LIBRARY_PATH
 	//more or less than mine does we just force append those
 	//Hopefully this won't mess anything else up
@@ -200,6 +231,23 @@ static void load()
 	}
 
 	SLSAPI::init();
+
+	// Steamtools-Linux: import Lua scripts and provision manifest files.
+	// Must run AFTER setup so g_config.getDir() is valid and AFTER hooks
+	// so g_pLog is alive.
+	DepotKey::onStartup();
+
+	// Steamtools-Linux: re-inject AdditionalApps into package 0 in case
+	// Steam already loaded it before our hook was placed.  No-op when
+	// the LoadPackage detour has already seeded the same ids.
+	{
+		const auto added = g_config.addedAppIds.get();
+		if (!added.empty())
+		{
+			std::vector<uint32_t> ids(added.begin(), added.end());
+			PackagePatch::injectIntoPackage0(ids);
+		}
+	}
 
 	if (g_config.notifyInit.get())
 	{

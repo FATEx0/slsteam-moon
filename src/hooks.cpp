@@ -19,9 +19,12 @@
 
 #include "feats/achievements.hpp"
 #include "feats/apps.hpp"
+#include "feats/depotkey.hpp"
 #include "feats/dlc.hpp"
 #include "feats/misc.hpp"
 #include "feats/fakeappid.hpp"
+#include "feats/packagepatch.hpp"
+#include "feats/pics.hpp"
 #include "feats/ticket.hpp"
 
 #include "libmem/libmem.h"
@@ -49,7 +52,6 @@ DetourHook<T>::DetourHook(const char* name) : Hook<T>::Hook(name)
 	this->size = 0;
 }
 
-//TODO: Fix this ungodly mess
 template<typename T>
 DetourHook<T>::DetourHook() : DetourHook<T>("")
 {
@@ -125,8 +127,6 @@ void VFTHook<T>::place()
 template<typename T>
 void VFTHook<T>::remove()
 {
-	//No clue how libmem reacts when unhooking a non existent hook
-	//so we do this
 	if (!this->hooked)
 	{
 		return;
@@ -187,7 +187,6 @@ static void hkProtoBufMsgBase_InitFromPacket(CProtoBufMsgBase* pMsg, void* pSrc)
 {
 	Hooks::CProtoBufMsgBase_InitFromPacket.tramp.fn(pMsg, pSrc);
 
-	//Safety first
 	if (!pSrc)
 	{
 		return;
@@ -196,13 +195,16 @@ static void hkProtoBufMsgBase_InitFromPacket(CProtoBufMsgBase* pMsg, void* pSrc)
 	g_pLog->debug("Received ProtoBufMsg of type %u with type %s\n", pMsg->type, MemHlp::getTypeName(pMsg));
 
 	Achievements::recvMessage(pMsg);
+	DepotKey::recvMsg(pMsg);
 	Misc::recvMsg(pMsg);
+	PICS::recvMsg(pMsg);
 	Ticket::recvMsg(pMsg);
 }
 
 static uint32_t hkProtoBufMsgBase_Send(CProtoBufMsgBase* pMsg)
 {
 	Apps::sendMsg(pMsg);
+	DepotKey::sendMsg(pMsg);
 	FakeAppIds::sendMsg(pMsg);
 
 	const uint32_t ret = Hooks::CProtoBufMsgBase_Send.tramp.fn(pMsg);
@@ -291,7 +293,6 @@ static uint32_t hkUser_CheckAppOwnership(void* pClientUser, uint32_t appId, CApp
 {
 	const uint32_t ret = Hooks::CUser_CheckAppOwnership.tramp.fn(pClientUser, appId, pOwnershipInfo);
 
-	//Do not log pOwnershipInfo because it gets deleted very quickly, so it's pretty much useless in the logs
 	g_pLog->once
 	(
 		"%s(%p, %u) -> %i\n",
@@ -366,7 +367,6 @@ static void* hkClientAppManager_LaunchApp(void* pClientAppManager, uint32_t* pAp
 		Ticket::launchApp(*pAppId);
 	}
 
-	//Do not do anything in post! Otherwise App launching will break
 	return Hooks::IClientAppManager_LaunchApp.originalFn.fn(pClientAppManager, pAppId, a2, a3, a4);
 }
 
@@ -454,6 +454,23 @@ static void hkClientAppManager_RunIPCFrame(void* pClientAppManager, void* a1, vo
 	Hooks::IClientAppManager_RunIPCFrame.originalFn.fn(pClientAppManager, a1, a2, a3);
 }
 
+static int32_t hkClientApps_GetAppData(void* pClientApps, uint32_t appId, const char* name, char* pChOut, uint32_t outSize)
+{
+	const int32_t ret = Hooks::IClientApps_GetAppData.originalFn.fn(pClientApps, appId, name, pChOut, outSize);
+
+	g_pLog->once
+	(
+		"%s(%u, %s, len=%u) -> %i\n",
+		Hooks::IClientApps_GetAppData.name.c_str(),
+		appId,
+		name ? name : "(null)",
+		outSize,
+		ret
+	);
+
+	return ret;
+}
+
 static unsigned int hkClientApps_GetDLCCount(void* pClientApps, uint32_t appId)
 {
 	uint32_t count = Hooks::IClientApps_GetDLCCount.originalFn.fn(pClientApps, appId);
@@ -482,7 +499,6 @@ static bool hkClientApps_GetDLCDataByIndex(void* pClientApps, uint32_t appId, in
 {
 	appId = FakeAppIds::getRealAppIdForCurrentPipe();
 
-	//Preserve original call to populate stuff
 	const bool ret = DLC::getDlcDataByIndex(appId, dlcIndex, pDlcId, pIsAvailable, pChDlcName, dlcNameLen)
 		|| Hooks::IClientApps_GetDLCDataByIndex.originalFn.fn(pClientApps, appId, dlcIndex, pDlcId, pIsAvailable, pChDlcName, dlcNameLen);
 
@@ -518,9 +534,11 @@ static void hkClientApps_RunIPCFrame(void* pClientApps, void* a1, void* a2, void
 
 		Hooks::IClientApps_GetDLCDataByIndex.setup(vft, VFTIndexes::IClientApps::GetDLCDataByIndex, hkClientApps_GetDLCDataByIndex);
 		Hooks::IClientApps_GetDLCCount.setup(vft, VFTIndexes::IClientApps::GetDLCCount, hkClientApps_GetDLCCount);
+		Hooks::IClientApps_GetAppData.setup(vft, VFTIndexes::IClientApps::GetAppData, hkClientApps_GetAppData);
 
 		Hooks::IClientApps_GetDLCDataByIndex.place();
 		Hooks::IClientApps_GetDLCCount.place();
+		Hooks::IClientApps_GetAppData.place();
 
 		g_pLog->debug("IClientApps->vft at %p\n", vft->vtable);
 
@@ -569,7 +587,6 @@ static void hkClientRemoteStorage_RunIPCFrame(void* pClientRemoteStorage, void* 
 		hooked = true;
 	}
 	
-	//Cloud & Workshop
 	FakeAppIds::runIPCFrame(false);
 	Hooks::IClientRemoteStorage_RunIPCFrame.tramp.fn(pClientRemoteStorage, a1, a2, a3);
 	FakeAppIds::runIPCFrame(true);
@@ -577,7 +594,6 @@ static void hkClientRemoteStorage_RunIPCFrame(void* pClientRemoteStorage, void* 
 
 static void hkClientUGC_RunIPCFrame(void* pClientUGC, void* a1, void* a2, void* a3)
 {
-	//Workshop
 	FakeAppIds::runIPCFrame(false);
 	Hooks::IClientUGC_RunIPCFrame.tramp.fn(pClientUGC, a1, a2, a3);
 	FakeAppIds::runIPCFrame(true);
@@ -645,14 +661,6 @@ static void hkClientUtils_RunIPCFrame(void* pClientUtils, void* a1, void* a2, vo
 static bool hkClientUser_BLoggedOn(void* pClientUser)
 {
 	const bool ret = Hooks::IClientUser_BLoggedOn.tramp.fn(pClientUser);
-	//Useless logging
-	//g_pLog->debug
-	//(
-	//	"%s(%p) -> %i\n",
-	//	Hooks::IClientUser_BLoggedOn.name.c_str(),
-	//	pClientUser,
-	//	ret
-	//);
 	
 	if (Misc::shouldFakeOffline())
 	{
@@ -709,9 +717,7 @@ static uint32_t hkClientUser_GetAppOwnershipTicketExtendedData(
 static uint8_t hkClientUser_IsUserSubscribedAppInTicket(void* pClientUser, uint32_t steamId, uint32_t a2, uint32_t a3, uint32_t appId)
 {
 	const uint8_t ticketState = Hooks::IClientUser_IsUserSubscribedAppInTicket.tramp.fn(pClientUser, steamId, a2, a3, appId);
-	//g_pLog->once("IClientUser::IsUserSubscribedAppInTicket(%p, %u, %u, %u, %u) -> %i\n", pClientUser, steamId, a2, a3, appId, ticketState);
-	//Don't log the steamId, protect users from themselves and stuff
-	g_pLog->once
+	g_pLog->debug
 	(
 		"%s(%p, %u, %u, %u) -> %i\n",
 
@@ -725,7 +731,6 @@ static uint8_t hkClientUser_IsUserSubscribedAppInTicket(void* pClientUser, uint3
 	
 	if (DLC::userSubscribedInTicket(appId))
 	{
-		//Owned and subscribed hehe :)
 		return 0;
 	}
 
@@ -748,7 +753,6 @@ static uint32_t hkClientUser_GetSteamId(uint32_t steamId)
 	}
 	else if (Ticket::oneTimeSteamIdSpoof)
 	{
-		//One time spoof should be enough for this type
 		steamId = Ticket::oneTimeSteamIdSpoof;
 		Ticket::oneTimeSteamIdSpoof = 0;
 	}
@@ -781,24 +785,15 @@ static bool hkClientUser_RequiresLegacyCDKey(void* pClientUser, uint32_t appId, 
 
 static void hkClientUser_RunIPCFrame(void* pClientUser, void* a1, void* a2, void* a3)
 {
-	//g_pClientUser = reinterpret_cast<IClientUser*>(pClientUser);
 
-	//std::shared_ptr<lm_vmt_t> vft = std::make_shared<lm_vmt_t>();
-	//LM_VmtNew(*reinterpret_cast<lm_address_t**>(pClientUser), vft.get());
 
-	//g_pLog->debug("IClientUser->vft at %p\n", vft->vtable);
 
-	//Hooks::IClientUser_RunIPCFrame.remove();
-	//Hooks::IClientUser_RunIPCFrame.originalFn.fn(pClientUser, a1, a2, a3);
 	
-	//FakeAppIds::pipeLoop(false);
 	Hooks::IClientUser_RunIPCFrame.tramp.fn(pClientUser, a1, a2, a3);
-	//FakeAppIds::pipeLoop(true);
 }
 
 static void hkClientUserStats_RunIPCFrame(void* pClientUserStats, void* a1, void* a2, void* a3)
 {
-	//Achievements
 	FakeAppIds::runIPCFrame(false);
 	Hooks::IClientUserStats_RunIPCFrame.tramp.fn(pClientUserStats, a1, a2, a3);
 	FakeAppIds::runIPCFrame(true);
@@ -855,7 +850,6 @@ static bool createAndPlaceSteamIdHook()
 	const unsigned int retIdx = insts.size() - 1;
 
 	g_pLog->debug("Ret is instruction number %u\n", retIdx);
-	//TODO: Create InlineHook class for this
 	size_t totalBytes = 0;
 	unsigned int instsToOverwrite = 0;
 	for(int i = retIdx; i >= 0; i--)
@@ -864,7 +858,6 @@ static bool createAndPlaceSteamIdHook()
 		totalBytes += inst.size;
 		instsToOverwrite++;
 
-		//Need only 5 bytes to place relative jmp
 		if (totalBytes >= 5)
 		{
 			break;
@@ -874,12 +867,9 @@ static bool createAndPlaceSteamIdHook()
 	static uint32_t steamId;
 
 	lm_address_t writeAddr = hkNakedGetSteamId;
-	//I really didn't want to use pushad and popad since it's just lazy
-	//But I'm bad at this so this has to do
 	MemHlp::assembleCodeAt(writeAddr, "mov [%p], ecx", &steamId);
 	MemHlp::assembleCodeAt(writeAddr, "pushad", nullptr);
 	MemHlp::assembleCodeAt(writeAddr, "pushfd", nullptr);
-	//MemHlp::assembleCodeAt(writeAddr, "pushfq", nullptr);
 
 	MemHlp::assembleCodeAt(writeAddr, "mov eax, %p", &hkClientUser_GetSteamId);
 	MemHlp::assembleCodeAt(writeAddr, "mov ebx, [%p]", &steamId);
@@ -887,26 +877,13 @@ static bool createAndPlaceSteamIdHook()
 	MemHlp::assembleCodeAt(writeAddr, "call eax", nullptr);
 	MemHlp::assembleCodeAt(writeAddr, "mov [%p], eax", &steamId);
 
-	//MemHlp::assembleCodeAt(writeAddr, "popfq", nullptr);
 	MemHlp::assembleCodeAt(writeAddr, "popfd", nullptr);
 	MemHlp::assembleCodeAt(writeAddr, "popad", nullptr);
 	MemHlp::assembleCodeAt(writeAddr, "mov ecx, [%p]", &steamId);
 	
-	//TODO: Dynamically resolve register which holds SteamId
-	//MemHlp::assembleCodeAt(writeAddr, "mov [%p], ecx", &g_currentSteamId);
 
-	//MemHlp::assembleCodeAt(writeAddr, "push eax", nullptr);
 
-	//MemHlp::assembleCodeAt(writeAddr, "mov eax, [%p]", &Ticket::steamIdSpoof);
-	//MemHlp::assembleCodeAt(writeAddr, "test eax, eax", nullptr);
-	//MemHlp::assembleCodeAt(writeAddr, "je %p", 4); //2 bytes
-	//MemHlp::assembleCodeAt(writeAddr, "mov ecx, eax", nullptr); //2 bytes
-	//MemHlp::assembleCodeAt(writeAddr, "mov eax, 0", nullptr); //5 bytes
-	//MemHlp::assembleCodeAt(writeAddr, "mov [%p], eax", &Ticket::steamIdSpoof); //5 bytes
-	//
-	//MemHlp::assembleCodeAt(writeAddr, "pop eax", nullptr);
 
-	//Write the overwritten instructions after our hook code
 	for (unsigned int i = 0; i < instsToOverwrite; i++)
 	{
 		lm_inst_t inst = insts.at(insts.size() - instsToOverwrite + i);
@@ -919,7 +896,6 @@ static bool createAndPlaceSteamIdHook()
 	lm_address_t jmpAddr = insts.at(insts.size() - instsToOverwrite).address;
 	g_pLog->debug("Placing jmp at %p\n", jmpAddr);
 
-	//Might be worth to convert to LM_AssembleEx, but whatever
 	lm_prot_t oldProt;
 	LM_ProtMemory(jmpAddr, 5, LM_PROT_XRW, &oldProt);
 	*reinterpret_cast<lm_byte_t*>(jmpAddr) = 0xE9;
@@ -931,7 +907,6 @@ static bool createAndPlaceSteamIdHook()
 
 namespace Hooks
 {
-	//TODO: Lazily intialize in a different way, or preload glibc
 	DetourHook<TraceIPC_t> TraceIPC;
 
 	DetourHook<IClientAppManager_RunIPCFrame_t> IClientAppManager_RunIPCFrame;
@@ -971,6 +946,7 @@ namespace Hooks
 
 	VFTHook<IClientApps_GetDLCDataByIndex_t> IClientApps_GetDLCDataByIndex("IClientApps::GetDLCDataByIndex");
 	VFTHook<IClientApps_GetDLCCount_t> IClientApps_GetDLCCount("IClientApps::GetDLCCount");
+	VFTHook<IClientApps_GetAppData_t> IClientApps_GetAppData("IClientApps::GetAppData");
 
 	VFTHook<IClientRemoteStorage_IsCloudEnabledForApp_t> IClientRemoteStorage_IsCloudEnabledForApp("IClientRemoteStorage::IsCloudEnabledForApp");
 
@@ -978,11 +954,9 @@ namespace Hooks
 	VFTHook<IClientUtils_GetOfflineMode_t> IClientUtils_GetOfflineMode("IClientUtils::GetOfflineMode");
 
 
-	//steamui.so
 	DetourHook<ISteamMatchmakingPingResponse_ServerResponded_t> ISteamMatchmakingPingResponse_ServerResponded;
 
 
-	//Naked
 	lm_address_t IClientUser_GetSteamId;
 }
 
@@ -1028,7 +1002,9 @@ bool Hooks::setup()
 		&& ISteamMatchmakingPingResponse_ServerResponded.setup(Patterns::ISteamMatchmakingPingResponse::ServerResponded, hkSteamMatchmakingPingResponse_ServerResponded);
 
 	Hooks::place();
-	//This is unnecessary but I'll keep this for now in case I wanna improve error checks
+
+	PackagePatch::setup();
+
 	return succeeded;
 }
 
@@ -1040,7 +1016,6 @@ void Hooks::place()
 		patchRetn(Patterns::StopPlayingBorrowedApp.address);
 	}
 
-	//Detours
 	TraceIPC.place();
 
 	CAPIJob_GetPlayerStats.place();
@@ -1080,7 +1055,6 @@ void Hooks::place()
 
 void Hooks::remove()
 {
-	//Detours
 	TraceIPC.remove();
 
 	CAPIJob_GetPlayerStats.remove();
@@ -1115,7 +1089,6 @@ void Hooks::remove()
 
 	ISteamMatchmakingPingResponse_ServerResponded.remove();
 
-	//VFT Hooks
 	IClientAppManager_BIsDlcEnabled.remove();
 	IClientAppManager_GetAppUpdateInfo.remove();
 	IClientAppManager_LaunchApp.remove();
@@ -1128,7 +1101,8 @@ void Hooks::remove()
 
 	IClientUtils_GetAppId.remove();
 	
-	//TODO: Remove jmp
+	PackagePatch::remove();
+
 	if (hkNakedGetSteamId != LM_ADDRESS_BAD)
 	{
 		LM_FreeMemory(hkNakedGetSteamId, 0);
