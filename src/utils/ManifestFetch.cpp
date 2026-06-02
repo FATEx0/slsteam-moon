@@ -294,7 +294,7 @@ bool fetchManifestBlob(uint64_t gid, uint32_t depotId, const std::string& depotc
 		return false;
 	}
 
-	const std::string tmpOutPath = targetPath + ".tmp";
+	const std::string tmpOutPath = targetPath + ".slsteam_tmp";
 	const std::string cmd =
 	    "unzip -p " + std::string(tmpZip) + " > " + tmpOutPath + " 2>/dev/null";
 	const int rc = std::system(cmd.c_str());
