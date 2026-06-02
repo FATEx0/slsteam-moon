@@ -5,11 +5,11 @@ SLSPATH="$SLSDIR/path"
 SLSLIB="$SLSDIR/SLSsteam.so"
 SLSAUDIT="LD_AUDIT=\"$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so\""
 
-
 uninstall()
 {
-	test -f "$SLSDIR/steam-jupiter.bak" && sudo cp -v "$SLSDIR/steam-jupiter.bak" "$(realpath "$(type -P steam-jupiter)")" #Left over from Steam Deck patcher
-	rm -v "$HOME/.config/fish/SLSsteam.fish" 2> /dev/null
+	test -f "$SLSDIR/steam-jupiter.bak" && sudo cp -v "$SLSDIR/steam-jupiter.bak" "$(realpath "$(type -P steam-jupiter)")"
+	rm -v "$HOME/.config/fish/conf.d/SLSsteam.fish" 2> /dev/null
+	sed -i '/export PATH="$HOME\/.local\/share\/SLSsteam\/path:$PATH"/d' "$HOME/.bashrc" "$HOME/.zshrc" 2> /dev/null
 	rm -v "$HOME/.local/share/applications/steam.desktop" 2> /dev/null
 	rm -v "$HOME/.local/share/applications/steam-native.desktop" 2> /dev/null
 	rm -rvf "$SLSDIR"
@@ -19,7 +19,12 @@ uninstall()
 install_wrapper()
 {
 	EXE="$1"
-	FPATH="$(type -P $EXE)"
+	FPATH="$(type -P $EXE 2>/dev/null)"
+
+	if [ -z "$FPATH" ]; then
+		echo "$EXE not found in path! Skipping"
+		return 1
+	fi
 
 	DIRNAME="$(dirname "$FPATH")"
 	if [ "$DIRNAME" = "$SLSPATH" ]; then
@@ -27,13 +32,7 @@ install_wrapper()
 		return 0
 	fi
 
-	if [[ $? -ne 0 ]]; then
-		echo "$EXE not found in path! Skipping"
-		return 1
-	fi
-
 	echo -e "#!/bin/sh\n$SLSAUDIT \"$FPATH\"" > "$SLSPATH/$EXE"
-
 	chmod u+x "$SLSPATH/$EXE"
 
 	echo "Created wrapper for $FPATH at $SLSPATH/$EXE"
@@ -44,85 +43,74 @@ install_desktop_file()
 {
 	NAME="$1.desktop"
 	USR_APP_DIR="$HOME/.local/share/applications"
-	APP_DIR="/usr/share/applications"
+	
+	APP_DIR=""
+	for dir in "/usr/share/applications" "/usr/local/share/applications" "$HOME/.local/share/applications"; do
+		if [ -f "$dir/$NAME" ]; then
+			APP_DIR="$dir"
+			break
+		fi
+	done
 
-	#All these error checks are borderline insane, but I won't assume anything anymore.
-	if [ ! -f "$APP_DIR/$NAME" ]; then
+	if [ -z "$APP_DIR" ]; then
 		echo "$NAME not found in applications! Skipping"
 		return 1
 	fi
 
 	if [ ! -d "$USR_APP_DIR" ]; then
-		mkdir "$USR_APP_DIR"
-		if [[ $? -ne 0 ]]; then
-			echo "Failed to create $USR_APP_DIR! Aborting .desktop creation"
-			return 1
-		fi
+		mkdir -p "$USR_APP_DIR" || return 1
 	fi
 
-	cp "$APP_DIR/$NAME" "$USR_APP_DIR/"
-	sed -i "s|^Exec=/|Exec=env $SLSAUDIT /|" "$USR_APP_DIR/$NAME"
-
-	echo "Created $USR_APP_DIR/$NAME"
+	if [ "$APP_DIR" != "$USR_APP_DIR" ] || ! grep -q "$SLSAUDIT" "$USR_APP_DIR/$NAME"; then
+		cp "$APP_DIR/$NAME" "$USR_APP_DIR/$NAME.tmp"
+		sed -i "s|^Exec=\(.*steam.*\)|Exec=env $SLSAUDIT \1|" "$USR_APP_DIR/$NAME.tmp"
+		mv "$USR_APP_DIR/$NAME.tmp" "$USR_APP_DIR/$NAME"
+		echo "Created $USR_APP_DIR/$NAME"
+	else
+		echo "$NAME is already patched! Skipping"
+	fi
 }
 
 install_path()
 {
-	SHELLPATH="$(realpath "$SHELL")"
-	CMD="$(echo "export PATH=\"$SLSPATH:\$PATH\"")"
+	SHELL_NAME="$(basename "$SHELL")"
+	CMD="export PATH=\"$SLSPATH:\$PATH\""
 
-	if [ "$SHELLPATH" = "/usr/bin/fish" ]; then
+	if [ "$SHELL_NAME" = "fish" ]; then
+		mkdir -p "$HOME/.config/fish/conf.d"
 		SLSSTEAM_FISH="$HOME/.config/fish/conf.d/SLSsteam.fish"
 		if [ ! -f "$SLSSTEAM_FISH" ]; then
-			echo "$CMD" > "$SLSSTEAM_FISH"
-			echo "Wrote $CMD to $SLSSTEAM_FISH"
-
+			echo "set -gx PATH \"$SLSPATH\" \$PATH" > "$SLSSTEAM_FISH"
+			echo "Wrote path config to $SLSSTEAM_FISH"
 			echo "Relog for changes to take effect!"
 		fi
+	elif [ "$SHELL_NAME" = "bash" ] || [ "$SHELL_NAME" = "zsh" ]; then
+		RC_FILE="$HOME/.${SHELL_NAME}rc"
+		if ! grep -q "$SLSPATH" "$RC_FILE" 2>/dev/null; then
+			echo "" >> "$RC_FILE"
+			echo "$CMD" >> "$RC_FILE"
+			echo "Wrote path config to $RC_FILE"
+			echo "Relog or run 'source $RC_FILE' for changes to take effect!"
+		fi
 	else
-		echo "User is on unsupported shell! Skipping path installation"
-		return 1
+		echo "User is on unsupported shell ($SHELL_NAME)! Please add $SLSPATH to your PATH manually."
 	fi
-
-	return 0
 }
 
 install_slssteam()
 {
 	LIB="./bin/SLSsteam.so"
 	if [ ! -f "$LIB" ]; then
-		echo "bin/SLSsteam.so not found! Did you run the install.sh in the correct directory?"
+		echo "$LIB not found! Did you run setup.sh in the correct directory?"
 		exit 1
 	fi
 
-	if [ ! -d "$SLSDIR" ]; then
-		#Not using -p flag because it will silence errors
-		#Although I don't think there's anyone that doesn't have a ~/.local/share directory
-		mkdir "$SLSDIR"
-		if [[ $? -ne 0 ]]; then
-			echo "Unable to create $SLSDIR! Aborting"
-			exit 1
-		fi
-	fi
-
-	if [ ! -d "$SLSPATH" ]; then #This whole fucking block should be unnecessary. Well, better safe than sorry. Thanks Valve for the Deck
-		mkdir "$SLSPATH"
-
-		if [[ $? -ne 0 ]]; then
-			echo "Unable to create $SLSPATH! Aborting"
-			exit 1
-		fi
-	fi
+	mkdir -p "$SLSDIR" || exit 1
+	mkdir -p "$SLSPATH" || exit 1
 
 	cp -v ./bin/* "$SLSDIR/"
 }
 
-# Bundles the Steam Stub bypass helper + Steamless binaries into
-# the SLSsteam install dir.  feats/steamstub.cpp probes for both
-# steamstub-bypass/run-steamless.sh and steamless-bin/Steamless.CLI.exe
-# under the .so's directory at runtime; this layout matches.
-# Idempotent: install-steamless.sh skips its download when the
-# binaries are already in place.
 install_steamstub()
 {
 	TARGET="$1"
@@ -149,18 +137,15 @@ install_all()
 	install_steamstub "$SLSDIR"
 
 	install_path
-	if [[ $? -eq 0 ]]; then
-		install_wrapper steam
-		install_wrapper steam-runtime
-		#Wrapping the steam-jupiter doesn't work, probably doesn't get called from PATH
-		install_wrapper steam-native
-	fi
+	
+	install_wrapper steam
+	install_wrapper steam-runtime
+	install_wrapper steam-native
 
 	install_desktop_file steam
-	#No steam-runtime.desktop (atleast on my Arch install...)
 	install_desktop_file steam-native
 
-	echo "Install script done! If any wrappers or .desktop files have been created it was successfull."
+	echo "Install script done! If any wrappers or .desktop files have been created it was successful."
 }
 
 if [[ $# -lt 1 ]]; then
