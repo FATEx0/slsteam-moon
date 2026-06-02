@@ -5,9 +5,6 @@ SLSPATH="$SLSDIR/path"
 SLSLIB="$SLSDIR/SLSsteam.so"
 SLSAUDIT="LD_AUDIT=\"$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so\""
 
-FLATPAK_APP_ID="com.valvesoftware.Steam"
-FLATPAK_SLSDIR="$HOME/.var/app/$FLATPAK_APP_ID/.local/share/SLSsteam"
-FLATPAK_LD_AUDIT="/app/links/\$LIB/libshared-library-guard.so:$FLATPAK_SLSDIR/library-inject.so:$FLATPAK_SLSDIR/SLSsteam.so"
 
 uninstall()
 {
@@ -17,19 +14,6 @@ uninstall()
 	rm -v "$HOME/.local/share/applications/steam-native.desktop" 2> /dev/null
 	rm -rvf "$SLSDIR"
 	echo "Uninstall done!"
-}
-
-uninstall_flatpak()
-{
-	if ! type -P flatpak > /dev/null; then
-		echo "Flatpak not found! Skipping flatpak uninstall"
-		return 1
-	fi
-
-	flatpak override --user --unset-env=LD_AUDIT --unset-env=SHARED_LIBRARY_GUARD "$FLATPAK_APP_ID" 2> /dev/null
-	rm -rvf "$FLATPAK_SLSDIR"
-
-	echo "Flatpak uninstall done!"
 }
 
 install_wrapper()
@@ -159,40 +143,6 @@ install_steamstub()
 		--target "$TARGET/steamless-bin"
 }
 
-install_flatpak()
-{
-	if [ ! -f "./bin/SLSsteam.so" ]; then
-		echo "bin/SLSsteam.so not found! Did you run the install.sh in the correct directory?"
-		return 1
-	fi
-
-	if ! type -P flatpak > /dev/null; then
-		echo "Flatpak not found! Do you have flatpak installed?"
-		return 1
-	fi
-
-	if ! flatpak info "$FLATPAK_APP_ID" > /dev/null 2>&1; then
-		echo "Flatpak Steam not installed! Do you have Steam Flatpak installed?"
-		return 1
-	fi
-
-	if [ ! -d "$FLATPAK_SLSDIR" ]; then
-		mkdir -p "$FLATPAK_SLSDIR"
-		if [[ $? -ne 0 ]]; then
-			echo "Unable to create $FLATPAK_SLSDIR! Aborting flatpak install"
-			return 1
-		fi
-	fi
-
-	cp -v ./bin/* "$FLATPAK_SLSDIR/"
-
-	install_steamstub "$FLATPAK_SLSDIR"
-
-	flatpak override --user --env=LD_AUDIT="$FLATPAK_LD_AUDIT" --env=SHARED_LIBRARY_GUARD=0 "$FLATPAK_APP_ID"
-
-	echo "Flatpak install done!"
-}
-
 install_all()
 {
 	install_slssteam
@@ -214,7 +164,7 @@ install_all()
 }
 
 if [[ $# -lt 1 ]]; then
-	echo "Usage: $0 install|uninstall|flatpak-install|flatpak-uninstall"
+	echo "Usage: $0 install|uninstall"
 	exit 0
 fi
 
@@ -222,10 +172,6 @@ if [ "$1" == "install" ]; then
 	install_all
 elif [ "$1" == "uninstall" ]; then
 	uninstall
-elif [ "$1" == "flatpak-install" ]; then
-	install_flatpak
-elif [ "$1" == "flatpak-uninstall" ]; then
-	uninstall_flatpak
 else
 	echo "Unknown command $1!"
 	exit 1
