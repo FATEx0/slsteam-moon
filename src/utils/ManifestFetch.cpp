@@ -352,6 +352,14 @@ void submitManifestBlob(uint64_t manifestGid, uint32_t /*appId*/, uint32_t depot
 	}).detach();
 }
 
+bool fetchManifestBlobSync(uint64_t manifestGid, uint32_t depotId)
+{
+	const auto steamRoot = findSteamRootForBlob();
+	if (steamRoot.empty()) return false;
+	const std::string depotcacheDir = steamRoot + "/depotcache";
+	return fetchManifestBlob(manifestGid, depotId, depotcacheDir);
+}
+
 
 
 int getTimeoutSec()

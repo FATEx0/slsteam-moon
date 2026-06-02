@@ -475,25 +475,15 @@ bool hkCDepotDownloadMgr_BYldRequestDepotManifest(void* pthis, uint32_t appId, u
 		
 		if (!std::filesystem::exists(manifestPath) || std::filesystem::file_size(manifestPath) == 0)
 		{
-			g_pLog->info("BYldRequestDepotManifest: manifest file missing, initiating download: %s\n", manifestPath.c_str());
+			g_pLog->info("BYldRequestDepotManifest: manifest file missing, initiating sync download: %s\n", manifestPath.c_str());
 			
-			ManifestFetch::submitManifestBlob(manifestId, appId, depotId);
-			
-			int elapsedMs = 0;
-			const int timeoutMs = 15000; // 15 seconds max timeout
-			while (elapsedMs < timeoutMs)
+			if (ManifestFetch::fetchManifestBlobSync(manifestId, depotId))
 			{
-				if (std::filesystem::exists(manifestPath) && std::filesystem::file_size(manifestPath) > 0)
-				{
-					g_pLog->info("BYldRequestDepotManifest: manifest downloaded and verified after %d ms\n", elapsedMs);
-					break;
-				}
-				std::this_thread::sleep_for(std::chrono::milliseconds(100));
-				elapsedMs += 100;
+				g_pLog->info("BYldRequestDepotManifest: manifest downloaded and verified\n");
 			}
-			if (!std::filesystem::exists(manifestPath) || std::filesystem::file_size(manifestPath) == 0)
+			else
 			{
-				g_pLog->warn("BYldRequestDepotManifest: manifest download timed out after %d ms\n", timeoutMs);
+				g_pLog->warn("BYldRequestDepotManifest: manifest download failed\n");
 			}
 		}
 		else

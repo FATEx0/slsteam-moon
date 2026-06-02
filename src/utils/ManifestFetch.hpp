@@ -16,6 +16,8 @@ namespace ManifestFetch
 	void submitManifestBlob(uint64_t manifestGid,
 	                        uint32_t appId, uint32_t depotId);
 
+	bool fetchManifestBlobSync(uint64_t manifestGid, uint32_t depotId);
+
 	std::optional<uint64_t> resolve(uint64_t jobId);
 
 	void discard(uint64_t jobId);
