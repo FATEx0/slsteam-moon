@@ -130,6 +130,8 @@ std::vector<std::pair<uint32_t, uint64_t>> extractDepotsAndGids(const std::strin
 	int depth = 1;
 	size_t scan = openBrace + 1;
 	uint32_t currentDepotId = 0;
+	std::string currentSection;
+	std::string currentBranch;
 
 	while (scan < buf.size() && depth > 0)
 	{
@@ -154,7 +156,15 @@ std::vector<std::pair<uint32_t, uint64_t>> extractDepotsAndGids(const std::strin
 					catch (...) { currentDepotId = 0; }
 				}
 			}
-			else if (depth > 1 && token == "gid" && currentDepotId != 0)
+			else if (depth == 2)
+			{
+				currentSection = token;
+			}
+			else if (depth == 3 && currentSection == "manifests")
+			{
+				currentBranch = token;
+			}
+			else if (depth == 4 && currentSection == "manifests" && currentBranch == "public" && token == "gid" && currentDepotId != 0)
 			{
 				size_t valStart = buf.find('"', scan);
 				if (valStart != std::string::npos)
