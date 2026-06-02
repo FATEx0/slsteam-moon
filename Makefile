@@ -14,6 +14,7 @@ CXXFLAGS := -O3 -flto=auto -fPIC -m32 -std=c++20 -Wall -Wextra -Wpedantic -Wno-e
 LDFLAGS := -shared -Wl,--no-undefined
 LDFLAGS += $(shell pkg-config --libs "openssl")
 LDFLAGS += $(shell pkg-config --libs "libcurl")
+LDFLAGS += -lpthread -ldl
 
 #DATE := $(shell date "+%Y%m%d%H%M%S")
 DATE := $(shell cat res/version.txt)
