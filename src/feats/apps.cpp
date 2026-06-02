@@ -231,6 +231,7 @@ void Apps::sendPICSInfoRequest(CMsgClientPICSProductInfoRequest* msg)
 	}
 
 	int injected = 0;
+	bool addedInRequest = false;
 	for (uint32_t appId : added)
 	{
 		if (!appId)
@@ -241,6 +242,7 @@ void Apps::sendPICSInfoRequest(CMsgClientPICSProductInfoRequest* msg)
 		if (alreadyRequested.count(appId))
 		{
 			g_pLog->debug("PICS-request: skip injection for %u (already in request)\n", appId);
+			addedInRequest = true;
 			continue;
 		}
 
@@ -251,18 +253,19 @@ void Apps::sendPICSInfoRequest(CMsgClientPICSProductInfoRequest* msg)
 			entry->set_access_token(tokens.at(appId));
 		}
 		++injected;
+		addedInRequest = true;
 		g_pLog->debug("PICS-request: injected %u\n", appId);
 	}
 	g_pLog->debug("PICS-request: addedAppIds.size=%zu, injected=%d\n", added.size(), injected);
+
+	if (addedInRequest && msg->meta_data_only())
+	{
+		msg->set_meta_data_only(false);
+		g_pLog->debug("PICS-request: forced meta_data_only=false (AdditionalApp in batch, need buffers)\n");
+	}
 	if (injected > 0)
 	{
 		g_pLog->debug("PICS-request: injected %d AdditionalApps into outgoing request\n", injected);
-
-		if (msg->meta_data_only())
-		{
-			msg->set_meta_data_only(false);
-			g_pLog->debug("PICS-request: forced meta_data_only=false to get full buffers\n");
-		}
 	}
 
 	std::stringstream sentIds;

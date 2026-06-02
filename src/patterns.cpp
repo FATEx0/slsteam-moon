@@ -328,6 +328,53 @@ namespace Patterns
 		};
 	}
 
+	namespace CWebSocketConnection
+	{
+		Pattern_t BBuildAndAsyncSendFrame
+		{
+			"CWebSocketConnection::BBuildAndAsyncSendFrame",
+			"55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 81 EC AC 00 00 00 "
+			"8B 45 10 8B 55 08 89 85 ? ? FF FF 89 95 ? ? FF FF "
+			"65 A1 14 00 00 00",
+			SigFollowMode::None
+		};
+	}
+
+	namespace CRemoteClientManager
+	{
+		Pattern_t RecvPkt
+		{
+			"CRemoteClientManager::RecvPkt",
+			"55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 83 EC 1C "
+			"8B 86 B0 08 00 00 8B 00 85 C0 0F 85 ? ? ? ? "
+			"C7 45 E4 00 00 00 00 83 EC 08 89 F3 6A 01 FF 75 0C "
+			"E8 ? ? ? ? 89 C7 83 C4 10 85 C0 0F 84 ? ? ? ? 83 EC 0C 50",
+			SigFollowMode::None
+		};
+	}
+
+	namespace CJobMgr
+	{
+		Pattern_t BRouteMsgToJob
+		{
+			"CJobMgr::BRouteMsgToJob",
+			"55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 83 EC 7C "
+			"8B 45 08 8B 4D 14 89 45 90 8B 45 0C 89 4D A0 89 45 88 "
+			"8B 45 10 89 45 A4 65 8B 0D 14 00 00",
+			SigFollowMode::None
+		};
+	}
+
+	namespace CDepotDownloadMgr
+	{
+		Pattern_t BYldRequestDepotManifest
+		{
+			"CDepotDownloadMgr::BYldRequestDepotManifest",
+			"55 b9 fd ff ff ff 89 e5 57 e8 ? ? ? ? 81 c7 ? ? ? ? 56 53 83 ec 7c 8b 45 14 8b 55 18",
+			SigFollowMode::None
+		};
+	}
+
 	std::vector<Pattern_t*> patterns;
 }
 

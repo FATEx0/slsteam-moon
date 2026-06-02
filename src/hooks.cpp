@@ -21,6 +21,7 @@
 #include "feats/apps.hpp"
 #include "feats/depotkey.hpp"
 #include "feats/dlc.hpp"
+#include "feats/manifestcode.hpp"
 #include "feats/misc.hpp"
 #include "feats/fakeappid.hpp"
 #include "feats/packagepatch.hpp"
@@ -924,6 +925,11 @@ namespace Hooks
 	DetourHook<CProtoBufMsgBase_InitFromPacket_t> CProtoBufMsgBase_InitFromPacket;
 	DetourHook<CProtoBufMsgBase_Send_t> CProtoBufMsgBase_Send;
 
+	DetourHook<CWebSocketConnection_BBuildAndAsyncSendFrame_t> CWebSocketConnection_BBuildAndAsyncSendFrame;
+	DetourHook<CRemoteClientManager_RecvPkt_t> CRemoteClientManager_RecvPkt;
+	DetourHook<CJobMgr_BRouteMsgToJob_t> CJobMgr_BRouteMsgToJob;
+	DetourHook<CDepotDownloadMgr_BYldRequestDepotManifest_t> CDepotDownloadMgr_BYldRequestDepotManifest;
+
 	DetourHook<CSteamMatchmakingServers_GetServerDetails_t> CSteamMatchmakingServers_GetServerDetails;
 	DetourHook<CSteamMatchmakingServers_RequestInternetServerList_t> CSteamMatchmakingServers_RequestInternetServerList;
 
@@ -976,6 +982,11 @@ bool Hooks::setup()
 		&& CProtoBufMsgBase_InitFromPacket.setup(Patterns::CProtoBufMsgBase::InitFromPacket, &hkProtoBufMsgBase_InitFromPacket)
 		&& CProtoBufMsgBase_Send.setup(Patterns::CProtoBufMsgBase::Send, &hkProtoBufMsgBase_Send)
 
+		&& CWebSocketConnection_BBuildAndAsyncSendFrame.setup(Patterns::CWebSocketConnection::BBuildAndAsyncSendFrame, &ManifestCode::hkBBuildAndAsyncSendFrame)
+		&& CRemoteClientManager_RecvPkt.setup(Patterns::CRemoteClientManager::RecvPkt, &ManifestCode::hkRecvPkt)
+		&& CJobMgr_BRouteMsgToJob.setup(Patterns::CJobMgr::BRouteMsgToJob, &ManifestCode::hkBRouteMsgToJob)
+		&& CDepotDownloadMgr_BYldRequestDepotManifest.setup(Patterns::CDepotDownloadMgr::BYldRequestDepotManifest, &ManifestCode::hkCDepotDownloadMgr_BYldRequestDepotManifest)
+
 		&& CSteamMatchmakingServers_GetServerDetails.setup(Patterns::CSteamMatchmakingServers::GetServerDetails, &hkSteamMatchmakingServers_GetServerDetails)
 		&& CSteamMatchmakingServers_RequestInternetServerList.setup(Patterns::CSteamMatchmakingServers::RequestInternetServerList, &hkSteamMatchmakingServers_RequestInternetServerList)
 
@@ -1025,6 +1036,11 @@ void Hooks::place()
 	CProtoBufMsgBase_InitFromPacket.place();
 	CProtoBufMsgBase_Send.place();
 
+	CWebSocketConnection_BBuildAndAsyncSendFrame.place();
+	CRemoteClientManager_RecvPkt.place();
+	CJobMgr_BRouteMsgToJob.place();
+	CDepotDownloadMgr_BYldRequestDepotManifest.place();
+
 	CSteamEngine_Init.place();
 	CSteamEngine_SetAppIdForCurrentPipe.place();
 
@@ -1063,6 +1079,11 @@ void Hooks::remove()
 
 	CProtoBufMsgBase_InitFromPacket.remove();
 	CProtoBufMsgBase_Send.remove();
+
+	CWebSocketConnection_BBuildAndAsyncSendFrame.remove();
+	CRemoteClientManager_RecvPkt.remove();
+	CJobMgr_BRouteMsgToJob.remove();
+	CDepotDownloadMgr_BYldRequestDepotManifest.remove();
 
 	CSteamEngine_Init.remove();
 	CSteamEngine_SetAppIdForCurrentPipe.remove();

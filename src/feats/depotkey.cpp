@@ -294,6 +294,51 @@ void provisionManifests()
 	}
 }
 
+void disableShaderCache()
+{
+	const auto added = g_config.addedAppIds.get();
+	if (added.empty()) return;   // nothing faked → leave shader cache alone
+
+	const auto root = findSteamRoot();
+	if (root.empty()) return;
+
+	const auto path = root + "/config/config.vdf";
+	if (!std::filesystem::exists(path)) return;
+
+	std::string content;
+	{
+		std::ifstream ifs(path);
+		if (!ifs.is_open()) return;
+		std::stringstream ss;
+		ss << ifs.rdbuf();
+		content = ss.str();
+	}
+
+	if (content.find("\"DisableShaderCache\"") != std::string::npos)
+	{
+		g_pLog->debug("DepotKey: DisableShaderCache already in config.vdf\n");
+		return;
+	}
+
+	const auto anchor = content.find("\"ShaderCacheManager\"");
+	if (anchor == std::string::npos) return;
+
+	const auto brace = content.find('{', anchor);
+	if (brace == std::string::npos) return;
+
+	const std::string insertion =
+		"\n\t\t\t\t\t\t\"DisableShaderCache\"\t\t\"1\"";
+	content.insert(brace + 1, insertion);
+
+	{
+		std::ofstream ofs(path, std::ios::trunc);
+		if (!ofs.is_open()) return;
+		ofs << content;
+	}
+	g_pLog->infoOnce("DepotKey: injected DisableShaderCache=1 into config.vdf "
+	             "(AdditionalApps present)\n");
+}
+
 
 void onStartup()
 {
@@ -301,6 +346,7 @@ void onStartup()
 	g_startupDone = true;
 	importLuaScripts();
 	provisionManifests();
+	disableShaderCache();
 }
 
 
@@ -333,20 +379,36 @@ void recvDepotKey(CMsgClientGetDepotDecryptionKeyResponse* resp)
 	}
 
 	auto cached = getCachedKey(resp->depot_id());
-	if (cached.depotId == 0 || cached.key.size() != 32)
+	if (cached.depotId != 0 && cached.key.size() == 32)
 	{
-		g_pLog->debug("DepotKey: no cached key for depot %u (Steam said eresult=%u)\n",
-		              resp->depot_id(), resp->eresult());
+		g_pLog->infoOnce("DepotKey: substituting cached key for depot %u (Steam said eresult=%u)\n",
+		             resp->depot_id(), resp->eresult());
+
+		CMsgClientGetDepotDecryptionKeyResponse fresh;
+		fresh.set_eresult(ERESULT_OK);
+		fresh.set_depot_id(resp->depot_id());
+		fresh.set_depot_encryption_key(cached.key);
+		resp->ParseFromString(fresh.SerializeAsString());
 		return;
 	}
-	g_pLog->infoOnce("DepotKey: substituting cached key for depot %u (Steam said eresult=%u)\n",
-	             resp->depot_id(), resp->eresult());
 
-	CMsgClientGetDepotDecryptionKeyResponse fresh;
-	fresh.set_eresult(ERESULT_OK);
-	fresh.set_depot_id(resp->depot_id());
-	fresh.set_depot_encryption_key(cached.key);
-	resp->ParseFromString(fresh.SerializeAsString());
+	const uint32_t depotId = resp->depot_id();
+	const bool isAdditional = g_config.isAddedAppId(depotId);
+	if (isAdditional)
+	{
+		const std::string zeroKey(32, '\0');
+		g_pLog->infoOnce("DepotKey: synthesising zero key for AdditionalApps depot %u (Steam said eresult=%u)\n",
+		             depotId, resp->eresult());
+		CMsgClientGetDepotDecryptionKeyResponse fresh;
+		fresh.set_eresult(ERESULT_OK);
+		fresh.set_depot_id(depotId);
+		fresh.set_depot_encryption_key(zeroKey);
+		resp->ParseFromString(fresh.SerializeAsString());
+		return;
+	}
+
+	g_pLog->debug("DepotKey: no cached key for depot %u (Steam said eresult=%u)\n",
+	              depotId, resp->eresult());
 }
 
 void sendDepotKey(CMsgClientGetDepotDecryptionKey* req)

@@ -1,0 +1,16 @@
+
+syntax = "proto2";
+
+option optimize_for = LITE_RUNTIME;
+
+message CContentServerDirectory_GetManifestRequestCode_Request {
+	optional uint32 app_id = 1;
+	optional uint32 depot_id = 2;
+	optional uint64 manifest_id = 3;
+	optional string app_branch = 4;
+	optional string branch_password_hash = 5;
+}
+
+message CContentServerDirectory_GetManifestRequestCode_Response {
+	optional uint64 manifest_request_code = 1;
+}

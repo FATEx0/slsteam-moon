@@ -119,6 +119,26 @@ namespace Patterns
 		extern Pattern_t Offset_GetPipeIndex;
 	}
 
+	namespace CWebSocketConnection
+	{
+		extern Pattern_t BBuildAndAsyncSendFrame;
+	}
+
+	namespace CRemoteClientManager
+	{
+		extern Pattern_t RecvPkt;
+	}
+
+	namespace CJobMgr
+	{
+		extern Pattern_t BRouteMsgToJob;
+	}
+
+	namespace CDepotDownloadMgr
+	{
+		extern Pattern_t BYldRequestDepotManifest;
+	}
+
 
 	namespace ISteamMatchmakingPingResponse
 	{

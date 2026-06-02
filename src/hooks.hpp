@@ -13,6 +13,9 @@ struct gameserverdetails_t;
 
 struct Pattern_t;
 
+struct CNetPacket;
+enum EWebSocketOpCode : uint32_t;
+
 template<typename T>
 union FunctionUnion_t
 {
@@ -101,12 +104,24 @@ namespace Hooks
 
 	typedef bool(*IClientUtils_GetOfflineMode_t)(void*);
 
+	typedef bool(*CWebSocketConnection_BBuildAndAsyncSendFrame_t)(void*, EWebSocketOpCode, uint8_t*, uint32_t);
+	typedef void*(*CRemoteClientManager_RecvPkt_t)(void*, CNetPacket*);
+
+	typedef bool(*CJobMgr_BRouteMsgToJob_t)(void*, void*, void*, void*);
+
+	typedef bool(*CDepotDownloadMgr_BYldRequestDepotManifest_t)(void*, uint32_t, uint32_t, uint64_t, const char*, void*);
+
 	extern DetourHook<TraceIPC_t> TraceIPC;
 
 	extern DetourHook<CAPIJob_GetPlayerStats_t> CAPIJob_GetPlayerStats;
 
 	extern DetourHook<CProtoBufMsgBase_InitFromPacket_t> CProtoBufMsgBase_InitFromPacket;
 	extern DetourHook<CProtoBufMsgBase_Send_t> CProtoBufMsgBase_Send;
+
+	extern DetourHook<CWebSocketConnection_BBuildAndAsyncSendFrame_t> CWebSocketConnection_BBuildAndAsyncSendFrame;
+	extern DetourHook<CRemoteClientManager_RecvPkt_t> CRemoteClientManager_RecvPkt;
+	extern DetourHook<CJobMgr_BRouteMsgToJob_t> CJobMgr_BRouteMsgToJob;
+	extern DetourHook<CDepotDownloadMgr_BYldRequestDepotManifest_t> CDepotDownloadMgr_BYldRequestDepotManifest;
 
 	extern DetourHook<CSteamMatchmakingServers_GetServerDetails_t> CSteamMatchmakingServers_GetServerDetails;
 	extern DetourHook<CSteamMatchmakingServers_RequestInternetServerList_t> CSteamMatchmakingServers_RequestInternetServerList;
