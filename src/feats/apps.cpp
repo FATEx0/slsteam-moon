@@ -246,6 +246,12 @@ void Apps::sendPICSInfoRequest(CMsgClientPICSProductInfoRequest* msg)
 			continue;
 		}
 
+		if (!msg->meta_data_only())
+		{
+			g_pLog->debug("PICS-request: skip injection for %u (request is meta_data_only=false)\n", appId);
+			continue;
+		}
+
 		auto* entry = msg->add_apps();
 		entry->set_appid(appId);
 		if (tokens.contains(appId))
@@ -258,11 +264,7 @@ void Apps::sendPICSInfoRequest(CMsgClientPICSProductInfoRequest* msg)
 	}
 	g_pLog->debug("PICS-request: addedAppIds.size=%zu, injected=%d\n", added.size(), injected);
 
-	if (addedInRequest && msg->meta_data_only())
-	{
-		msg->set_meta_data_only(false);
-		g_pLog->debug("PICS-request: forced meta_data_only=false (AdditionalApp in batch, need buffers)\n");
-	}
+
 	if (injected > 0)
 	{
 		g_pLog->debug("PICS-request: injected %d AdditionalApps into outgoing request\n", injected);

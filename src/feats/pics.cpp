@@ -256,11 +256,6 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 		resp->meta_data_only() ? 1 : 0
 	);
 
-	if (!resp->meta_data_only())
-	{
-		resp->set_meta_data_only(true);
-		g_pLog->debug("PICS: forced response.meta_data_only=true to satisfy client-side assert\n");
-	}
 
 	const auto added = g_config.addedAppIds.get();
 	for (int i = 0; i < resp->apps_size(); ++i)
