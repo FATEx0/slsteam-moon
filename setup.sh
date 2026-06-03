@@ -3,6 +3,14 @@
 SLSDIR="$HOME/.local/share/SLSsteam"
 SLSLIB="$SLSDIR/SLSsteam.so"
 
+# User-local applications dir (XDG override always wins over system-wide).
+USER_APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+USER_DESKTOP="$USER_APPS/steam.desktop"
+SYS_DESKTOP="/usr/share/applications/steam.desktop"
+
+# Tag we drop into patched .desktop files so we can detect/undo them later.
+SLSM_TAG="X-SLSteamMoon-Patched=true"
+
 # ============================================================================
 # Pretty output (colors + box-drawing). Falls back to plain text when stdout
 # is not a TTY or the terminal does not advertise colour support.
@@ -28,35 +36,26 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
 	NC=$'\033[0m'
 
 	if [ "$HAS_256" = 1 ]; then
-		# Moon-themed accents.
-		MOON=$'\033[38;5;153m'      # pale silver-blue — primary brand colour
-		NIGHT=$'\033[38;5;75m'      # cool steel blue  — section headers / info
-		HALO=$'\033[38;5;231m'      # bright white     — moon glyph highlight
-		MUTED=$'\033[38;5;110m'     # dusk blue        — hints / separators
-		# Semantic status colours stay standard so users read them instinctively.
-		GREEN=$'\033[38;5;114m'     # soft sage green
-		YELLOW=$'\033[38;5;221m'    # warm amber
-		RED=$'\033[38;5;203m'       # muted coral red
+		MOON=$'\033[38;5;153m'
+		NIGHT=$'\033[38;5;75m'
+		HALO=$'\033[38;5;231m'
+		MUTED=$'\033[38;5;110m'
+		GREEN=$'\033[38;5;114m'
+		YELLOW=$'\033[38;5;221m'
+		RED=$'\033[38;5;203m'
 	else
-		MOON=$'\033[1;34m'          # bold blue
-		NIGHT=$'\033[0;36m'         # cyan
-		HALO=$'\033[1;37m'          # bold white
-		MUTED=$'\033[0;34m'         # blue
+		MOON=$'\033[1;34m'
+		NIGHT=$'\033[0;36m'
+		HALO=$'\033[1;37m'
+		MUTED=$'\033[0;34m'
 		GREEN=$'\033[0;32m'
 		YELLOW=$'\033[0;33m'
 		RED=$'\033[0;31m'
 	fi
 else
-	BOLD=""
-	DIM=""
-	NC=""
-	MOON=""
-	NIGHT=""
-	HALO=""
-	MUTED=""
-	GREEN=""
-	YELLOW=""
-	RED=""
+	BOLD=""; DIM=""; NC=""
+	MOON=""; NIGHT=""; HALO=""; MUTED=""
+	GREEN=""; YELLOW=""; RED=""
 fi
 
 print_banner() {
@@ -81,54 +80,6 @@ log_warn()    { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error()   { echo -e "${RED}✗${NC} $1"; }
 log_step()    { echo -e "${MOON}•${NC} $1"; }
 
-# Make sure no Steam process is running so the wrapper / desktop entry takes
-# effect on next launch. Tries graceful shutdown first, falls back to SIGKILL.
-kill_steam() {
-	# Only do anything if Steam is actually running.
-	if ! pgrep -x steam >/dev/null 2>&1 \
-	   && ! pgrep -f '/usr/games/steam' >/dev/null 2>&1 \
-	   && ! pgrep -f 'steamwebhelper' >/dev/null 2>&1; then
-		log_success "No running Steam process detected"
-		return 0
-	fi
-
-	log_info "Stopping running Steam processes"
-
-	# Graceful shutdown via Steam's own IPC, if available.
-	if command -v steam >/dev/null 2>&1; then
-		steam -shutdown >/dev/null 2>&1 || true
-	fi
-
-	# Give it a moment to exit on its own.
-	for _ in 1 2 3 4 5; do
-		if ! pgrep -x steam >/dev/null 2>&1 \
-		   && ! pgrep -f 'steamwebhelper' >/dev/null 2>&1; then
-			log_success "Steam stopped"
-			return 0
-		fi
-		sleep 1
-	done
-
-	# Polite SIGTERM.
-	pkill -TERM -x steam 2>/dev/null || true
-	pkill -TERM -f 'steamwebhelper' 2>/dev/null || true
-	pkill -TERM -f '/usr/games/steam' 2>/dev/null || true
-	sleep 2
-
-	# Force kill anything still lingering.
-	if pgrep -x steam >/dev/null 2>&1 \
-	   || pgrep -f 'steamwebhelper' >/dev/null 2>&1 \
-	   || pgrep -f '/usr/games/steam' >/dev/null 2>&1; then
-		log_warn "Steam still running — sending SIGKILL"
-		pkill -KILL -x steam 2>/dev/null || true
-		pkill -KILL -f 'steamwebhelper' 2>/dev/null || true
-		pkill -KILL -f '/usr/games/steam' 2>/dev/null || true
-		sleep 1
-	fi
-
-	log_success "Steam stopped"
-}
-
 print_install_complete() {
 	echo ""
 	echo -e "${GREEN}${BOLD}"
@@ -151,68 +102,115 @@ print_uninstall_complete() {
 }
 
 # ============================================================================
-# Core actions
+# Detection helpers
 # ============================================================================
 
-uninstall()
-{
-	print_banner
-	print_section "Uninstalling SLSsteam"
-
-	kill_steam
-
-	# Remove from bashrc
-	if [ -f "$HOME/.bashrc" ]; then
-		if grep -q "SLSsteam/path" "$HOME/.bashrc"; then
-			log_info "Removing wrapper PATH entry from ~/.bashrc"
-			sed -i '/# SLSsteam: Add wrapper to PATH/d' "$HOME/.bashrc"
-			sed -i '\|SLSsteam/path|d' "$HOME/.bashrc"
+# Find the real Steam binary. Distros vary:
+#   /usr/games/steam        Debian, Ubuntu, Mint (steam-installer)
+#   /usr/bin/steam          Arch, Fedora, openSUSE, Manjaro, Pop!_OS
+#   /usr/local/bin/steam    manual installs
+detect_steam_binary() {
+	local c
+	for c in /usr/games/steam /usr/bin/steam /usr/local/bin/steam; do
+		if [ -x "$c" ]; then
+			echo "$c"
+			return 0
 		fi
-	fi
-
-	# Remove local .desktop file if exists
-	if [ -f "$HOME/.local/share/applications/steam.desktop" ]; then
-		if grep -q "SLSsteam" "$HOME/.local/share/applications/steam.desktop"; then
-			log_info "Removing local steam.desktop"
-			rm -f "$HOME/.local/share/applications/steam.desktop"
-		fi
-	fi
-
-	# Restore system-wide .desktop if modified
-	if [ -f "/usr/share/applications/steam.desktop" ] && grep -q "SLSsteam" "/usr/share/applications/steam.desktop" 2>/dev/null; then
-		if [ -f "/usr/share/applications/steam.desktop.slssteam-backup" ]; then
-			log_info "Restoring system steam.desktop (requires sudo)"
-			sudo cp "/usr/share/applications/steam.desktop.slssteam-backup" \
-			        "/usr/share/applications/steam.desktop"
-			sudo rm "/usr/share/applications/steam.desktop.slssteam-backup"
-			log_success "Restored system steam.desktop"
-		else
-			log_warn "System steam.desktop is modified but no backup found"
-			echo "    You may need to reinstall Steam to restore it"
-		fi
-	fi
-
-	# Check if /usr/games/steam was modified (legacy method)
-	if [ -f "/usr/games/steam" ] && grep -q "SLSsteam" "/usr/games/steam" 2>/dev/null; then
-		log_info "Found legacy Steam script modification"
-		if [ -f "/usr/games/steam.slsteam-backup" ]; then
-			log_info "Restoring original Steam script (requires sudo)"
-			sudo cp "/usr/games/steam.slsteam-backup" "/usr/games/steam"
-			sudo rm "/usr/games/steam.slsteam-backup"
-			log_success "Restored /usr/games/steam"
-		else
-			log_warn "Legacy modification found but no backup exists"
-		fi
-	fi
-
-	# Remove SLSsteam directory
-	if [ -d "$SLSDIR" ]; then
-		log_info "Removing $SLSDIR"
-		rm -rf "$SLSDIR"
-	fi
-
-	print_uninstall_complete
+	done
+	command -v steam 2>/dev/null
 }
+
+# Tell the Mint/Debian "steam-installer" stub apart from a real Steam launcher.
+# The stub has Name=Install Steam.
+is_real_steam_desktop() {
+	local f="$1"
+	[ -f "$f" ] || return 1
+	# Already patched by us — treat as real (don't recurse).
+	grep -q "$SLSM_TAG" "$f" 2>/dev/null && return 0
+	# Stub installer, skip it.
+	grep -q "^Name=Install Steam" "$f" 2>/dev/null && return 1
+	# Heuristic: any Exec= line that runs steam directly.
+	grep -qE "^Exec=.*((^| |\")steam( |\$|%)|/steam( |\$|%)|/games/steam|/bin/steam)" "$f" 2>/dev/null
+}
+
+# Already patched to use our wrapper?
+is_patched_desktop() {
+	[ -f "$1" ] && grep -q "$SLSM_TAG" "$1" 2>/dev/null
+}
+
+# Locate a "donor" .desktop to seed the user-local override from when the user
+# doesn't already have one. Tries, in order: existing user-local (real), the
+# system-wide entry (real), and the bundle Steam itself ships under
+# ~/.steam/.../steam-launcher/.
+find_donor_desktop() {
+	local c
+	if is_real_steam_desktop "$USER_DESKTOP"; then
+		echo "$USER_DESKTOP"; return 0
+	fi
+	if is_real_steam_desktop "$SYS_DESKTOP"; then
+		echo "$SYS_DESKTOP"; return 0
+	fi
+	for c in \
+		"$HOME/.steam/steam/steam-launcher/steam.desktop" \
+		"$HOME/.steam/debian-installation/deb-installer/steam-launcher/steam.desktop" \
+		"$HOME/.steam/debian-installation/deb-installer/steam.desktop"; do
+		if is_real_steam_desktop "$c"; then
+			echo "$c"; return 0
+		fi
+	done
+	return 1
+}
+
+# ============================================================================
+# Steam process management
+# ============================================================================
+
+# Stop any running Steam so the wrapper / desktop entry takes effect on next
+# launch. Tries graceful shutdown first, falls back to SIGTERM then SIGKILL.
+kill_steam() {
+	if ! pgrep -x steam >/dev/null 2>&1 \
+	   && ! pgrep -f '/steam$|/steam ' >/dev/null 2>&1 \
+	   && ! pgrep -f 'steamwebhelper' >/dev/null 2>&1; then
+		log_success "No running Steam process detected"
+		return 0
+	fi
+
+	log_info "Stopping running Steam processes"
+
+	if command -v steam >/dev/null 2>&1; then
+		steam -shutdown >/dev/null 2>&1 || true
+	fi
+
+	for _ in 1 2 3 4 5; do
+		if ! pgrep -x steam >/dev/null 2>&1 \
+		   && ! pgrep -f 'steamwebhelper' >/dev/null 2>&1; then
+			log_success "Steam stopped"
+			return 0
+		fi
+		sleep 1
+	done
+
+	pkill -TERM -x steam 2>/dev/null || true
+	pkill -TERM -f 'steamwebhelper' 2>/dev/null || true
+	pkill -TERM -f '/steam$|/steam ' 2>/dev/null || true
+	sleep 2
+
+	if pgrep -x steam >/dev/null 2>&1 \
+	   || pgrep -f 'steamwebhelper' >/dev/null 2>&1 \
+	   || pgrep -f '/steam$|/steam ' >/dev/null 2>&1; then
+		log_warn "Steam still running — sending SIGKILL"
+		pkill -KILL -x steam 2>/dev/null || true
+		pkill -KILL -f 'steamwebhelper' 2>/dev/null || true
+		pkill -KILL -f '/steam$|/steam ' 2>/dev/null || true
+		sleep 1
+	fi
+
+	log_success "Steam stopped"
+}
+
+# ============================================================================
+# Install steps
+# ============================================================================
 
 install_slssteam()
 {
@@ -239,20 +237,46 @@ create_steam_wrapper()
 {
 	log_info "Creating Steam wrapper with SLSsteam injection"
 
-	# Create wrapper directory
 	mkdir -p "$SLSDIR/path"
 
-	# Create wrapper script
+	# The wrapper resolves the real Steam binary at runtime so the install is
+	# portable across distros (and survives moves between, e.g., a Debian-style
+	# /usr/games/steam and an Arch-style /usr/bin/steam).
 	cat > "$SLSDIR/path/steam" << 'EOF'
 #!/bin/sh
-# SLSsteam wrapper - injects via LD_AUDIT (rtld-audit).
-# Loading SLSsteam.so as an audit module keeps it (and the protobuf /
-# yaml-cpp / libstdc++ symbols it statically links) in the linker's
-# separate auditing namespace, so they cannot interpose on the copies
-# Steam's own libraries use. library-inject.so redirects libcurl to a
-# system copy and must come first in the list.
+# slsteam-moon wrapper. Injects via LD_AUDIT (rtld-audit) so the audit
+# namespace can't interpose on Steam's own copies of protobuf / yaml-cpp /
+# libstdc++. library-inject.so redirects libcurl to the system copy and must
+# come first.
 SLSDIR="$HOME/.local/share/SLSsteam"
-LD_AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so${LD_AUDIT:+:$LD_AUDIT}" exec /usr/games/steam "$@"
+
+# Resolve the real Steam binary, skipping our own wrapper.
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+STEAM_BIN=""
+for c in /usr/games/steam /usr/bin/steam /usr/local/bin/steam; do
+	if [ -x "$c" ] && [ "$(readlink -f "$c" 2>/dev/null || echo "$c")" != "$SELF" ]; then
+		STEAM_BIN="$c"
+		break
+	fi
+done
+if [ -z "$STEAM_BIN" ]; then
+	# Fall back to PATH lookup, but skip ourselves.
+	IFS=:
+	for d in $PATH; do
+		c="$d/steam"
+		if [ -x "$c" ] && [ "$(readlink -f "$c" 2>/dev/null || echo "$c")" != "$SELF" ]; then
+			STEAM_BIN="$c"
+			break
+		fi
+	done
+	unset IFS
+fi
+if [ -z "$STEAM_BIN" ]; then
+	echo "slsteam-moon: could not find the real Steam binary" >&2
+	exit 127
+fi
+
+LD_AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so${LD_AUDIT:+:$LD_AUDIT}" exec "$STEAM_BIN" "$@"
 EOF
 
 	chmod +x "$SLSDIR/path/steam"
@@ -262,38 +286,146 @@ EOF
 	return 0
 }
 
+# Patch every Exec= line in $1 (in-place) so it runs through our wrapper. Drops
+# our marker line and writes a backup to $1.slssteam-backup if one isn't there.
+patch_desktop_file() {
+	local f="$1"
+	local backup="$f.slssteam-backup"
+	local wrapper="$SLSDIR/path/steam"
+	local sudo_cmd="${2:-}"
+
+	# Backup once.
+	if [ ! -f "$backup" ]; then
+		$sudo_cmd cp -- "$f" "$backup"
+	fi
+
+	# sed escapes for $HOME paths.
+	local esc_wrapper
+	esc_wrapper=$(printf '%s' "$wrapper" | sed -e 's/[\/&]/\\&/g')
+
+	# Rewrite every Exec= line:
+	#   Exec=/usr/games/steam %U     -> Exec=<wrapper> %U
+	#   Exec=/usr/bin/steam steam:// -> Exec=<wrapper> steam://
+	#   Exec=sh -c '... steam %U'    -> Exec=sh -c '... <wrapper> %U'
+	#   Exec=steam %U                -> Exec=<wrapper> %U
+	# We swap the literal Steam invocations, then drop any prior marker so we
+	# don't accumulate duplicates, and append the marker once.
+	$sudo_cmd sed -i \
+		-e "s|^\(Exec=.*\)/usr/games/steam|\1$esc_wrapper|g" \
+		-e "s|^\(Exec=.*\)/usr/bin/steam|\1$esc_wrapper|g" \
+		-e "s|^\(Exec=.*\)/usr/local/bin/steam|\1$esc_wrapper|g" \
+		-e "s|^\(Exec=[^/]*\)\bsteam\b|\1$esc_wrapper|g" \
+		-e "/^$SLSM_TAG\$/d" \
+		"$f"
+
+	# Append marker after the [Desktop Entry] header (or end of file as fallback).
+	if grep -q '^\[Desktop Entry\]' "$f" 2>/dev/null; then
+		$sudo_cmd sed -i "0,/^\[Desktop Entry\]/ s|^\[Desktop Entry\]\$|[Desktop Entry]\n$SLSM_TAG|" "$f"
+	else
+		echo "$SLSM_TAG" | $sudo_cmd tee -a "$f" >/dev/null
+	fi
+}
+
 setup_path_and_desktop()
 {
 	log_info "Setting up PATH and desktop integration"
 
-	# Add to bashrc if not already there
-	if ! grep -q "SLSsteam/path" "$HOME/.bashrc" 2>/dev/null; then
-		echo '' >> "$HOME/.bashrc"
-		echo '# SLSsteam: Add wrapper to PATH' >> "$HOME/.bashrc"
-		echo 'export PATH="$HOME/.local/share/SLSsteam/path:$PATH"' >> "$HOME/.bashrc"
-		log_success "Added wrapper to ~/.bashrc"
-	else
-		log_success "Already in ~/.bashrc"
+	# --- Shell PATH integration -------------------------------------------
+	local rc found=0
+	for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+		[ -f "$rc" ] || continue
+		if grep -q "SLSsteam/path" "$rc" 2>/dev/null; then
+			log_success "Already in $(basename "$rc")"
+		else
+			{
+				echo ''
+				echo '# SLSsteam: Add wrapper to PATH'
+				echo 'export PATH="$HOME/.local/share/SLSsteam/path:$PATH"'
+			} >> "$rc"
+			log_success "Added wrapper to $(basename "$rc")"
+		fi
+		found=1
+	done
+	if [ "$found" = 0 ]; then
+		# Create a .bashrc if no shell rc files exist (rare but possible).
+		echo 'export PATH="$HOME/.local/share/SLSsteam/path:$PATH"' > "$HOME/.bashrc"
+		log_success "Created ~/.bashrc with wrapper PATH"
 	fi
 
-	# Modify system-wide desktop file for better DE compatibility
-	if [ -f "/usr/share/applications/steam.desktop" ]; then
-		# Check if already modified
-		if grep -q "SLSsteam" /usr/share/applications/steam.desktop 2>/dev/null; then
-			log_success "System steam.desktop already configured"
-		else
-			# Create backup if doesn't exist
-			if [ ! -f "/usr/share/applications/steam.desktop.slssteam-backup" ]; then
-				log_info "Creating backup of system steam.desktop"
-				sudo cp /usr/share/applications/steam.desktop \
-				        /usr/share/applications/steam.desktop.slssteam-backup
-			fi
+	# --- Detect Steam binary ----------------------------------------------
+	local steam_bin
+	steam_bin="$(detect_steam_binary)"
+	if [ -z "$steam_bin" ]; then
+		log_warn "Steam doesn't appear to be installed yet"
+		log_warn "Install Steam first, then re-run: ./setup.sh install"
+		return 0
+	fi
+	log_success "Found Steam binary at $steam_bin"
 
-			log_info "Modifying system steam.desktop (requires sudo)"
-			sudo sed -i "s|Exec=/usr/games/steam|Exec=$HOME/.local/share/SLSsteam/path/steam|g" \
-				/usr/share/applications/steam.desktop
-			log_success "Modified system steam.desktop"
+	# --- User-local override (XDG: always wins over system-wide) ----------
+	mkdir -p "$USER_APPS"
+
+	if is_patched_desktop "$USER_DESKTOP"; then
+		log_success "User .desktop already patched ($USER_DESKTOP)"
+	else
+		local donor=""
+		if is_real_steam_desktop "$USER_DESKTOP"; then
+			# User already had their own; back it up and patch in place.
+			donor="$USER_DESKTOP"
+		else
+			donor="$(find_donor_desktop)"
 		fi
+
+		if [ -n "$donor" ]; then
+			if [ "$donor" != "$USER_DESKTOP" ]; then
+				log_info "Seeding $USER_DESKTOP from $donor"
+				cp -- "$donor" "$USER_DESKTOP"
+			fi
+			patch_desktop_file "$USER_DESKTOP"
+			log_success "Patched user .desktop: $USER_DESKTOP"
+		else
+			# No donor available — generate a minimal launcher so the menu
+			# entry at least works.
+			log_info "No existing steam.desktop found; writing a minimal launcher"
+			cat > "$USER_DESKTOP" << EOF
+[Desktop Entry]
+$SLSM_TAG
+Name=Steam
+Comment=Application for managing and playing games on Steam
+Exec=$SLSDIR/path/steam %U
+Icon=steam
+Terminal=false
+Type=Application
+Categories=Network;FileTransfer;Game;
+MimeType=x-scheme-handler/steam;x-scheme-handler/steamlink;
+PrefersNonDefaultGPU=true
+EOF
+			log_success "Created $USER_DESKTOP"
+		fi
+	fi
+
+	# Refresh XDG cache so launchers/menus pick up the change without a logout.
+	if command -v update-desktop-database >/dev/null 2>&1; then
+		update-desktop-database "$USER_APPS" >/dev/null 2>&1 || true
+	fi
+
+	# --- System-wide patch (best-effort) ----------------------------------
+	# Belt-and-braces: also patch /usr/share/applications when it's the real
+	# launcher. We don't strictly need it (XDG picks the user-local copy
+	# first), but it covers oddball launchers that read system entries only.
+	if [ -f "$SYS_DESKTOP" ] && is_real_steam_desktop "$SYS_DESKTOP" && ! is_patched_desktop "$SYS_DESKTOP"; then
+		if command -v sudo >/dev/null 2>&1; then
+			log_info "Patching system .desktop (requires sudo): $SYS_DESKTOP"
+			patch_desktop_file "$SYS_DESKTOP" sudo
+			log_success "Patched system .desktop"
+			if command -v update-desktop-database >/dev/null 2>&1; then
+				sudo update-desktop-database "/usr/share/applications" >/dev/null 2>&1 || true
+			fi
+		else
+			log_warn "sudo not available; skipping system-wide .desktop patch"
+		fi
+	elif is_patched_desktop "$SYS_DESKTOP"; then
+		log_success "System .desktop already patched"
 	fi
 
 	echo ""
@@ -343,6 +475,92 @@ install_all()
 	install_steamstub "$SLSDIR"
 
 	print_install_complete
+}
+
+# ============================================================================
+# Uninstall
+# ============================================================================
+
+restore_or_remove_desktop() {
+	local f="$1"
+	local backup="$f.slssteam-backup"
+	local sudo_cmd="${2:-}"
+
+	if [ ! -f "$f" ]; then
+		return 0
+	fi
+	if ! is_patched_desktop "$f"; then
+		return 0
+	fi
+
+	if [ -f "$backup" ]; then
+		log_info "Restoring $f from backup"
+		$sudo_cmd cp -- "$backup" "$f"
+		$sudo_cmd rm -- "$backup"
+		log_success "Restored $f"
+	else
+		log_info "Removing $f (no backup found)"
+		$sudo_cmd rm -- "$f"
+		log_success "Removed $f"
+	fi
+}
+
+uninstall()
+{
+	print_banner
+	print_section "Uninstalling SLSsteam"
+
+	kill_steam
+
+	# Remove from shell rc files.
+	local rc
+	for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+		[ -f "$rc" ] || continue
+		if grep -q "SLSsteam/path" "$rc" 2>/dev/null; then
+			log_info "Cleaning wrapper PATH entry from $(basename "$rc")"
+			sed -i '/# SLSsteam: Add wrapper to PATH/d' "$rc"
+			sed -i '\|SLSsteam/path|d' "$rc"
+		fi
+	done
+
+	# User-local .desktop.
+	restore_or_remove_desktop "$USER_DESKTOP"
+	if command -v update-desktop-database >/dev/null 2>&1; then
+		update-desktop-database "$USER_APPS" >/dev/null 2>&1 || true
+	fi
+
+	# System-wide .desktop (only if we actually patched it).
+	if [ -f "$SYS_DESKTOP" ] && (is_patched_desktop "$SYS_DESKTOP" || grep -q "SLSsteam" "$SYS_DESKTOP" 2>/dev/null); then
+		if command -v sudo >/dev/null 2>&1; then
+			log_info "Restoring system .desktop (requires sudo)"
+			restore_or_remove_desktop "$SYS_DESKTOP" sudo
+			if command -v update-desktop-database >/dev/null 2>&1; then
+				sudo update-desktop-database "/usr/share/applications" >/dev/null 2>&1 || true
+			fi
+		else
+			log_warn "sudo not available; cannot restore $SYS_DESKTOP automatically"
+		fi
+	fi
+
+	# Legacy: /usr/games/steam patch from older versions.
+	if [ -f "/usr/games/steam" ] && grep -q "SLSsteam" "/usr/games/steam" 2>/dev/null; then
+		log_info "Found legacy /usr/games/steam modification"
+		if [ -f "/usr/games/steam.slsteam-backup" ]; then
+			log_info "Restoring original /usr/games/steam (requires sudo)"
+			sudo cp "/usr/games/steam.slsteam-backup" "/usr/games/steam"
+			sudo rm "/usr/games/steam.slsteam-backup"
+			log_success "Restored /usr/games/steam"
+		else
+			log_warn "Legacy modification found but no backup exists"
+		fi
+	fi
+
+	if [ -d "$SLSDIR" ]; then
+		log_info "Removing $SLSDIR"
+		rm -rf "$SLSDIR"
+	fi
+
+	print_uninstall_complete
 }
 
 # ============================================================================
