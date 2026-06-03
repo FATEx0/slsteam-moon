@@ -1,6 +1,11 @@
 #!/bin/bash
 # Check SLSsteam binary compatibility
 
+# Switch to repo root so ./bin/SLSsteam.so resolves correctly.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
+
 BINARY="./bin/SLSsteam.so"
 
 if [ ! -f "$BINARY" ]; then
@@ -118,7 +123,7 @@ case "$HIGHEST_GLIBC" in
 		echo "  ⚠️  LIMITED COMPATIBILITY"
 		echo ""
 		echo "  Consider rebuilding with Docker for better portability:"
-		echo "    ./build-docker.sh"
+		echo "    ./scripts/build/build-docker.sh"
 		;;
 	unknown)
 		echo "  (Cannot determine - objdump not available)"
@@ -135,7 +140,7 @@ if [ "$HIGHEST_GLIBC" != "unknown" ] && [ "$HIGHEST_GLIBC" != "2.17" ]; then
 	echo ""
 	echo "For maximum compatibility, rebuild with Docker:"
 	echo ""
-	echo "  ./build-docker.sh"
+	echo "  ./scripts/build/build-docker.sh"
 	echo ""
 	echo "This produces a binary that works on glibc 2.17+ (2012+)"
 	echo ""

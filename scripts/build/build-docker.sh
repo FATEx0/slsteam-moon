@@ -4,6 +4,12 @@
 
 set -e
 
+# Resolve script dir and switch to repo root so relative paths
+# (Dockerfile, ./bin, ./setup.sh) work regardless of where this is invoked.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
+
 echo "========================================="
 echo "  SLSsteam Container Build"
 echo "========================================="
@@ -52,7 +58,7 @@ fi
 # Build container image
 echo ""
 echo "Building container image..."
-$CONTAINER_CMD build -f Dockerfile.build -t slssteam-builder .
+$CONTAINER_CMD build -f scripts/build/Dockerfile.build -t slssteam-builder .
 
 # Extract compiled binaries
 echo ""

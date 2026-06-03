@@ -27,7 +27,7 @@ sudo usermod -aG docker $USER
 newgrp docker  # or logout/login
 
 # Build
-./build-docker.sh
+./scripts/build/build-docker.sh
 ```
 
 This creates binaries in `./bin/` that work on virtually any modern Linux distro.
@@ -71,7 +71,7 @@ make clean && make
 - ❌ Binary only works on glibc >= your version
 - ❌ Not portable for distribution
 
-Use `./build-portable.sh` for interactive guided build with dependency checking.
+Use `./scripts/build/build-portable.sh` for interactive guided build with dependency checking.
 
 ### Method 3: Old Distro VM (Alternative to Docker)
 
@@ -172,7 +172,7 @@ For GitHub Actions or GitLab CI:
 ```yaml
 - name: Build SLSsteam (manylinux)
   run: |
-    docker build -f Dockerfile.build -t slssteam-builder .
+    docker build -f scripts/build/Dockerfile.build -t slssteam-builder .
     docker create --name builder slssteam-builder
     docker cp builder:/build/bin ./bin
     docker rm builder
