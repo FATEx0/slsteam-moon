@@ -145,17 +145,36 @@ bool Apps::shouldDisableCloud(uint32_t appId)
 		return false;
 	}
 
-	return !g_pSteamEngine->getUser(0)->isSubscribed(appId);
+	CUser* user = getLocalUser();
+	if (user == nullptr)
+	{
+		return false;
+	}
+	return !user->isSubscribed(appId);
 }
 
 bool Apps::shouldDisableCDKey(uint32_t appId)
 {
-	return !g_pSteamEngine->getUser(0)->isSubscribed(appId);
+	CUser* user = getLocalUser();
+	if (user == nullptr)
+	{
+		return false;
+	}
+	return !user->isSubscribed(appId);
 }
 
 bool Apps::shouldDisableUpdates(uint32_t appId)
 {
-	return g_config.isAddedAppId(appId) || !g_pSteamEngine->getUser(0)->isSubscribed(appId);
+	if (g_config.isAddedAppId(appId))
+	{
+		return true;
+	}
+	CUser* user = getLocalUser();
+	if (user == nullptr)
+	{
+		return false;
+	}
+	return !user->isSubscribed(appId);
 }
 
 void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
@@ -172,9 +191,13 @@ void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
 			continue;
 		}
 
-		if(!owned && g_pSteamEngine->getUser(0)->isSubscribed(game.game_id()))
+		if(!owned)
 		{
-			owned = true;
+			CUser* user = getLocalUser();
+			if (user != nullptr && user->isSubscribed(game.game_id()))
+			{
+				owned = true;
+			}
 		}
 
 		if (g_config.disableFamilyLock.get())
@@ -189,9 +212,12 @@ void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
 		else if (!owned || FakeAppIds::getFakeAppId(game.game_id()))
 		{
 			char name[256] {}; //No clue how long titles can get
-			g_pClientApps->getAppData(game.game_id(), "common/name", name, sizeof(name));
-			g_pLog->debug("AppName %s\n", name);
-			game.set_game_extra_info(name);
+			if (g_pClientApps)
+			{
+				g_pClientApps->getAppData(game.game_id(), "common/name", name, sizeof(name));
+				g_pLog->debug("AppName %s\n", name);
+				game.set_game_extra_info(name);
+			}
 		}
 
 		msg->mutable_games_played(i)->ParseFromString(game.SerializeAsString());
@@ -222,72 +248,35 @@ void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
 void Apps::sendPICSInfoRequest(CMsgClientPICSProductInfoRequest* msg)
 {
 	const auto tokens = g_config.appTokens.get();
-	const auto added = g_config.addedAppIds.get();
 
-	std::unordered_set<uint32_t> alreadyRequested;
-	for (int i = 0; i < msg->apps_size(); ++i)
+	// We intentionally do NOT add AdditionalApps to Steam's outgoing PICS
+	// product-info requests.  This mirrors the upstream LumaCore design:
+	// ownership is established purely by the package-0 AppIdVec injection in
+	// PackagePatch plus the CheckAppOwnership patch, and Steam fetches the
+	// product info for those apps through its own normal request/response
+	// handshake.  Injecting appids here (or forcing meta_data_only=false)
+	// makes Steam follow up forever for buffers it never asked for, which
+	// hangs the client at "Loading user data".  We only attach an access
+	// token to apps Steam is ALREADY asking about, so the CM returns a real
+	// product-info buffer for them.
+	for (int i = 0; i < msg->apps_size(); i++)
 	{
-		alreadyRequested.insert(msg->apps(i).appid());
-	}
-
-	int injected = 0;
-	bool addedInRequest = false;
-	for (uint32_t appId : added)
-	{
-		if (!appId)
+		auto app = msg->mutable_apps(i);
+		if (tokens.contains(app->appid()))
 		{
-			g_pLog->debug("PICS-request: skip injection for appId=0\n");
-			continue;
+			app->set_access_token(tokens.at(app->appid()));
+			g_pLog->debug("PICS-request: attached access token for %u\n", app->appid());
 		}
-		if (alreadyRequested.count(appId))
-		{
-			g_pLog->debug("PICS-request: skip injection for %u (already in request)\n", appId);
-			addedInRequest = true;
-			continue;
-		}
-
-		if (!msg->meta_data_only())
-		{
-			g_pLog->debug("PICS-request: skip injection for %u (request is meta_data_only=false)\n", appId);
-			continue;
-		}
-
-		auto* entry = msg->add_apps();
-		entry->set_appid(appId);
-		if (tokens.contains(appId))
-		{
-			entry->set_access_token(tokens.at(appId));
-		}
-		++injected;
-		addedInRequest = true;
-		g_pLog->debug("PICS-request: injected %u\n", appId);
-	}
-	g_pLog->debug("PICS-request: addedAppIds.size=%zu, injected=%d\n", added.size(), injected);
-
-
-	if (injected > 0)
-	{
-		g_pLog->debug("PICS-request: injected %d AdditionalApps into outgoing request\n", injected);
 	}
 
 	std::stringstream sentIds;
 	for (int i = 0; i < msg->apps_size(); ++i)
 	{
 		if (i) sentIds << ',';
-		sentIds << msg->mutable_apps(i)->appid();
+		sentIds << msg->apps(i).appid();
 	}
 	g_pLog->debug("PICS-request: apps=%d packages=%d ids=[%s]\n",
 	              msg->apps_size(), msg->packages_size(), sentIds.str().c_str());
-
-	for(int i = 0; i < msg->apps_size(); i++)
-	{
-		auto app = msg->mutable_apps(i);
-		if (tokens.contains(app->appid()))
-		{
-			app->set_access_token(tokens.at(app->appid()));
-			g_pLog->debug("Used access token from config for %u\n", app->appid());
-		}
-	}
 }
 
 void Apps::sendMsg(CProtoBufMsgBase *msg)

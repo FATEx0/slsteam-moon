@@ -23,7 +23,7 @@ Pattern_t::Pattern_t(const char* name, const char* pattern, MemHlp::SigFollowMod
 	prologue(prologue),
 	module(module)
 {
-	Patterns::patterns.emplace_back(this);
+	Patterns::patterns().emplace_back(this);
 }
 
 bool Pattern_t::find()
@@ -36,10 +36,21 @@ bool Patterns::init()
 {
 	bool found = true;
 
-	for(auto& pattern : patterns)
+	for(auto& pattern : patterns())
 	{
 		if (!pattern->find())
 		{
+			if (pattern->optional)
+			{
+				// Optional patterns degrade to a safe no-op in their
+				// dependent feature; don't fail the whole load.
+				g_pLog->warn
+				(
+					"Optional pattern '%s' not found; dependent feature disabled\n",
+					pattern->name.c_str()
+				);
+				continue;
+			}
 			found = false;
 		}
 	}
@@ -375,6 +386,13 @@ namespace Patterns
 		};
 	}
 
-	std::vector<Pattern_t*> patterns;
+	std::vector<Pattern_t*>& patterns()
+	{
+		// Function-local static: guaranteed initialized on first call,
+		// which happens from the first Pattern_t constructor above —
+		// before init() ever iterates it.  Immune to static-init order.
+		static std::vector<Pattern_t*> instance;
+		return instance;
+	}
 }
 

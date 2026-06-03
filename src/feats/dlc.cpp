@@ -12,7 +12,7 @@
 
 bool DLC::shouldUnlockDlc(uint32_t appId)
 {
-	if (!g_pClientUtils->getAppId())
+	if (!g_pClientUtils || !g_pClientUtils->getAppId())
 	{
 		return false;
 	}
@@ -22,7 +22,8 @@ bool DLC::shouldUnlockDlc(uint32_t appId)
 		return false;
 	}
 
-	if (g_pSteamEngine->getUser(0)->isSubscribed(appId))
+	CUser* user = getLocalUser();
+	if (user != nullptr && user->isSubscribed(appId))
 	{
 		return false;
 	}

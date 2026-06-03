@@ -7,7 +7,10 @@
 
 CLog::CLog(const char* path) : path(path)
 {
-	ofstream = std::ofstream(path, std::ios::out);
+	// Append (not truncate) so a complete record survives even if the
+	// logger is constructed more than once in a session.  This is also
+	// a diagnostic safety net: truncation was hiding the init phase.
+	ofstream = std::ofstream(path, std::ios::out | std::ios::app);
 	if (!ofstream.is_open())
 	{
 		throw std::runtime_error("Unable to open logfile!");

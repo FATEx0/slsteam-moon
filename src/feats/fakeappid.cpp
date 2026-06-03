@@ -22,9 +22,13 @@ uint32_t FakeAppIds::getFakeAppId(uint32_t appId)
 	{
 		return fakeAppIds[appId];
 	}
-	else if (fakeAppIds.contains(0) && !g_pSteamEngine->getUser(0)->isSubscribed(appId))
+	else if (fakeAppIds.contains(0))
 	{
-		return fakeAppIds[0];
+		CUser* user = getLocalUser();
+		if (user != nullptr && !user->isSubscribed(appId))
+		{
+			return fakeAppIds[0];
+		}
 	}
 
 	return 0;
@@ -32,6 +36,16 @@ uint32_t FakeAppIds::getFakeAppId(uint32_t appId)
 
 uint32_t FakeAppIds::getRealAppIdForCurrentPipe(bool fallback)
 {
+	// g_pClientUtils is populated lazily from IClientUtils::RunIPCFrame.
+	// Under the LD_PRELOAD injection model our hooks are placed after
+	// Steam is already running, so callers (ticket recv, DLC, matchmaking)
+	// can reach here before that hook has fired.  Guard against the null
+	// pointer instead of dereferencing it.
+	if (!g_pClientUtils)
+	{
+		return 0;
+	}
+
 	uint32_t hPipe = *g_pClientUtils->getPipeIndex();
 	if (fakeAppIdMap.contains(hPipe))
 	{
@@ -53,6 +67,11 @@ void FakeAppIds::launchApp(uint32_t appId)
 
 void FakeAppIds::setAppIdForCurrentPipe(uint32_t& appId)
 {
+	if (!g_pClientUtils)
+	{
+		return;
+	}
+
 	//Keep track of every AppId, for various reasons
 	//fakeAppIdMap[*g_pClientUtils->getPipeIndex()] = appId;
 	fakeAppIdMap[*g_pClientUtils->getPipeIndex()] = lastAppLaunched;
@@ -88,7 +107,16 @@ void FakeAppIds::runIPCFrame(bool post)
 		appId = fakeAppId;
 	}
 
+	if (!g_pClientUtils)
+	{
+		return;
+	}
 	g_pLog->debug("Setting AppId to %u in pipe %p\n", appId, *g_pClientUtils->getPipeIndex());
+
+	if (!g_pSteamEngine)
+	{
+		return;
+	}
 	g_pSteamEngine->setAppIdForCurrentPipe(appId);
 }
 

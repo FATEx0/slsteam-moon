@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 #include "api.hpp"
 #include "config.hpp"
 #include "globals.hpp"
@@ -20,7 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <link.h>
+
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -113,15 +114,15 @@ static void setup()
 
 	g_pLog->debug("SLSsteam loading in %s\n", proc.name);
 
-	//Any release
+	// Strip ourselves from $LD_AUDIT so child processes Steam spawns
+	// (reaper, steamwebhelper, games) don't re-audit and re-run our
+	// hooks in foreign processes.  setup() also early-outs on non-steam
+	// processes, but cleaning the env is cheaper and avoids surprises.
 	cleanEnvVar("LD_AUDIT", "SLSsteam.so");
 	cleanEnvVar("LD_AUDIT", "library-inject.so");
-
-	//Arch release
 	cleanEnvVar("LD_AUDIT", "libSLSsteam.so");
 	cleanEnvVar("LD_AUDIT", "libSLS-library-inject.so");
-	//TODO: Investigate weird logging. Not like it's necessary anymore
-	//cleanEnvVar("LD_PRELOAD");
+
 
 	if(!g_config.init())
 	{
@@ -156,12 +157,16 @@ static void setup()
 		}
 	}
 
-	//Since we can't statically link everything and some distros seem to respect LD_LIBRARY_PATH
-	//more or less than mine does we just force append those
-	//Hopefully this won't mess anything else up
-	auto ldLibPath = std::string(getenv("LD_LIBRARY_PATH"));
-	ldLibPath.append("/usr/lib:/usr/lib32");
-	setenv("LD_LIBRARY_PATH", ldLibPath.c_str(), true);
+
+	// Some distros honour LD_LIBRARY_PATH differently; make sure the
+	// system lib dirs are searchable so library-inject.so's libcurl
+	// redirect resolves.  Harmless append.
+	{
+		const char* cur = getenv("LD_LIBRARY_PATH");
+		std::string ldLibPath = cur ? cur : "";
+		ldLibPath.append(":/usr/lib:/usr/lib32");
+		setenv("LD_LIBRARY_PATH", ldLibPath.c_str(), true);
+	}
 
 	Updater::init();
 
@@ -174,6 +179,7 @@ static void load()
 	{
 		return;
 	}
+
 
 	//This should never happen, but better be safe than sorry in case I refactor someday
 	if (!LM_FindModule("steamclient.so", &g_modSteamClient))
@@ -305,22 +311,63 @@ static void load()
 	}
 }
 
-unsigned int la_version(unsigned int)
+#include <thread>
+#include <chrono>
+#include <link.h>
+
+// ───────────────────────────────────────────────────────────────────────
+// Injection model: LD_AUDIT (rtld-audit).
+//
+// SLSsteam is loaded as an audit module via
+//   LD_AUDIT="library-inject.so:SLSsteam.so"
+// which places it in the dynamic linker's *auditing* link namespace,
+// separate from the application's namespace.  This is essential: the .so
+// statically links protobuf / yaml-cpp / an old-ABI libstdc++ and therefore
+// carries thousands of those symbols.  In the audit namespace they are
+// invisible to the application, so they cannot interpose on the copies
+// Steam's own libraries resolve at runtime.
+//
+// We tried LD_PRELOAD instead; it puts those symbols in the process-global
+// scope, Steam binds to OUR protobuf/std copies, and the resulting ABI
+// mismatch aborts Steam during store load (reproduced on Pop!_OS).  Hiding
+// the symbols isn't viable either: a `local:*` version script collapses
+// yaml-cpp's C++ vague-linkage and crashes config parsing.  LD_AUDIT is the
+// upstream-proven design and sidesteps the whole problem.
+//
+// la_objsearch/la_preinit/la_objopen run in every audited process; setup()
+// itself bails out unless the process is the main "steam" binary, so we do
+// nothing inside steamwebhelper (whose Chromium sandbox would kill us).
+// We deliberately do NOT spawn a background polling thread: la_objopen
+// fires synchronously the moment steamclient.so/steamui.so are mapped,
+// which both avoids the thread-vs-audit glibc TLS issues and lets us patch
+// the target functions while they are still cold (before Steam's worker
+// threads call them).
+// ───────────────────────────────────────────────────────────────────────
+
+extern "C" unsigned int la_version(unsigned int)
 {
 	return LAV_CURRENT;
 }
 
-unsigned int la_objopen(struct link_map *map, __attribute__((unused)) Lmid_t lmid, __attribute__((unused)) uintptr_t *cookie)
+extern "C" unsigned int la_objopen(struct link_map* map,
+                                   __attribute__((unused)) Lmid_t lmid,
+                                   __attribute__((unused)) uintptr_t* cookie)
 {
-	if (std::string(map->l_name).ends_with("/steamclient.so") || std::string(map->l_name).ends_with("/steamui.so"))
+	if (map && map->l_name &&
+	    (std::string(map->l_name).ends_with("/steamclient.so") ||
+	     std::string(map->l_name).ends_with("/steamui.so")))
 	{
+		if (!setupSuccess)
+		{
+			setup();
+		}
 		load();
 	}
 
 	return 0;
 }
 
-void la_preinit(__attribute__((unused)) uintptr_t *cookie)
+extern "C" void la_preinit(__attribute__((unused)) uintptr_t* cookie)
 {
 	setup();
 }

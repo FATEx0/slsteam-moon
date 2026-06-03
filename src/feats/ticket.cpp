@@ -117,7 +117,13 @@ void Ticket::launchApp(uint32_t appId)
 		return;
 	}
 
-	g_pSteamEngine->getUser(0)->updateAppOwnershipTicket(appId, reinterpret_cast<void*>(ticket.ticket.data()), ticket.ticket.size());
+	CUser* user = getLocalUser();
+	if (user == nullptr)
+	{
+		g_pLog->debug("Ticket::launchApp(%u): no local user yet; skipping\n", appId);
+		return;
+	}
+	user->updateAppOwnershipTicket(appId, reinterpret_cast<void*>(ticket.ticket.data()), ticket.ticket.size());
 	g_pLog->infoOnce("Force loaded AppOwnershipTicket for %i\n", appId);
 }
 
