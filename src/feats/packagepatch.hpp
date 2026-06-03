@@ -37,4 +37,12 @@ namespace PackagePatch
 	// that call (e.g. config parser loaded extra appids late), this
 	// reinjects them.  Idempotent against the same id-set.
 	bool injectIntoPackage0(const std::vector<uint32_t>& appIds);
+
+	// Retry the one-shot post-injection license reconcile.  Called from
+	// a hook that reliably has a valid local user (CheckAppOwnership) so
+	// the LicensesUpdated_t broadcast can happen even when the package-0
+	// injection occurred before the engine user map was populated (cold
+	// cache).  Cheap no-op once the broadcast has fired or before
+	// anything has been injected.
+	void tryReconcileLicenses();
 }

@@ -36,6 +36,12 @@ bool Patterns::init()
 {
 	bool found = true;
 
+	// Mark patterns whose absence must NOT abort the load.  Their
+	// dependent features null-guard on the resolved address and become
+	// a safe no-op when unresolved (no regression on builds where the
+	// signature drifts).
+	CUser::NotifyLicensesUpdated.optional = true;
+
 	for(auto& pattern : patterns())
 	{
 		if (!pattern->find())
@@ -174,6 +180,36 @@ namespace Patterns
 			"IClientUser::UpdateAppOwnershipTicket",
 			"E8 ? ? ? ? E9 ? ? ? ? ? ? ? ? ? ? 8D 45 ? 89 45 ? EB",
 			SigFollowMode::Relative
+		};
+		// CUser::<broadcast LicensesUpdated_t>(CUser* this)
+		//
+		// The license-update notifier: rebuilds the LicensesUpdated_t
+		// callback (callback id 0x7d) from the CUser's own license vector
+		// and posts it to every subscriber via the PostCallback dispatch.
+		// Used as the post-injection reconcile: after we append our
+		// AdditionalApps into package 0's AppIdVec, invoking this on the
+		// local CUser forces Steam's ownership/library layer to re-read
+		// licenses (and therefore package 0, now containing our appids),
+		// which breaks the cold-cache PICS product-info request loop.
+		//
+		// Positively identified via the RTTI string "17LicensesUpdated_t"
+		// referenced just before it posts callback 0x7d.  Single stack arg
+		// (`this`, read from [ebp+0x8]); standard cdecl, safe to call by
+		// resolved pointer with g_pLocalUser as `this`.
+		//
+		// Direct prologue match (push ebp / mov ebp,esp / push edi,esi,ebx
+		// / get_pc_thunk + add ebx / sub esp,0x1bc / mov edi,[ebp+0x8] /
+		// mov edi,[eax+0x1b18] / mov [ebp-0x1ac],ebx / test edi,edi).  The
+		// get_pc_thunk call rel, the PIC add immediate, the frame size, and
+		// the [ebp-0x1ac] spill offset are masked so local-frame reshuffles
+		// across builds stay compatible.
+		//
+		// Verified: 1 match, resolves to 0x01817bc0 (build sha 27edb4…).
+		Pattern_t NotifyLicensesUpdated
+		{
+			"CUser::NotifyLicensesUpdated",
+			"55 89 E5 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 81 EC ? ? ? ? 8B 45 08 8B B8 18 1B 00 00 89 9D ? ? FF FF 85 FF",
+			SigFollowMode::None
 		};
 	}
 

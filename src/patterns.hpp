@@ -70,6 +70,7 @@ namespace Patterns
 		extern Pattern_t GetSubscribedApps;
 		extern Pattern_t PostCallback;
 		extern Pattern_t UpdateAppOwnershipTicket;
+		extern Pattern_t NotifyLicensesUpdated;
 	}
 
 	namespace IClientAppManager

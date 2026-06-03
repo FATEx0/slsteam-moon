@@ -40,3 +40,21 @@ void CUser::updateAppOwnershipTicket(uint32_t appId, void* pTicket, uint32_t len
 	cb.appId = appId;
 	postCallback(ECallbackType::AppOwnershipTicketReceived_t, &cb, sizeof(cb));
 }
+
+bool CUser::notifyLicensesUpdated()
+{
+	const auto addr = Patterns::CUser::NotifyLicensesUpdated.address;
+	if (addr == LM_ADDRESS_BAD)
+	{
+		// Pattern didn't resolve on this build — degrade to a safe
+		// no-op so we don't regress the warm-cache path.
+		return false;
+	}
+
+	// cdecl, single arg (`this`).  The function rebuilds the
+	// LicensesUpdated_t callback from this user's own license vector
+	// and posts it to every subscriber.
+	const static auto fn = reinterpret_cast<void(*)(void*)>(addr);
+	fn(this);
+	return true;
+}

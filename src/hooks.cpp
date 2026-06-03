@@ -293,6 +293,16 @@ static uint32_t hkSteamMatchmakingServers_RequestInternetServerList(void* pSteam
 __attribute__((hot))
 static uint32_t hkUser_CheckAppOwnership(void* pClientUser, uint32_t appId, CAppOwnershipInfo* pOwnershipInfo)
 {
+	// Cache the local CUser* as a timing-independent fallback for
+	// getLocalUser().  This hook fires early and constantly with the
+	// pipe-0 user, so it covers the case where the one-shot
+	// CSteamEngine::Init call happened before our hooks were placed
+	// (LD_PRELOAD injection) and g_pSteamEngine is therefore null.
+	if (pClientUser != nullptr)
+	{
+		g_pLocalUser = reinterpret_cast<CUser*>(pClientUser);
+	}
+
 	const uint32_t ret = Hooks::CUser_CheckAppOwnership.tramp.fn(pClientUser, appId, pOwnershipInfo);
 
 	g_pLog->debugOnce
@@ -304,6 +314,15 @@ static uint32_t hkUser_CheckAppOwnership(void* pClientUser, uint32_t appId, CApp
 		appId,
 		ret
 	);
+
+	// Drive the one-shot package-0 license reconcile from here: this
+	// hook fires early and repeatedly with a valid pipe-0 CUser, so it
+	// is the reliable place to broadcast LicensesUpdated_t once the
+	// AdditionalApps have been injected into package 0 — even on a cold
+	// cache where the engine user map isn't populated when LoadPackage
+	// runs.  No-op until injection has happened and after the single
+	// broadcast.
+	PackagePatch::tryReconcileLicenses();
 
 	if (Apps::checkAppOwnership(appId, pOwnershipInfo) || DLC::checkAppOwnership(appId, pOwnershipInfo))
 	{
@@ -676,7 +695,8 @@ static bool hkClientUser_BLoggedOn(void* pClientUser)
 static uint32_t hkClientUser_BUpdateOwnershipTicket(void* pClientUser, uint32_t appId, bool staleOnly)
 {
 	const auto cached = Ticket::getCachedTicket(appId);
-	if (g_pSteamEngine->getUser(0)->isSubscribed(appId) && !cached.steamId)
+	CUser* user = getLocalUser();
+	if (user != nullptr && user->isSubscribed(appId) && !cached.steamId)
 	{
 		staleOnly = false;
 		g_pLog->debug("Force re-requesting OwnershipInfo for %u\n", appId);
@@ -810,6 +830,15 @@ static void hkSteamMatchmakingPingResponse_ServerResponded(void* pSteamMatchingP
 
 static void patchRetn(lm_address_t address)
 {
+	// Defense-in-depth: never write to a null or unresolved address.
+	// If a pattern fails to resolve, its address is 0 (or
+	// LM_ADDRESS_BAD); patching it would segfault.  Skip instead.
+	if (address == 0 || address == LM_ADDRESS_BAD)
+	{
+		g_pLog->warn("patchRetn called with invalid address %p; skipping\n", reinterpret_cast<void*>(address));
+		return;
+	}
+
 	constexpr lm_byte_t retn = 0xC3;
 
 	lm_prot_t oldProt;

@@ -11,6 +11,8 @@
 #include "../patterns.hpp"
 
 #include "../sdk/CPackageInfo.hpp"
+#include "../sdk/CSteamEngine.hpp"
+#include "../sdk/CUser.hpp"
 
 #include "libmem/libmem.h"
 
@@ -54,6 +56,70 @@ namespace
 	std::mutex g_seededMutex;
 	std::unordered_set<uint32_t> g_seededAppIds;
 	std::unordered_set<uint32_t> g_seededDepotIds;
+
+	// Guards the post-injection license-reconcile so we broadcast a
+	// LicensesUpdated_t at most once per process.  Re-broadcasting on
+	// every LoadPackage(0) call would spam the client UI; one reconcile
+	// after the package-0 AppIdVec contains our apps is enough to break
+	// the cold-cache PICS loop.
+	std::atomic<bool> g_licenseReconciled{false};
+
+	// Set true once we've actually appended our AdditionalApps into
+	// package 0.  The reconcile must not fire before this (there'd be
+	// nothing to reconcile), and the CheckAppOwnership-driven retry
+	// path keys off it.
+	std::atomic<bool> g_package0Injected{false};
+
+	// Force Steam to re-read licenses (and therefore package 0, now
+	// holding our injected AdditionalApps) by broadcasting a
+	// LicensesUpdated_t on the local CUser.  This is the missing
+	// "license reconcile" step: without it, injecting appids into
+	// package 0's AppIdVec on a COLD cache leaves Steam re-requesting
+	// PICS product-info for those apps forever ("Loading user data"
+	// hang).  Safe no-op when nothing has been injected yet, when the
+	// local user isn't available yet (retried later), or when the
+	// NotifyLicensesUpdated pattern didn't resolve.  Broadcasts once.
+	void reconcileLicensesOnce()
+	{
+		if (g_licenseReconciled.load(std::memory_order_acquire))
+		{
+			return;
+		}
+		if (!g_package0Injected.load(std::memory_order_acquire))
+		{
+			// Nothing injected yet — nothing to reconcile.
+			return;
+		}
+
+		CUser* user = getLocalUser();
+		if (user == nullptr)
+		{
+			// No usable CUser yet (very early on a cold cache, before
+			// the engine user map is populated and before
+			// CheckAppOwnership has captured one).  Leave the flag
+			// unset; the CheckAppOwnership-driven retry will call us
+			// again once a user exists.
+			g_pLog->debugOnce("PackagePatch: license reconcile deferred (no local user yet)\n");
+			return;
+		}
+
+		const bool notified = user->notifyLicensesUpdated();
+		if (notified)
+		{
+			g_licenseReconciled.store(true, std::memory_order_release);
+			g_pLog->info("PackagePatch: broadcast LicensesUpdated_t to reconcile package 0\n");
+		}
+		else
+		{
+			g_pLog->warn
+			(
+				"PackagePatch: NotifyLicensesUpdated unavailable; "
+				"cold-cache reconcile skipped (warm cache still works)\n"
+			);
+			// Mark as done so we don't log this every call.
+			g_licenseReconciled.store(true, std::memory_order_release);
+		}
+	}
 
 	// Walk the SLSsteam depot-key cache (`<config>/cache/depotkey_*.yaml`)
 	// and return every depot id whose recorded appId is in `appFilter`.
@@ -196,6 +262,10 @@ namespace
 				depotsAdded
 			);
 		}
+		if (appsAdded)
+		{
+			g_package0Injected.store(true, std::memory_order_release);
+		}
 		return appsAdded;
 	}
 
@@ -251,8 +321,20 @@ namespace
 
 		std::vector<uint32_t> ids(added.begin(), added.end());
 
-		std::lock_guard<std::mutex> lk(g_seededMutex);
-		injectFullSetLocked(pInfo, ids);
+		uint32_t addedNow = 0;
+		{
+			std::lock_guard<std::mutex> lk(g_seededMutex);
+			addedNow = injectFullSetLocked(pInfo, ids);
+		}
+
+		// After the package-0 AppIdVec actually contains our apps,
+		// broadcast a license update so Steam re-reads ownership.
+		// Without this the cold cache hangs at "Loading user data".
+		// Also run it even when addedNow==0 on the first pass: a
+		// warm-ish cache may have seeded earlier, but the reconcile is
+		// gated to fire once regardless, and is a safe no-op if a user
+		// isn't ready yet (it retries on the next LoadPackage(0)).
+		reconcileLicensesOnce();
 		return result;
 	}
 }
@@ -317,6 +399,8 @@ namespace PackagePatch
 		g_pOrigLoadPackage = nullptr;
 		g_pCUtlMemoryGrow  = nullptr;
 		g_pPackage0.store(nullptr, std::memory_order_release);
+		g_licenseReconciled.store(false, std::memory_order_release);
+		g_package0Injected.store(false, std::memory_order_release);
 		std::lock_guard<std::mutex> lk(g_seededMutex);
 		g_seededAppIds.clear();
 		g_seededDepotIds.clear();
@@ -329,7 +413,24 @@ namespace PackagePatch
 		{
 			return false;
 		}
-		std::lock_guard<std::mutex> lk(g_seededMutex);
-		return injectFullSetLocked(pPkg, appIds) > 0;
+		bool injected;
+		{
+			std::lock_guard<std::mutex> lk(g_seededMutex);
+			injected = injectFullSetLocked(pPkg, appIds) > 0;
+		}
+
+		// Reconcile after the manual re-inject path too (covers the
+		// case where Steam loaded package 0 before our hook was placed).
+		reconcileLicensesOnce();
+		return injected;
+	}
+
+	void tryReconcileLicenses()
+	{
+		// Cheap, lock-free retry entry point driven by a hook that
+		// reliably has a valid local user (CheckAppOwnership).  No-op
+		// after the one-shot broadcast has happened, or before package
+		// 0 has actually been injected.
+		reconcileLicensesOnce();
 	}
 }
