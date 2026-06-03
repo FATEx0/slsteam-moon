@@ -124,35 +124,86 @@ std::size_t curlWriteCb(const char* p, std::size_t sz, std::size_t n, std::strin
 	return sz * n;
 }
 
+#include <dlfcn.h>
+
+typedef CURL* (*curl_easy_init_t)();
+typedef CURLcode (*curl_easy_setopt_t)(CURL *curl, CURLoption option, ...);
+typedef CURLcode (*curl_easy_perform_t)(CURL *curl);
+typedef void (*curl_easy_cleanup_t)(CURL *curl);
+typedef CURLcode (*curl_easy_getinfo_t)(CURL *curl, CURLINFO info, ...);
+typedef const char* (*curl_easy_strerror_t)(CURLcode);
+
+static curl_easy_init_t p_curl_easy_init = nullptr;
+static curl_easy_setopt_t p_curl_easy_setopt = nullptr;
+static curl_easy_perform_t p_curl_easy_perform = nullptr;
+static curl_easy_cleanup_t p_curl_easy_cleanup = nullptr;
+static curl_easy_getinfo_t p_curl_easy_getinfo = nullptr;
+static curl_easy_strerror_t p_curl_easy_strerror = nullptr;
+
+static bool load_curl() {
+	if (p_curl_easy_init) return true;
+
+	void* handle = dlopen("libcurl.so.4", RTLD_NOLOAD | RTLD_LAZY);
+	if (!handle) handle = dlopen("libcurl.so.4", RTLD_LAZY);
+	if (!handle) handle = RTLD_DEFAULT;
+
+	p_curl_easy_init = (curl_easy_init_t)dlsym(handle, "curl_easy_init");
+	p_curl_easy_setopt = (curl_easy_setopt_t)dlsym(handle, "curl_easy_setopt");
+	p_curl_easy_perform = (curl_easy_perform_t)dlsym(handle, "curl_easy_perform");
+	p_curl_easy_cleanup = (curl_easy_cleanup_t)dlsym(handle, "curl_easy_cleanup");
+	p_curl_easy_getinfo = (curl_easy_getinfo_t)dlsym(handle, "curl_easy_getinfo");
+	p_curl_easy_strerror = (curl_easy_strerror_t)dlsym(handle, "curl_easy_strerror");
+
+	return p_curl_easy_init && p_curl_easy_setopt && p_curl_easy_perform && p_curl_easy_cleanup;
+}
+
 HttpResponse httpGet(const std::string& url)
 {
-	HttpResponse r;
-	CURL* c = curl_easy_init();
-	if (!c)
-	{
-		r.networkError = true;
-		r.diagnostic = "curl_easy_init failed";
-		return r;
-	}
-	curl_easy_setopt(c, CURLOPT_URL, url.c_str());
-	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteCb);
-	curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
-	curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-	curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
-	curl_easy_setopt(c, CURLOPT_USERAGENT, "SLSsteam-ManifestFetch/0.1");
-	const CURLcode rc = curl_easy_perform(c);
-	if (rc != CURLE_OK)
-	{
-		r.networkError = true;
-		r.diagnostic = curl_easy_strerror(rc);
-	}
-	else
-	{
-		curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
-	}
-	curl_easy_cleanup(c);
-	return r;
+    HttpResponse r;
+    
+    if (!load_curl())
+    {
+            r.networkError = true;
+            r.diagnostic = "failed to load libcurl dynamically";
+            return r;
+    }
+
+    CURL* c = p_curl_easy_init();
+    if (!c)
+    {
+            r.networkError = true;
+            r.diagnostic = "curl_easy_init failed";
+            return r;
+    }
+    p_curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    p_curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    p_curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteCb);
+    p_curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
+    p_curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+    p_curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
+    // MANDATORY for multi-threaded use: httpGet runs on a ManifestFetch
+    // worker thread.  Without CURLOPT_NOSIGNAL, libcurl built with a
+    // synchronous resolver implements timeouts via SIGALRM + siglongjmp.
+    // That handler is process-wide; if SIGALRM fires while another thread
+    // (e.g. Steam's main thread in poll()) is running, the longjmp targets
+    // the wrong stack and glibc's __longjmp_chk aborts the whole client.
+    // NOSIGNAL switches libcurl to signal-free timeouts.
+    p_curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    p_curl_easy_setopt(c, CURLOPT_USERAGENT, "SLSsteam-ManifestFetch/0.1");
+    const CURLcode rc = p_curl_easy_perform(c);
+    if (rc != CURLE_OK)
+    {
+            r.networkError = true;
+            r.diagnostic = p_curl_easy_strerror ? p_curl_easy_strerror(rc) : "curl error";
+    }
+    else
+    {
+            r.networkError = false;
+            r.diagnostic = "OK";
+            if (p_curl_easy_getinfo) p_curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
+    }
+    p_curl_easy_cleanup(c);
+    return r;
 }
 
 std::optional<uint64_t> runOnce(uint64_t gid, uint32_t appId, uint32_t depotId)

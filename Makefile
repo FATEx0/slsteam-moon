@@ -12,9 +12,8 @@ deps := $(objs:%.o=%.d)
 CXXFLAGS := -O3 -flto=auto -fPIC -m32 -std=c++20 -Wall -Wextra -Wpedantic -Wno-error=format-security -D_GLIBCXX_USE_CXX11_ABI=0
 
 LDFLAGS := -shared -Wl,--no-undefined
-LDFLAGS += $(shell pkg-config --libs "openssl")
-LDFLAGS += $(shell pkg-config --libs "libcurl")
 LDFLAGS += -lpthread -ldl
+
 
 #DATE := $(shell date "+%Y%m%d%H%M%S")
 DATE := $(shell cat res/version.txt)
@@ -37,10 +36,11 @@ bin/SLSsteam.so: $(objs) $(libs)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) $^ -o bin/SLSsteam.so $(LDFLAGS)
 
-bin/library-inject.so: tools/library-inject/main.cpp tools/library-inject/build.sh
-	sh tools/library-inject/build.sh
+# Separate audit module that redirects libcurl loading to a system copy.
+# Loaded ahead of SLSsteam.so in $LD_AUDIT.
+bin/library-inject.so: tools/library-inject/main.cpp
 	@mkdir -p bin
-	cp tools/library-inject/library-inject.so bin/library-inject.so
+	$(CXX) tools/library-inject/main.cpp -O3 -m32 -fPIC -shared -std=c++20 -o bin/library-inject.so
 
 tools/ticket-grabber/bin/Release/net9.0/linux-x64/publish/ticket-grabber:
 	sh tools/ticket-grabber/build.sh
@@ -73,7 +73,6 @@ zips: rebuild
 	7z a -mx9 -m9=lzma2 \
 		"zips/SLSsteam $(DATE).7z" \
 		"bin/SLSsteam.so" \
-		"bin/library-inject.so" \
 		"setup.sh" \
 		"docs/LICENSE" \
 		"res/config.yaml" \
@@ -84,7 +83,6 @@ zips: rebuild
 	7z a -mx9 -m9=lzma \
 		"zips/SLSsteam $(DATE).zip" \
 		"bin/SLSsteam.so" \
-		"bin/library-inject.so" \
 		"setup.sh" \
 		"docs/LICENSE" \
 		"res/config.yaml" \

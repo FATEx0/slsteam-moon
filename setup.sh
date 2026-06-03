@@ -93,8 +93,14 @@ create_steam_wrapper()
 	# Create wrapper script
 	cat > "$SLSDIR/path/steam" << 'EOF'
 #!/bin/sh
-# SLSsteam wrapper - injects library via LD_AUDIT
-LD_AUDIT="$HOME/.local/share/SLSsteam/library-inject.so:$HOME/.local/share/SLSsteam/SLSsteam.so" exec /usr/games/steam "$@"
+# SLSsteam wrapper - injects via LD_AUDIT (rtld-audit).
+# Loading SLSsteam.so as an audit module keeps it (and the protobuf /
+# yaml-cpp / libstdc++ symbols it statically links) in the linker's
+# separate auditing namespace, so they cannot interpose on the copies
+# Steam's own libraries use. library-inject.so redirects libcurl to a
+# system copy and must come first in the list.
+SLSDIR="$HOME/.local/share/SLSsteam"
+LD_AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so${LD_AUDIT:+:$LD_AUDIT}" exec /usr/games/steam "$@"
 EOF
 	
 	chmod +x "$SLSDIR/path/steam"

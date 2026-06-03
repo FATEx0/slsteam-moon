@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <openssl/sha.h>
+#include <dlfcn.h>
 
 std::vector<std::string> Utils::strsplit(char *str, const char *delimeter)
 {
@@ -40,7 +41,21 @@ std::string Utils::getFileSHA256(const char *filePath)
 
 	std::vector<unsigned char> bytes(std::istreambuf_iterator<char>(fs), {});
 	unsigned char sha256Bytes[SHA256_DIGEST_LENGTH];
-	SHA256(bytes.data(), bytes.size(), sha256Bytes);
+
+        static unsigned char* (*p_SHA256)(const unsigned char *d, size_t n, unsigned char *md) = nullptr;
+        if (!p_SHA256)
+        {
+                void* handle = dlopen("libcrypto.so.1.1", RTLD_NOLOAD | RTLD_LAZY);
+                if (!handle) handle = dlopen("libcrypto.so.1.0.0", RTLD_NOLOAD | RTLD_LAZY);
+                if (!handle) handle = dlopen("libcrypto.so.3", RTLD_NOLOAD | RTLD_LAZY);
+                if (!handle) handle = RTLD_DEFAULT;
+                p_SHA256 = (unsigned char*(*)(const unsigned char*, size_t, unsigned char*))dlsym(handle, "SHA256");
+        }
+        
+        if (p_SHA256)
+                p_SHA256(bytes.data(), bytes.size(), sha256Bytes);
+        else
+                memset(sha256Bytes, 0, SHA256_DIGEST_LENGTH); // fallback if not found
 
 	std::stringstream sha256;
 	for(int i = 0; i < SHA256_DIGEST_LENGTH; i++)

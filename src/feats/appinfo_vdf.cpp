@@ -18,6 +18,7 @@
 #include <fstream>
 #include <ios>
 #include <openssl/sha.h>
+#include <dlfcn.h>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -445,7 +446,20 @@ bool translateWireToIndexed(const std::string& wire,
 
 void sha1(const void* data, size_t n, uint8_t out[20])
 {
-	SHA1(static_cast<const uint8_t*>(data), n, out);
+	static unsigned char* (*p_SHA1)(const unsigned char *d, size_t n, unsigned char *md) = nullptr;
+	if (!p_SHA1)
+	{
+		void* handle = dlopen("libcrypto.so.1.1", RTLD_NOLOAD | RTLD_LAZY);
+		if (!handle) handle = dlopen("libcrypto.so.1.0.0", RTLD_NOLOAD | RTLD_LAZY);
+		if (!handle) handle = dlopen("libcrypto.so.3", RTLD_NOLOAD | RTLD_LAZY);
+		if (!handle) handle = RTLD_DEFAULT;
+		p_SHA1 = (unsigned char*(*)(const unsigned char*, size_t, unsigned char*))dlsym(handle, "SHA1");
+	}
+	
+	if (p_SHA1)
+		p_SHA1(static_cast<const uint8_t*>(data), n, out);
+	else
+		memset(out, 0, 20);
 }
 
 // ---------------------------------------------------------------------------
