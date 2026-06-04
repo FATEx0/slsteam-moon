@@ -253,6 +253,34 @@ void Ticket::recvAppTicket(CMsgClientGetAppOwnershipTicketResponse* msg)
 		return;
 	}
 
+	const uint32_t appId = msg->app_id();
+
+	// For AdditionalApps the CM legitimately returns a non-OK eresult on
+	// the ownership ticket request, and Steam's downloader treats that
+	// as a hard fault: it won't even progress to GetManifestRequestCode,
+	// so the install stalls at "Failed downloading 1 manifests
+	// (Connection timeout)" minutes later.
+	//
+	// Stamp eresult=OK on the parsed message so the downloader proceeds.
+	// We intentionally do NOT touch the `ticket` string field — that
+	// lives in Steam's protobuf arena and rewriting it has corrupted the
+	// heap in past experiments (see HANDOFF.md "DO NOT").  set_eresult is
+	// a trivial int32 mutation, no allocation.  If Steam's later pipeline
+	// strictly validates the ticket bytes we may need to re-route this
+	// through a fresh message buffer (mirror what hkBRouteMsgToJob does
+	// for GetManifestRequestCode), but try the minimal change first.
+	if (g_config.isAddedAppId(appId))
+	{
+		msg->set_eresult(static_cast<int32_t>(ERESULT_OK));
+		// One-time log so we don't spam every retry.  Note: do NOT
+		// use infoOnce here — a bug in CLog dedup-thread interaction
+		// has caused crashes in the past.  A plain `info` is safe;
+		// CM only sends a handful of these per session.
+		g_pLog->info("Ticket: stamped eresult=OK on AppOwnershipTicket response for AdditionalApp=%u\n",
+		             appId);
+		return;
+	}
+
 	//We do not load tickets from disk in the network layer, otherwise they won't be loaded in offline mode
 }
 
