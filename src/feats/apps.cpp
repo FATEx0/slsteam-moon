@@ -6,6 +6,7 @@
 #include "../sdk/CUser.hpp"
 #include "../sdk/EReleaseState.hpp"
 #include "../sdk/IClientApps.hpp"
+#include "../sdk/IClientAppManager.hpp"
 
 #include "../config.hpp"
 #include "../globals.hpp"
@@ -165,16 +166,34 @@ bool Apps::shouldDisableCDKey(uint32_t appId)
 
 bool Apps::shouldDisableUpdates(uint32_t appId)
 {
-	if (g_config.isAddedAppId(appId))
+	const bool added = g_config.isAddedAppId(appId);
+	if (!added)
 	{
-		return true;
+		CUser* user = getLocalUser();
+		if (user == nullptr)
+		{
+			return false;
+		}
+		return !user->isSubscribed(appId);
 	}
-	CUser* user = getLocalUser();
-	if (user == nullptr)
+
+	// For AdditionalApps we want to suppress UPDATES (so Steam doesn't
+	// re-fetch and overwrite the staged build) — but NOT suppress the
+	// initial INSTALL.  Returning false from GetUpdateInfo
+	// unconditionally made Steam think a not-yet-installed AddedApp had
+	// "nothing to download", so the install hung in "Reconfiguring"
+	// and got Suspended.  Only disable updates once the app is already
+	// fully installed; while it's uninstalled / update-required, let
+	// the real update info through so the download proceeds.
+	if (g_pClientAppManager != nullptr)
 	{
-		return false;
+		const EAppState state = g_pClientAppManager->getAppInstallState(appId);
+		if (!(state & APPSTATE_FULLY_INSTALLED))
+		{
+			return false;  // allow the install/download to start
+		}
 	}
-	return !user->isSubscribed(appId);
+	return true;
 }
 
 void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
