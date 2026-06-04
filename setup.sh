@@ -446,8 +446,10 @@ install_steamstub()
 	mkdir -p "$TARGET/steamstub-bypass"
 	cp -v "$HELPERSRC/run-steamless.sh"     "$TARGET/steamstub-bypass/"
 	cp -v "$HELPERSRC/install-steamless.sh" "$TARGET/steamstub-bypass/"
+	cp -v "$HELPERSRC/scan-all.sh"          "$TARGET/steamstub-bypass/"
 	chmod u+x "$TARGET/steamstub-bypass/run-steamless.sh" \
-	          "$TARGET/steamstub-bypass/install-steamless.sh"
+	          "$TARGET/steamstub-bypass/install-steamless.sh" \
+	          "$TARGET/steamstub-bypass/scan-all.sh"
 
 	echo ""
 	bash "$TARGET/steamstub-bypass/install-steamless.sh" \

@@ -27,9 +27,10 @@
 
 namespace
 {
-	// 4-byte signature at file offset 0x40 in PE files that go
-	// through the wrapper.  Identifies them before we pay the Wine
-	// startup cost.
+	// 4-byte signature at file offset 0x40 in PE files wrapped by the
+	// SteamStub v2 packer.  The v3 packer (x86 + x64) drops this fixed
+	// magic and instead puts its header inside a PE section named
+	// ".bind" — both variants are recognised below.
 	constexpr uint8_t kVlvSig[4] = { 'V', 'L', 'V', 0x00 };
 	constexpr off_t   kVlvSigOff = 0x40;
 
@@ -51,19 +52,77 @@ namespace
 	std::mutex g_warmupMu;
 	std::condition_variable g_warmupCV;
 
-	// Returns true when the file at `path` carries the VLV signature
-	// at offset 0x40.  Returns false on any I/O error or short reads
-	// — stub-detection is best-effort and a missed positive only
-	// costs the user the wine round-trip with an early exit.
-	bool fileHasVlvSig(const std::string& path)
+	// Returns true when the file at `path` carries the VLV magic at
+	// offset 0x40 (SteamStub v2) OR has a ".bind" PE section
+	// (SteamStub v3 x86/x64).  Best-effort: any I/O error or a
+	// malformed header returns false.  A missed positive only costs
+	// the user the wine round-trip with an early exit; a false
+	// positive falls through to Steamless which itself rejects
+	// non-stub'd inputs.
+	bool fileHasStubMarker(const std::string& path)
 	{
 		std::ifstream f(path, std::ios::binary);
 		if (!f.is_open()) return false;
+
+		// v2 magic at 0x40.
 		f.seekg(kVlvSigOff, std::ios::beg);
 		uint8_t buf[4] = {};
 		f.read(reinterpret_cast<char*>(buf), sizeof(buf));
-		if (f.gcount() != static_cast<std::streamsize>(sizeof(buf))) return false;
-		return std::memcmp(buf, kVlvSig, sizeof(buf)) == 0;
+		if (f.gcount() == static_cast<std::streamsize>(sizeof(buf))
+		    && std::memcmp(buf, kVlvSig, sizeof(buf)) == 0)
+		{
+			return true;
+		}
+
+		// v3 detection — walk the PE section table looking for ".bind".
+		f.clear();
+		f.seekg(0, std::ios::beg);
+
+		uint8_t mz[2] = {};
+		f.read(reinterpret_cast<char*>(mz), sizeof(mz));
+		if (f.gcount() != 2 || mz[0] != 'M' || mz[1] != 'Z') return false;
+
+		uint32_t e_lfanew = 0;
+		f.seekg(0x3c, std::ios::beg);
+		f.read(reinterpret_cast<char*>(&e_lfanew), sizeof(e_lfanew));
+		if (f.gcount() != sizeof(e_lfanew)) return false;
+		if (e_lfanew == 0 || e_lfanew > 0x10000) return false; // sanity
+
+		// PE\0\0 magic.
+		uint8_t peSig[4] = {};
+		f.seekg(e_lfanew, std::ios::beg);
+		f.read(reinterpret_cast<char*>(peSig), sizeof(peSig));
+		if (f.gcount() != 4
+		    || peSig[0] != 'P' || peSig[1] != 'E'
+		    || peSig[2] != 0   || peSig[3] != 0)
+		{
+			return false;
+		}
+
+		// COFF header: NumberOfSections @ +6, SizeOfOptionalHeader @ +0x14.
+		uint16_t nsec = 0, optsize = 0;
+		f.seekg(e_lfanew + 6, std::ios::beg);
+		f.read(reinterpret_cast<char*>(&nsec), sizeof(nsec));
+		f.seekg(e_lfanew + 0x14, std::ios::beg);
+		f.read(reinterpret_cast<char*>(&optsize), sizeof(optsize));
+		if (!f.good() || nsec == 0 || nsec > 96) return false;
+
+		const std::streamoff secTable = static_cast<std::streamoff>(e_lfanew)
+		                              + 0x18 + optsize;
+		for (uint16_t i = 0; i < nsec; ++i)
+		{
+			char name[8] = {};
+			f.seekg(secTable + i * 40, std::ios::beg);
+			f.read(name, sizeof(name));
+			if (!f.good()) return false;
+			// Section names are zero-padded ASCII; ".bind" is the
+			// container the Steamless v3 unpacker looks for.
+			if (std::strncmp(name, ".bind", 5) == 0 && (name[5] == 0 || name[5] == ' '))
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	// Resolve the install dir for `appId` from the Steam appmanifest.
@@ -362,11 +421,43 @@ void onLaunchApp(uint32_t appId)
 
 		const auto pathStr = p.string();
 
-		// Marker file lets us skip already-processed exes without
-		// re-reading them on every launch.
-		if (std::filesystem::exists(pathStr + ".steamless_done"))
+		// Skip the helper's own artefacts: it leaves `<exe>.original.exe`
+		// as a backup and may transiently produce `<exe>.unpacked.exe`.
+		// Re-running steamless on those would corrupt the backup chain
+		// (verified once in the wild: produced .original.exe.original.exe
+		// and a swapped-in unpacked stand-in).
+		const auto fname = p.filename().string();
+		auto endsWith = [](const std::string& s, const char* suffix) {
+			const size_t n = std::strlen(suffix);
+			return s.size() >= n
+			    && std::strncmp(s.data() + s.size() - n, suffix, n) == 0;
+		};
+		if (endsWith(fname, ".original.exe") || endsWith(fname, ".unpacked.exe"))
 		{
 			continue;
+		}
+
+		// Marker file lets us skip already-processed exes without
+		// re-reading them on every launch.  Validate the marker
+		// against the exe's mtime so a Steam update that rewrites
+		// the binary (and therefore re-applies the stub) forces a
+		// reprocess instead of being silently skipped.
+		const auto markerPath = pathStr + ".steamless_done";
+		if (std::filesystem::exists(markerPath))
+		{
+			std::error_code ec1, ec2;
+			const auto exeMtime    = std::filesystem::last_write_time(p, ec1);
+			const auto markerMtime = std::filesystem::last_write_time(markerPath, ec2);
+			if (!ec1 && !ec2 && markerMtime >= exeMtime)
+			{
+				continue;
+			}
+			// Marker stale (exe newer than marker, or stat failed).
+			// Drop it; the helper will rewrite it after a successful
+			// run.  If stat failed, fall through and let the sig
+			// check decide.
+			std::error_code rmEc;
+			std::filesystem::remove(markerPath, rmEc);
 		}
 
 		// Avoid redoing the same exe twice in one Steam session
@@ -379,7 +470,7 @@ void onLaunchApp(uint32_t appId)
 			}
 		}
 
-		if (!fileHasVlvSig(pathStr))
+		if (!fileHasStubMarker(pathStr))
 		{
 			continue;
 		}

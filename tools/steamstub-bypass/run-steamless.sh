@@ -65,14 +65,58 @@ if [ "$PREWARM" -eq 0 ]; then
     [ -n "$EXE_PATH" ] || die "usage: $0 <exe-path>  |  $0 --prewarm" 1
     [ -f "$EXE_PATH" ] || die "exe not found: $EXE_PATH" 1
 
-    # ── 2. probe Steam Stub VLV signature at offset 0x40 ────────────────
-    # Quick exit if the exe isn't packed. Saves 5-30s of Wine startup.
+    # Refuse our own artefacts so a buggy caller can't recurse on the
+    # backup we left behind (`<exe>.original.exe`) or the transient
+    # output (`<exe>.unpacked.exe`). Treated as a no-op success so
+    # batch callers don't bail.
+    case "$(basename "$EXE_PATH")" in
+        *.original.exe|*.unpacked.exe)
+            log "exe is a Steamless artefact ($(basename "$EXE_PATH")); skipping"
+            exit 2
+            ;;
+    esac
+
+    # ── 2. probe SteamStub markers ──────────────────────────────────────
+    # Two variants we handle:
+    #   - v2 (x86): 'VLV\0' magic at file offset 0x40.
+    #   - v3 (x86/x64): no fixed offset magic, but the unpacker header
+    #     lives in a PE section named ".bind". Reading the section
+    #     table is the canonical detection (Steamless does the same).
+    # Quick exit if neither marker is present, to avoid the 5-30 s
+    # Wine startup cost on plain non-stub'd binaries.
     sig=$(dd if="$EXE_PATH" bs=1 skip=64 count=4 2>/dev/null | xxd -p)
-    if [ "$sig" != "564c5600" ]; then
-        log "exe is not Steam-Stub-wrapped (sig=$sig); skipping"
+    if [ "$sig" = "564c5600" ]; then
+        log "SteamStub v2 (VLV) signature detected — proceeding"
+    elif python3 - "$EXE_PATH" <<'PY'
+import struct, sys
+try:
+    with open(sys.argv[1], 'rb') as f:
+        head = f.read(4096)
+    if head[:2] != b'MZ':
+        sys.exit(1)
+    e_lfanew = struct.unpack_from('<I', head, 0x3c)[0]
+    if e_lfanew + 0x18 > len(head) or head[e_lfanew:e_lfanew+4] != b'PE\x00\x00':
+        sys.exit(1)
+    nsec    = struct.unpack_from('<H', head, e_lfanew + 6)[0]
+    optsize = struct.unpack_from('<H', head, e_lfanew + 0x14)[0]
+    sec_off = e_lfanew + 0x18 + optsize
+    if sec_off + nsec * 40 > len(head):
+        with open(sys.argv[1], 'rb') as f:
+            head = f.read(sec_off + nsec * 40 + 16)
+    for i in range(nsec):
+        name = head[sec_off + i*40 : sec_off + i*40 + 8].rstrip(b'\x00')
+        if name == b'.bind':
+            sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+    then
+        log "SteamStub v3 (.bind section) detected — proceeding"
+    else
+        log "exe is not SteamStub-wrapped (v2 sig=$sig, no .bind section); skipping"
         exit 2
     fi
-    log "Steam Stub VLV signature detected — proceeding"
 fi
 
 # ── 3. resolve Steamless home (skipped in --prewarm) ───────────────────
