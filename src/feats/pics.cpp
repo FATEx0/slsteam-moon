@@ -1,6 +1,8 @@
 
 #include "pics.hpp"
 
+#include "depotkey.hpp"
+
 #include "../config.hpp"
 #include "../globals.hpp"
 #include "../log.hpp"
@@ -205,6 +207,26 @@ std::vector<std::pair<uint32_t, uint64_t>> extractDepotsAndGids(const std::strin
 	return results;
 }
 
+// Read a previously-persisted product-info buffer from our cache.
+// Used to recover the depot/gid list for AdditionalApps whose live CM
+// product-info response carries an empty buffer (see the staging
+// fallback in recvProductInfoResponse).  AppInfoProvision and
+// persistAppBuffer both write to this same `picsbuffer_<appid>.bin`
+// path, so whichever ran last is what we read.
+std::string readCachedBuffer(uint32_t appId)
+{
+	const auto path = getBufferPath(appId);
+	std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+	if (!ifs.is_open()) return {};
+	const std::streamsize sz = ifs.tellg();
+	if (sz <= 0 || sz > (8LL << 20)) return {};
+	std::string out;
+	out.resize(static_cast<std::size_t>(sz));
+	ifs.seekg(0);
+	if (!ifs.read(out.data(), sz)) return {};
+	return out;
+}
+
 void cleanShaderHitCache(uint32_t appId)
 {
 	const char* home = std::getenv("HOME");
@@ -270,7 +292,12 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 			app->buffer().size()
 		);
 
-		if (added.count(app->appid()) && app->buffer().size() > 0)
+		if (!added.count(app->appid()))
+		{
+			continue;
+		}
+
+		if (app->buffer().size() > 0)
 		{
 			// IMPORTANT: do NOT rewrite app->buffer() here.
 			//
@@ -302,14 +329,86 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 			                 app->sha(), app->buffer());
 
 			cleanShaderHitCache(app->appid());
+		}
 
-			auto depots = extractDepotsAndGids(app->buffer());
-			for (const auto& [depotId, gid] : depots)
+		// Decide which buffer to mine for depots/gids.  For an
+		// AdditionalApp whose product info isn't in the local library,
+		// the live CM response carries an EMPTY buffer (no depots), so we
+		// fall back to the product-info buffer we provisioned to disk
+		// during setup() (picsbuffer_<appid>.bin).
+		const bool emptyLiveBuffer = app->buffer().size() == 0;
+		const std::string warmBuf =
+		    emptyLiveBuffer ? readCachedBuffer(app->appid()) : app->buffer();
+		if (warmBuf.empty())
+		{
+			g_pLog->debug("PICS: app=%u no buffer to stage (live=%zu, no cache)\n",
+			              app->appid(), app->buffer().size());
+			continue;
+		}
+
+		auto depots = extractDepotsAndGids(warmBuf);
+		for (const auto& [depotId, gid] : depots)
+		{
+			// Only stage depots we can actually decrypt; the provisioned
+			// buffer still lists depots whose keys we don't have (other
+			// OSes, DLC), and staging those just wastes a CDN round-trip.
+			if (DepotKey::getCachedKey(depotId).key.empty())
 			{
-				g_pLog->info("PICS: triggering background manifest download for app=%u depot=%u gid=%llu\n",
+				continue;
+			}
+
+			if (!emptyLiveBuffer)
+			{
+				// Library app: Steam drives its own manifest fetch.  A
+				// best-effort async prefetch is harmless but never on
+				// the critical path, so don't block the recv thread.
+				g_pLog->info("PICS: prefetching manifest for app=%u depot=%u gid=%llu\n",
 				             app->appid(), depotId, static_cast<unsigned long long>(gid));
 				ManifestFetch::submitManifestBlob(gid, app->appid(), depotId);
+				continue;
 			}
+
+			// AdditionalApp: stage the manifest SYNCHRONOUSLY, before
+			// this handler returns.
+			//
+			// Why synchronous here is the actual fix (verified on the VM
+			// 2026-06-04, superseding the HANDOFF "timing race" theory):
+			//
+			// Clicking Install triggers a fresh PICS product-info request
+			// for the app; Steam cannot begin update *planning* until that
+			// response is processed (it's what tells Steam which depots /
+			// manifests exist).  So this recv handler strictly precedes
+			// planning.
+			//
+			// During planning Steam decides whether to call
+			// CDepotDownloadMgr::BYldRequestDepotManifest.  Content-log
+			// evidence (both a native-Linux depot 285903 AND a windows
+			// depot 638511) shows:
+			//   - manifest NOT on disk at planning  -> Steam calls BYld ->
+			//     the ORIGINAL BYld returns 'Access Denied' -> the whole
+			//     attempt is canceled with "No connection".  Our injected
+			//     request-code lands in Steam's cache but does NOT rescue
+			//     that in-flight call, so the first attempt always failed.
+			//   - manifest ALREADY on disk at planning -> Steam SKIPS BYld
+			//     entirely and goes straight to Downloading -> success.
+			//     (This is exactly why the ~30s auto-retry always worked:
+			//     attempt 1 left the blob on disk.)
+			//
+			// Staging the blob here, before we return, guarantees the
+			// .manifest is on disk before planning runs, so BYld is never
+			// called on the first attempt and the install succeeds without
+			// the retry.  This runs on a genuine Steam worker thread (the
+			// InitFromPacket detour), the same context the prefetch above
+			// has always used safely; blocking it briefly is acceptable
+			// (the BYld sync fetch already blocked a Steam thread the same
+			// way).
+			g_pLog->info("PICS: staging manifest synchronously for app=%u depot=%u gid=%llu\n",
+			             app->appid(), depotId, static_cast<unsigned long long>(gid));
+			const bool staged = ManifestFetch::awaitManifestBlob(
+			    gid, depotId, ManifestFetch::getTimeoutSec());
+			g_pLog->info("PICS: manifest staging for app=%u depot=%u gid=%llu -> %s\n",
+			             app->appid(), depotId, static_cast<unsigned long long>(gid),
+			             staged ? "on disk" : "FAILED (will fall back to BYld retry)");
 		}
 	}
 
