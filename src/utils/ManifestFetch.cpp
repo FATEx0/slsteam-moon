@@ -485,13 +485,29 @@ std::shared_future<bool> launchOrJoinBlob(uint64_t gid, uint32_t depotId,
 	auto it = g_blobInflight.find(key);
 	if (it != g_blobInflight.end())
 	{
-		// If the previous job finished successfully and the file is on
-		// disk, return that.  If it finished but failed, drop the entry
-		// so a retry can happen.
+		// If the previous job finished successfully AND the manifest is
+		// still on disk, return that.  If it finished but failed, OR the
+		// file is gone, drop the entry so a fresh re-fetch happens.
+		//
+		// The on-disk re-check is essential: Steam purges sibling depot
+		// manifests from depotcache when it commits a base depot, so a
+		// manifest we staged once (e.g. a DLC depot like 238325, staged
+		// up-front in the PICS recv handler) can vanish before Steam
+		// plans that depot.  Without this check a cached success made
+		// BYldRequestDepotManifest's fallback report "staged on disk"
+		// while never re-writing the file — Steam then looped forever on
+		// "Access Denied / No connection" because the manifest stayed
+		// deleted.  Re-checking lets the fallback actually re-stage it so
+		// the next planning pass finds it and skips BYld entirely.
 		if (it->second.wait_for(std::chrono::seconds(0)) ==
 		    std::future_status::ready)
 		{
-			if (it->second.get())
+			const std::string targetPath = depotcacheDir + "/" +
+			    std::to_string(depotId) + "_" + std::to_string(gid) + ".manifest";
+			struct stat st{};
+			const bool onDisk =
+			    (stat(targetPath.c_str(), &st) == 0 && st.st_size > 0);
+			if (it->second.get() && onDisk)
 			{
 				return it->second;
 			}
