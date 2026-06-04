@@ -410,21 +410,35 @@ void importLuaScripts()
 
 		std::ifstream ifs(path);
 		if (!ifs.is_open()) continue;
-		std::stringstream buf;
-		buf << ifs.rdbuf();
-		const std::string content = buf.str();
 
-		auto begin = std::sregex_iterator(content.begin(), content.end(),
-		                                  setManifestRe);
-		auto end = std::sregex_iterator();
-		for (auto it = begin; it != end; ++it)
+		// Process line by line so we can strip Lua line comments
+		// (`-- ...`).  A previous version regex-scanned the whole file
+		// and happily imported pins from commented-out lines like
+		// `--setManifestid(638511,"...")`, which then pinned a stale
+		// GID that no longer matched what Steam requested — the
+		// install would hang.  Strip everything from the first `--`
+		// on each line before matching.
+		std::string line;
+		while (std::getline(ifs, line))
 		{
-			const uint32_t depotId =
-				static_cast<uint32_t>(std::stoul((*it)[1].str()));
-			const std::string gid = (*it)[2].str();
-			if (savePin(depotId, gid))
+			const auto commentPos = line.find("--");
+			if (commentPos != std::string::npos)
 			{
-				++imported;
+				line.erase(commentPos);
+			}
+
+			auto begin = std::sregex_iterator(line.begin(), line.end(),
+			                                  setManifestRe);
+			auto end = std::sregex_iterator();
+			for (auto it = begin; it != end; ++it)
+			{
+				const uint32_t depotId =
+					static_cast<uint32_t>(std::stoul((*it)[1].str()));
+				const std::string gid = (*it)[2].str();
+				if (savePin(depotId, gid))
+				{
+					++imported;
+				}
 			}
 		}
 	}

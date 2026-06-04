@@ -219,25 +219,34 @@ void importLuaScripts()
 
 		std::ifstream ifs(path);
 		if (!ifs.is_open()) continue;
-		std::stringstream buf;
-		buf << ifs.rdbuf();
-		const std::string content = buf.str();
 
 		uint32_t appIdGuess = 0;
 		try { appIdGuess = static_cast<uint32_t>(std::stoul(path.stem().string())); }
 		catch (...) {}
 
-		auto begin = std::sregex_iterator(content.begin(), content.end(), addappidWithKeyRe);
-		auto end = std::sregex_iterator();
-		for (auto it = begin; it != end; ++it)
+		// Line-by-line so we can strip Lua comments (`-- ...`); a
+		// commented-out `--addappid(d,1,"key")` must NOT be imported.
+		std::string line;
+		while (std::getline(ifs, line))
 		{
-			const uint32_t depotId = static_cast<uint32_t>(std::stoul((*it)[1].str()));
-			const std::string keyHex = (*it)[2].str();
-			const std::string keyBin = hexToBytes(keyHex);
-			if (keyBin.size() != 32) continue;
-			if (saveKeyToCache(appIdGuess ? appIdGuess : depotId, depotId, keyBin))
+			const auto commentPos = line.find("--");
+			if (commentPos != std::string::npos)
 			{
-				++imported;
+				line.erase(commentPos);
+			}
+
+			auto begin = std::sregex_iterator(line.begin(), line.end(), addappidWithKeyRe);
+			auto end = std::sregex_iterator();
+			for (auto it = begin; it != end; ++it)
+			{
+				const uint32_t depotId = static_cast<uint32_t>(std::stoul((*it)[1].str()));
+				const std::string keyHex = (*it)[2].str();
+				const std::string keyBin = hexToBytes(keyHex);
+				if (keyBin.size() != 32) continue;
+				if (saveKeyToCache(appIdGuess ? appIdGuess : depotId, depotId, keyBin))
+				{
+					++imported;
+				}
 			}
 		}
 	}
