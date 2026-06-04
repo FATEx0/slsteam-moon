@@ -6,6 +6,7 @@
 
 #include "depotkey.hpp"
 #include "manifestid.hpp"
+#include "retry.hpp"
 
 #include "../config.hpp"
 #include "../globals.hpp"
@@ -22,6 +23,7 @@
 #include <curl/curl.h>
 #include <dlfcn.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +34,7 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -101,14 +104,17 @@ bool httpGetJson(const std::string& url, std::string& body, std::string& diag)
 	p_curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
 	p_curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWriteCb);
 	p_curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
-	// Generous timeouts: AppInfoProvision runs once at startup before
-	// Steam opens the appinfo.vdf cache, so a slow first DNS / TLS
-	// handshake (cold network on a freshly booted VM) is fine to wait
-	// for.  Failing here just means Steam shows "Install" with 0 B
-	// for that AddedApp, which we want to avoid more than we want a
-	// fast startup.
-	p_curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
-	p_curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
+	// Bounded timeouts.  AppInfoProvision runs in setup() on the startup
+	// path, so we must not stall Steam's launch for too long if
+	// steamcmd.net is slow or unreachable.  The fetch is now wrapped in a
+	// bounded retry (see provisionApp), so each individual attempt can be
+	// tighter: a genuinely down host fails fast at connect (8s) instead of
+	// burning the full transfer budget, while a transient slow transfer
+	// still gets a generous 20s and is retried with backoff.  Worst case
+	// per app ≈ 3*20s + (1s+2s) backoff ≈ 63s only if every attempt times
+	// out at the transfer stage; an unreachable host is ≈ 3*8s + 3s.
+	p_curl_easy_setopt(c, CURLOPT_TIMEOUT, 20L);
+	p_curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 8L);
 	// Same multi-thread safety justification as ManifestFetch::httpGet.
 	p_curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
 	p_curl_easy_setopt(c, CURLOPT_USERAGENT, "SLSsteam-AppInfoProvision/0.1");
@@ -140,9 +146,20 @@ bool httpGetJson(const std::string& url, std::string& body, std::string& diag)
 
 const std::vector<std::string>& providerChain()
 {
-	static const std::vector<std::string> chain = {
-		"https://api.steamcmd.net/v1/info/{appid}",
-	};
+	// Built once.  The first entry can be overridden via the env var
+	// SLSSTEAM_APPINFO_PROVIDER (a URL template containing `{appid}`),
+	// which is handy for testing the fetch/retry path against a custom
+	// or deliberately-slow endpoint without rebuilding.
+	static const std::vector<std::string> chain = [] {
+		std::vector<std::string> c;
+		if (const char* ov = std::getenv("SLSSTEAM_APPINFO_PROVIDER");
+		    ov && *ov)
+		{
+			c.emplace_back(ov);
+		}
+		c.emplace_back("https://api.steamcmd.net/v1/info/{appid}");
+		return c;
+	}();
 	return chain;
 }
 
@@ -743,11 +760,24 @@ bool provisionApp(uint32_t appId, const std::string& appinfoVdfPath)
 	{
 		url = expandUrl(tmpl, appId);
 		g_pLog->info("AppInfoProvision: app=%u GET %s\n", appId, url.c_str());
-		if (httpGetJson(url, body, diag)) { fetched = true; break; }
+
+		// Retry transient failures (timeouts, 5xx, cold-network DNS) with
+		// a bounded linear backoff.  A single steamcmd.net timeout used to
+		// leave the app unprovisioned for the whole session unless Steam
+		// happened to re-exec setup(); the larger an app's product-info
+		// JSON is, the more likely the 30s total-transfer timeout trips on
+		// a slow first request (observed: Outlast 238320's 8-depot JSON
+		// timed out while the smaller 2262770 succeeded in the same pass).
+		const bool ok = retryWithBackoff(
+			[&] { return httpGetJson(url, body, diag); },
+			/*maxAttempts=*/3, /*baseDelayMs=*/1000,
+			[](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); });
+		if (ok) { fetched = true; break; }
+
 		// Use info, not warn: warn fires a critical notify-send popup
 		// (CLog ctor configures urgency=critical for warn).  A single
-		// provider miss isn't user-actionable noise.
-		g_pLog->info("AppInfoProvision: app=%u provider failed (%s), trying next\n",
+		// provider exhausting its retries isn't user-actionable noise.
+		g_pLog->info("AppInfoProvision: app=%u provider failed after retries (%s), trying next\n",
 		             appId, diag.c_str());
 	}
 	if (!fetched)
