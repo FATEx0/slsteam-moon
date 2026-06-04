@@ -1,7 +1,18 @@
-#Thanks to https://stackoverflow.com/questions/52034997/how-to-make-makefile-recompile-when-a-header-file-is-changed for the -MMD & -MP flags
-#Without them headers wouldn't trigger recompilation
+# Build glue for slsteam-moon.
+#
+# Common invocations:
+#   make             Build bin/SLSsteam.so + bin/library-inject.so on the host.
+#                    Use scripts/build.sh --portable for a release-grade
+#                    binary with broader glibc compatibility.
+#   make clean       Remove all build artefacts.
+#   make install     Install onto the host (delegates to setup.sh install).
+#   make release     Build portable + package dist/slsteam-moon-linux-<ver>.zip.
+#                    Same as scripts/release.sh.
+#
+# -MMD/-MP keep dependency files in sync so header edits trigger
+# recompilation, see https://stackoverflow.com/q/52034997.
 
-#Force g++ cause clang crashes on some hooks
+# Force g++; clang miscompiles a few hooks.
 CXX := g++
 
 libs := $(wildcard lib/*.a)
@@ -9,20 +20,17 @@ srcs := $(shell find src/ -type f -iname "*.cpp")
 objs := $(srcs:src/%.cpp=obj/%.o)
 deps := $(objs:%.o=%.d)
 
-CXXFLAGS := -O3 -flto=auto -fPIC -m32 -std=c++20 -Wall -Wextra -Wpedantic -Wno-error=format-security -D_GLIBCXX_USE_CXX11_ABI=0
+CXXFLAGS := -O3 -flto=auto -fPIC -m32 -std=c++20 \
+            -Wall -Wextra -Wpedantic -Wno-error=format-security \
+            -D_GLIBCXX_USE_CXX11_ABI=0
 
-LDFLAGS := -shared -Wl,--no-undefined
-LDFLAGS += -lpthread -ldl
-
-
-#DATE := $(shell date "+%Y%m%d%H%M%S")
-DATE := $(shell cat res/version.txt)
+LDFLAGS := -shared -Wl,--no-undefined -lpthread -ldl
 
 ifeq ($(shell echo $$NATIVE),1)
 	CXXFLAGS += -march=native
 endif
 
-#Speed up compilation if additional dependencies are found
+# Optional speed-ups picked up if installed.
 ifeq ($(shell type ccache &> /dev/null && echo "found"),found)
 	export PATH := /usr/lib/ccache/bin:$(PATH)
 endif
@@ -30,20 +38,22 @@ ifeq ($(shell type mold &> /dev/null && echo "found"),found)
 	LDFLAGS += -fuse-ld=mold
 endif
 
-audit-libs: bin/SLSsteam.so bin/library-inject.so tools/ticket-grabber/bin/Release/net9.0/linux-x64/publish/ticket-grabber
+.PHONY: all build rebuild clean install release
+.NOTPARALLEL: clean rebuild
+
+all: build
+build: bin/SLSsteam.so bin/library-inject.so
+rebuild: clean build
 
 bin/SLSsteam.so: $(objs) $(libs)
 	@mkdir -p bin
-	$(CXX) $(CXXFLAGS) $^ -o bin/SLSsteam.so $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-# Separate audit module that redirects libcurl loading to a system copy.
-# Loaded ahead of SLSsteam.so in $LD_AUDIT.
+# Audit-side helper that redirects libcurl loading to a system copy.
+# Loaded ahead of SLSsteam.so via $LD_AUDIT.
 bin/library-inject.so: tools/library-inject/main.cpp
 	@mkdir -p bin
-	$(CXX) tools/library-inject/main.cpp -O3 -m32 -fPIC -shared -std=c++20 -o bin/library-inject.so
-
-tools/ticket-grabber/bin/Release/net9.0/linux-x64/publish/ticket-grabber:
-	sh tools/ticket-grabber/build.sh
+	$(CXX) -O3 -m32 -fPIC -shared -std=c++20 $< -o $@
 
 -include $(deps)
 obj/update.o: src/update.cpp res/version.txt
@@ -63,40 +73,10 @@ obj/%.o : src/%.cpp
 	$(CXX) $(CXXFLAGS) -isysteminclude -MMD -MP -c $< -o $@
 
 clean:
-	rm -rvf "obj/" "bin/" "zips/" "tools/ticket-grabber/bin"
+	rm -rf obj/ bin/ dist/
 
 install:
-	sh setup.sh
+	sh setup.sh install
 
-zips: rebuild
-	@mkdir -p zips
-	7z a -mx9 -m9=lzma2 \
-		"zips/SLSsteam $(DATE).7z" \
-		"bin/SLSsteam.so" \
-		"setup.sh" \
-		"docs/LICENSE" \
-		"res/config.yaml" \
-		"tools/SLScheevo" \
-		"tools/ticket-grabber/bin/Release/net9.0/linux-x64/publish/ticket-grabber"
-
-	#Compatibility for Github issues
-	7z a -mx9 -m9=lzma \
-		"zips/SLSsteam $(DATE).zip" \
-		"bin/SLSsteam.so" \
-		"setup.sh" \
-		"docs/LICENSE" \
-		"res/config.yaml" \
-		"tools/SLScheevo" \
-		"tools/ticket-grabber/bin/Release/net9.0/linux-x64/publish/ticket-grabber"
-
-zips-config:
-	7z a -mx9 -m9=lzma "zips/SLSsteam - SLSConfig $(DATE).zip" "$(HOME)/.config/SLSsteam/config.yaml"
-	#Compatibility for Github issues
-	7z a -mx9 -m9=lzma2 "zips/SLSsteam - SLSConfig $(DATE).7z" "$(HOME)/.config/SLSsteam/config.yaml"
-
-build: audit-libs
-rebuild: clean build
-all: clean build zips
-
-.PHONY: all build clean rebuild zips
-.NOTPARALLEL: clean rebuild zips
+release:
+	bash scripts/release.sh

@@ -1,16 +1,16 @@
 #!/bin/bash
-# Check SLSsteam binary compatibility
+# Check slsteam-moon binary compatibility against the running host.
 
-# Switch to repo root so ./bin/SLSsteam.so resolves correctly.
+# Resolve repo root from script location (scripts/check-compat.sh).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 BINARY="./bin/SLSsteam.so"
 
 if [ ! -f "$BINARY" ]; then
 	echo "ERROR: $BINARY not found!"
-	echo "Build it first: make"
+	echo "Build it first: scripts/build.sh   (or scripts/build.sh --host)"
 	exit 1
 fi
 
