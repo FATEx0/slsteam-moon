@@ -146,6 +146,19 @@ bool Apps::shouldDisableCloud(uint32_t appId)
 		return false;
 	}
 
+	// AdditionalApps are injected into package 0 so Steam treats them as
+	// owned — which means isSubscribed() returns true for them.  Cloud
+	// saves still can't sync: Valve's cloud backend validates ownership
+	// server-side and rejects the upload with "Access Denied" (visible in
+	// cloud_log.txt).  Disable cloud for AddedApps explicitly so Steam
+	// doesn't attempt the doomed sync and surface a cloud error to the
+	// user; the isSubscribed() check below would otherwise be defeated by
+	// our own ownership injection.
+	if (g_config.isAddedAppId(appId))
+	{
+		return true;
+	}
+
 	CUser* user = getLocalUser();
 	if (user == nullptr)
 	{
