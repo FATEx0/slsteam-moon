@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 
@@ -42,6 +43,32 @@ const std::vector<std::string>& providerChain()
 
 std::mutex g_lock;
 std::map<uint64_t, std::shared_future<std::optional<uint64_t>>> g_pending;
+
+// Cache of resolved manifest request codes keyed by gid.  The same gid
+// is resolved twice in a normal install: once by the blob fetch inside
+// BYldRequestDepotManifest (to download the .manifest), and again when
+// Steam's GetManifestRequestCode job response arrives.  Caching by gid
+// lets the second lookup return instantly instead of racing a fresh
+// HTTP round-trip — which is what caused the first install attempt to
+// fail with "NO INTERNET CONNECTION" (the job response arrived before
+// the per-job async resolve finished) and only succeed on retry.
+std::mutex g_codeLock;
+std::map<uint64_t, uint64_t> g_codeByGid;
+
+void cacheCode(uint64_t gid, uint64_t code)
+{
+	if (!gid || !code) return;
+	std::lock_guard<std::mutex> lk(g_codeLock);
+	g_codeByGid[gid] = code;
+}
+
+std::optional<uint64_t> cachedCode(uint64_t gid)
+{
+	std::lock_guard<std::mutex> lk(g_codeLock);
+	auto it = g_codeByGid.find(gid);
+	if (it == g_codeByGid.end()) return std::nullopt;
+	return it->second;
+}
 
 
 bool parseDigitsOnly(std::string_view body, uint64_t* out)
@@ -208,6 +235,15 @@ HttpResponse httpGet(const std::string& url)
 
 std::optional<uint64_t> runOnce(uint64_t gid, uint32_t appId, uint32_t depotId)
 {
+	// Fast path: a previous resolve (e.g. the blob fetch in
+	// BYldRequestDepotManifest) already learned this gid's request
+	// code.  Reuse it so we don't race a fresh HTTP round-trip when
+	// Steam's GetManifestRequestCode job response arrives.
+	if (auto c = cachedCode(gid))
+	{
+		return c;
+	}
+
 	const auto& chain = providerChain();
 	if (chain.empty())
 	{
@@ -247,6 +283,7 @@ std::optional<uint64_t> runOnce(uint64_t gid, uint32_t appId, uint32_t depotId)
 			             static_cast<unsigned long long>(gid),
 			             static_cast<unsigned long long>(code),
 			             i + 1);
+			cacheCode(gid, code);
 			return code;
 		}
 		g_pLog->warn("ManifestFetch: gid=%llu provider %zu body unparseable (first 64: '%.*s'), trying next\n",
@@ -312,17 +349,43 @@ bool fetchManifestBlob(uint64_t gid, uint32_t depotId, const std::string& depotc
 	}
 	const uint64_t code = *codeOpt;
 
-	const std::string cdnUrl = "http://cache1-gru1.steamcontent.com/depot/"
-	                           + std::to_string(depotId) + "/manifest/"
-	                           + std::to_string(gid) + "/5/"
-	                           + std::to_string(code);
+	// Steam's manifest CDN occasionally answers 503 (overloaded edge)
+	// for a given host.  Try a handful of CDN hosts before giving up so
+	// a transient 503 doesn't surface as "NO INTERNET CONNECTION".
+	static const char* kCdnHosts[] = {
+		"cache1-gru1.steamcontent.com",
+		"cache2-gru1.steamcontent.com",
+		"cache4-gru1.steamcontent.com",
+		"cache8-gru1.steamcontent.com",
+		"cache11-gru1.steamcontent.com",
+		"fastly.cdn.steampipe.steamcontent.com",
+	};
 
-	const auto zipResp = httpGet(cdnUrl);
-	if (zipResp.networkError || zipResp.status != 200 || zipResp.body.empty())
+	HttpResponse zipResp;
+	bool gotZip = false;
+	for (const char* host : kCdnHosts)
 	{
-		g_pLog->warn("ManifestFetch: blob depot=%u gid=%llu CDN HTTP=%ld err='%s'\n",
-		             depotId, static_cast<unsigned long long>(gid),
+		const std::string cdnUrl = std::string("http://") + host + "/depot/"
+		                           + std::to_string(depotId) + "/manifest/"
+		                           + std::to_string(gid) + "/5/"
+		                           + std::to_string(code);
+		zipResp = httpGet(cdnUrl);
+		if (!zipResp.networkError && zipResp.status == 200 && !zipResp.body.empty())
+		{
+			gotZip = true;
+			break;
+		}
+		// info, not warn: warn fires a critical notify-send popup; a
+		// single edge returning 503 is expected and we just try the
+		// next host.
+		g_pLog->info("ManifestFetch: blob depot=%u gid=%llu host=%s HTTP=%ld err='%s', trying next CDN\n",
+		             depotId, static_cast<unsigned long long>(gid), host,
 		             zipResp.status, zipResp.diagnostic.c_str());
+	}
+	if (!gotZip)
+	{
+		g_pLog->warn("ManifestFetch: blob depot=%u gid=%llu all CDN hosts failed (last HTTP=%ld)\n",
+		             depotId, static_cast<unsigned long long>(gid), zipResp.status);
 		return false;
 	}
 
@@ -345,7 +408,9 @@ bool fetchManifestBlob(uint64_t gid, uint32_t depotId, const std::string& depotc
 		return false;
 	}
 
-	const std::string tmpOutPath = targetPath + ".slsteam_tmp";
+	const std::string tmpOutPath = targetPath + ".slsteam_tmp." +
+	                               std::to_string(static_cast<unsigned long>(getpid())) + "." +
+	                               std::to_string(reinterpret_cast<uintptr_t>(&zipResp));
 	const std::string cmd =
 	    "unzip -p " + std::string(tmpZip) + " > " + tmpOutPath + " 2>/dev/null";
 	const int rc = std::system(cmd.c_str());
@@ -386,30 +451,66 @@ bool fetchManifestBlob(uint64_t gid, uint32_t depotId, const std::string& depotc
 
 } // namespace
 
-void submitManifestBlob(uint64_t manifestGid, uint32_t /*appId*/, uint32_t depotId)
+namespace
 {
-	const auto steamRoot = findSteamRootForBlob();
-	if (steamRoot.empty())
+// Dedupe blob downloads by (gid, depotId).  All three call sites
+// (pics.cpp PICS recv, manifestcode.cpp Send/BYldRequestDepotManifest)
+// can race for the same depot+gid; without dedupe each spawned its own
+// thread and they raced over the same tmp file, causing the spurious
+// "bad magic 0x0" warn (popup) seen in the logs.
+struct BlobKey { uint64_t gid; uint32_t depotId; };
+struct BlobKeyHash
+{
+	std::size_t operator()(const BlobKey& k) const noexcept
 	{
-		g_pLog->debug("ManifestFetch: blob depot=%u gid=%llu skip, no Steam root\n",
-		              depotId,
-		              static_cast<unsigned long long>(manifestGid));
-		return;
+		return std::hash<uint64_t>{}(k.gid) ^ (std::hash<uint32_t>{}(k.depotId) << 1);
 	}
-	const std::string depotcacheDir = steamRoot + "/depotcache";
-
-	std::thread([gid = manifestGid, depotId, depotcacheDir]() {
-		fetchManifestBlob(gid, depotId, depotcacheDir);
-	}).detach();
-}
-
-bool fetchManifestBlobSync(uint64_t manifestGid, uint32_t depotId)
+};
+struct BlobKeyEq
 {
-	const auto steamRoot = findSteamRootForBlob();
-	if (steamRoot.empty()) return false;
-	const std::string depotcacheDir = steamRoot + "/depotcache";
-	return fetchManifestBlob(manifestGid, depotId, depotcacheDir);
+	bool operator()(const BlobKey& a, const BlobKey& b) const noexcept
+	{
+		return a.gid == b.gid && a.depotId == b.depotId;
+	}
+};
+
+std::mutex g_blobLock;
+std::unordered_map<BlobKey, std::shared_future<bool>, BlobKeyHash, BlobKeyEq> g_blobInflight;
+
+std::shared_future<bool> launchOrJoinBlob(uint64_t gid, uint32_t depotId,
+                                          const std::string& depotcacheDir)
+{
+	const BlobKey key{gid, depotId};
+	std::lock_guard<std::mutex> lk(g_blobLock);
+	auto it = g_blobInflight.find(key);
+	if (it != g_blobInflight.end())
+	{
+		// If the previous job finished successfully and the file is on
+		// disk, return that.  If it finished but failed, drop the entry
+		// so a retry can happen.
+		if (it->second.wait_for(std::chrono::seconds(0)) ==
+		    std::future_status::ready)
+		{
+			if (it->second.get())
+			{
+				return it->second;
+			}
+			g_blobInflight.erase(it);
+		}
+		else
+		{
+			return it->second;
+		}
+	}
+	auto fut = std::async(std::launch::async,
+	    [gid, depotId, depotcacheDir]() -> bool
+	    {
+	        return fetchManifestBlob(gid, depotId, depotcacheDir);
+	    }).share();
+	g_blobInflight.emplace(key, fut);
+	return fut;
 }
+} // namespace
 
 
 
@@ -421,6 +522,42 @@ int getTimeoutSec()
 const char* defaultTimeoutKey()
 {
 	return "ManifestFetch.timeout_sec";
+}
+
+void submitManifestBlob(uint64_t manifestGid, uint32_t /*appId*/, uint32_t depotId)
+{
+	const auto steamRoot = findSteamRootForBlob();
+	if (steamRoot.empty())
+	{
+		g_pLog->debug("ManifestFetch: blob depot=%u gid=%llu skip, no Steam root\n",
+		              depotId,
+		              static_cast<unsigned long long>(manifestGid));
+		return;
+	}
+	const std::string depotcacheDir = steamRoot + "/depotcache";
+	(void)launchOrJoinBlob(manifestGid, depotId, depotcacheDir);
+}
+
+bool awaitManifestBlob(uint64_t manifestGid, uint32_t depotId, int timeoutSec)
+{
+	const auto steamRoot = findSteamRootForBlob();
+	if (steamRoot.empty()) return false;
+	const std::string depotcacheDir = steamRoot + "/depotcache";
+	auto fut = launchOrJoinBlob(manifestGid, depotId, depotcacheDir);
+	if (timeoutSec <= 0) timeoutSec = getTimeoutSec();
+	if (fut.wait_for(std::chrono::seconds(timeoutSec)) !=
+	    std::future_status::ready)
+	{
+		g_pLog->warn("ManifestFetch: blob depot=%u gid=%llu await timed out after %ds\n",
+		             depotId, static_cast<unsigned long long>(manifestGid), timeoutSec);
+		return false;
+	}
+	return fut.get();
+}
+
+bool fetchManifestBlobSync(uint64_t manifestGid, uint32_t depotId)
+{
+	return awaitManifestBlob(manifestGid, depotId, getTimeoutSec());
 }
 
 void submit(uint64_t jobId, uint64_t manifestGid, uint32_t appId, uint32_t depotId)
