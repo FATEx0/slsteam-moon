@@ -8,6 +8,7 @@
 #include "update.hpp"
 #include "utils.hpp"
 
+#include "feats/appinfo_provision.hpp"
 #include "feats/appinfo_vdf.hpp"
 #include "feats/depotkey.hpp"
 #include "feats/manifestid.hpp"
@@ -150,6 +151,22 @@ static void setup()
 				    "/appcache/appinfo.vdf";
 				if (std::filesystem::exists(candidate))
 				{
+					// We need DepotKey/ManifestId catalogues populated
+					// from the user's Lua plugin BEFORE provisioning,
+					// because AppInfoProvision drops depots without a
+					// cached key (and pins manifest GIDs from the
+					// catalogue).  Both importers are idempotent — a
+					// second call from DepotKey::onStartup() / setup()
+					// after Hooks are installed is a no-op.
+					DepotKey::importLuaScripts();
+					ManifestId::importLuaScripts();
+
+					// First, fetch fresh PICS-equivalent buffers for
+					// any AdditionalApps whose entry in appinfo.vdf
+					// is missing depots (cold-start case).
+					// Writes to <config>/cache/picsbuffer_*.{bin,yaml},
+					// which the splice below then picks up.
+					AppInfoProvision::provisionAllAddedApps(candidate);
 					AppInfoVdf::injectAllCached(candidate);
 					break;
 				}

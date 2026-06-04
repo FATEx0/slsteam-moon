@@ -584,7 +584,31 @@ bool injectAppImpl(const std::string& path,
 
 	// Translate v39-wire -> v41-indexed.
 	std::vector<uint8_t> indexed;
-	if (!translateWireToIndexed(wireBuffer, f, indexed, err)) return false;
+	if (!translateWireToIndexed(wireBuffer, f, indexed, err))
+	{
+		g_pLog->warn("AppInfoVdf: translateWireToIndexed app=%u failed: %s\n",
+		             appid, err.c_str());
+		return false;
+	}
+
+	// Diagnostic: dump the first bytes of the indexed blob so we can
+	// verify what idx the writer assigned to "appinfo" and the appid
+	// child object.  Keep this until we're sure the v41 layout is
+	// correct end-to-end.
+	{
+		std::string hex;
+		for (size_t i = 0; i < std::min<size_t>(indexed.size(), 24u); ++i)
+		{
+			char b[4]; std::snprintf(b, sizeof(b), "%02x ", indexed[i]);
+			hex += b;
+		}
+		const uint32_t idxAppinfo = !indexed.empty() && indexed.size() >= 5
+		    ? *reinterpret_cast<const uint32_t*>(indexed.data() + 1) : 0u;
+		g_pLog->info("AppInfoVdf: indexed blob app=%u: %s "
+		             "(appinfo idx=%u, table size=%zu, wire %zu->indexed %zu)\n",
+		             appid, hex.c_str(), idxAppinfo, f.strings.size(),
+		             wireBuffer.size(), indexed.size());
+	}
 
 	// Build the new entry.
 	AppEntry ne;
@@ -684,10 +708,12 @@ bool injectApp(const std::string& path,
 	std::string err;
 	if (!injectAppImpl(path, appid, changeNumber, sha, wireBuffer, err))
 	{
-		g_pLog->debug("AppInfoVdf: injectApp(%u) failed: %s\n",
+		g_pLog->warn("AppInfoVdf: injectApp(%u) failed: %s\n",
 		              appid, err.c_str());
 		return false;
 	}
+	g_pLog->info("AppInfoVdf: injected app=%u change=%u into %s\n",
+	             appid, changeNumber, path.c_str());
 	return true;
 }
 
