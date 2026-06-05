@@ -1,5 +1,7 @@
 #pragma once
 
+#include "notify.hpp" // LogLevel + the notify-send command builder
+
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -11,18 +13,6 @@
 #include <shared_mutex>
 #include <sstream>
 #include <unordered_set>
-
-enum class LogLevel : unsigned int
-{
-	//TODO: Add Trace without breaking configs and without using -1 for Once
-	Once,
-	Debug,
-	Info,
-	NotifyShort,
-	NotifyLong,
-	Warn,
-	None
-};
 
 class CLog
 {
@@ -66,30 +56,12 @@ class CLog
 		formatted.resize(size);
 		snprintf(formatted.data(), size, msg, args...);
 
-		std::stringstream notifySS;
+		const std::string notifyCmd = Notify::buildCommand(lvl, formatted);
 
-		switch(lvl)
+		if (shouldNotify() && !notifyCmd.empty())
 		{
-			//TODO: Fix possible breakage when there's only one " in formatted
-			case LogLevel::NotifyShort:
-				notifySS << "notify-send -t 10000 -u \"normal\" \"SLSsteam-moon\" \"" << formatted.c_str() << "\"";
-				break;
-			case LogLevel::NotifyLong:
-				notifySS << "notify-send -t 30000 -u \"normal\" \"SLSsteam-moon\" \"" << formatted.c_str() << "\"";
-				break;
-			case LogLevel::Warn:
-				notifySS << "notify-send -u \"critical\" \"SLSsteam-moon\" \"" << formatted.c_str() << "\"";
-				break;
-
-			default:
-				break;
-
-		}
-
-		if (shouldNotify() && notifySS.str().size() > 0)
-		{
-			system(notifySS.str().c_str());
-			debug("system(\"%s\")\n", notifySS.str().c_str());
+			system(notifyCmd.c_str());
+			debug("system(\"%s\")\n", notifyCmd.c_str());
 		}
 
 		const auto lock = std::unique_lock(mutex);
