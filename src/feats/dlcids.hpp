@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// DLC appid extraction from a provisioned appinfo wire-text buffer.
+//
+// Root cause (proven on the Zorin VM 2026-06-05 with Binding of Isaac
+// 250900): Steam's depot-install planner only schedules a depot tagged
+// with `dlcappid` when that DLC's appid is present in package 0's
+// AppIdVec.  The existing PackagePatch injected only AdditionalApps
+// (base ids), so DLC appids were never injected and their depots were
+// filtered out — the base game installed but its DLC content never did.
+//
+// A base app advertises its DLC appids in two places inside its appinfo:
+//   - extended.listofdlc      -> comma-separated DLC appid list
+//   - depots.<id>.dlcappid    -> the DLC appid a depot belongs to
+// (Mirrors how GBE/GSE fork tools and SFF resolve DLC ids.)
+//
+// This header is pure (no Steam/SDK deps) so it can be unit-tested with
+// a stock g++, same pattern as feats/retry.hpp.  It parses the wire-text
+// VDF dialect that AppInfoProvision emits / persists to
+// `picsbuffer_<appid>.bin` (quoted keys and values, tab-separated).
+
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+namespace AppInfoProvision
+{
+
+namespace detail
+{
+
+// Append the integer parsed from `tok` to `out`/`seen` if it is a
+// non-zero appid different from `baseAppId`.
+inline void addDlcId(std::vector<uint32_t>& out,
+                     std::unordered_set<uint32_t>& seen,
+                     const std::string& tok, uint32_t baseAppId)
+{
+	if (tok.empty()) return;
+	for (char c : tok) if (c < '0' || c > '9') return;
+	uint32_t id = 0;
+	try { id = static_cast<uint32_t>(std::stoul(tok)); }
+	catch (...) { return; }
+	if (id == 0 || id == baseAppId) return;
+	if (seen.insert(id).second) out.push_back(id);
+}
+
+// Return the quoted value that follows the FIRST occurrence of the
+// quoted key `"<key>"` at or after `from`.  Sets `next` to one past the
+// consumed value so callers can continue scanning.  Returns false when
+// no further occurrence exists.
+inline bool nextQuotedValueFor(const std::string& s, const std::string& key,
+                               std::size_t from, std::string& value,
+                               std::size_t& next)
+{
+	const std::string needle = "\"" + key + "\"";
+	const std::size_t k = s.find(needle, from);
+	if (k == std::string::npos) return false;
+
+	// Find the opening quote of the value after the key.
+	std::size_t i = k + needle.size();
+	const std::size_t open = s.find('"', i);
+	if (open == std::string::npos) { next = s.size(); return false; }
+	const std::size_t close = s.find('"', open + 1);
+	if (close == std::string::npos) { next = s.size(); return false; }
+
+	value = s.substr(open + 1, close - (open + 1));
+	next = close + 1;
+	return true;
+}
+
+} // namespace detail
+
+// Parse `wire` (a provisioned appinfo wire-text VDF) and return every
+// DLC appid it advertises via `extended.listofdlc` and any
+// `depots.<id>.dlcappid`, deduplicated and excluding `baseAppId`.
+inline std::vector<uint32_t> extractDlcAppIds(const std::string& wire,
+                                              uint32_t baseAppId)
+{
+	std::vector<uint32_t> out;
+	std::unordered_set<uint32_t> seen;
+	if (wire.empty()) return out;
+
+	// Source A: extended.listofdlc (one comma-separated value; appears
+	// at most once, but scan all occurrences defensively).
+	{
+		std::size_t pos = 0;
+		std::string value;
+		while (detail::nextQuotedValueFor(wire, "listofdlc", pos, value, pos))
+		{
+			std::size_t i = 0;
+			while (i < value.size())
+			{
+				std::size_t j = value.find(',', i);
+				if (j == std::string::npos) j = value.size();
+				detail::addDlcId(out, seen, value.substr(i, j - i), baseAppId);
+				i = j + 1;
+			}
+		}
+	}
+
+	// Source B: every depots.<id>.dlcappid value.
+	{
+		std::size_t pos = 0;
+		std::string value;
+		while (detail::nextQuotedValueFor(wire, "dlcappid", pos, value, pos))
+		{
+			detail::addDlcId(out, seen, value, baseAppId);
+		}
+	}
+
+	return out;
+}
+
+} // namespace AppInfoProvision

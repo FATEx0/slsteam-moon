@@ -5,6 +5,7 @@
 #include "appinfo_provision.hpp"
 
 #include "depotkey.hpp"
+#include "dlcids.hpp"
 #include "manifestid.hpp"
 #include "retry.hpp"
 
@@ -892,6 +893,45 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath)
 	injectProtonMappings();
 
 	return provisioned;
+}
+
+std::vector<uint32_t> collectDlcAppIdsForAddedApps()
+{
+	std::vector<uint32_t> out;
+	std::unordered_set<uint32_t> seen;
+
+	const auto added = g_config.addedAppIds.get();
+	if (added.empty()) return out;
+
+	for (uint32_t appId : added)
+	{
+		// Read the provisioned buffer we wrote in provisionApp().  Same
+		// on-disk path feats/pics.cpp reads for synchronous staging.
+		const auto path = getBufferPath(appId);
+		std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+		if (!ifs.is_open()) continue;
+
+		const std::streamsize sz = ifs.tellg();
+		if (sz <= 0 || sz > (64LL << 20)) continue;
+		std::string wire;
+		wire.resize(static_cast<std::size_t>(sz));
+		ifs.seekg(0);
+		ifs.read(wire.data(), sz);
+
+		for (uint32_t dlcId : extractDlcAppIds(wire, appId))
+		{
+			// Never shadow a base AddedApp, and dedup across apps.
+			if (added.count(dlcId)) continue;
+			if (seen.insert(dlcId).second) out.push_back(dlcId);
+		}
+	}
+
+	if (!out.empty())
+	{
+		g_pLog->info("AppInfoProvision: collected %zu DLC appid(s) from %zu AdditionalApps\n",
+		             out.size(), added.size());
+	}
+	return out;
 }
 
 } // namespace AppInfoProvision

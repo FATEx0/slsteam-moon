@@ -70,6 +70,13 @@ namespace
 	// path keys off it.
 	std::atomic<bool> g_package0Injected{false};
 
+	// DLC appids (discovered from each AddedApp's provisioned appinfo)
+	// that must ALSO be injected into package 0's AppIdVec on every
+	// load, so the install planner schedules their `dlcappid` depots.
+	// Guarded by g_seededMutex.  Merged with config AdditionalApps at
+	// inject time.
+	std::vector<uint32_t> g_extraAppIds;
+
 	// Force Steam to re-read licenses (and therefore package 0, now
 	// holding our injected AdditionalApps) by broadcasting a
 	// LicensesUpdated_t on the local CUser.  This is the missing
@@ -314,12 +321,18 @@ namespace
 		}
 
 		const auto added = g_config.addedAppIds.get();
-		if (added.empty())
+
+		std::vector<uint32_t> ids(added.begin(), added.end());
+		{
+			// Append the registered DLC appids (under the same lock that
+			// guards g_extraAppIds and the seeding sets below).
+			std::lock_guard<std::mutex> lk(g_seededMutex);
+			ids.insert(ids.end(), g_extraAppIds.begin(), g_extraAppIds.end());
+		}
+		if (ids.empty())
 		{
 			return result;
 		}
-
-		std::vector<uint32_t> ids(added.begin(), added.end());
 
 		uint32_t addedNow = 0;
 		{
@@ -404,6 +417,13 @@ namespace PackagePatch
 		std::lock_guard<std::mutex> lk(g_seededMutex);
 		g_seededAppIds.clear();
 		g_seededDepotIds.clear();
+		g_extraAppIds.clear();
+	}
+
+	void setExtraAppIds(const std::vector<uint32_t>& appIds)
+	{
+		std::lock_guard<std::mutex> lk(g_seededMutex);
+		g_extraAppIds = appIds;
 	}
 
 	bool injectIntoPackage0(const std::vector<uint32_t>& appIds)

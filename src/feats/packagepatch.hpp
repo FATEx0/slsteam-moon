@@ -38,6 +38,18 @@ namespace PackagePatch
 	// reinjects them.  Idempotent against the same id-set.
 	bool injectIntoPackage0(const std::vector<uint32_t>& appIds);
 
+	// Register additional appids (beyond the config's AdditionalApps)
+	// that the LoadPackage detour must also inject into package 0 on
+	// every load.  Used for DLC appids discovered from each AddedApp's
+	// provisioned appinfo: Steam's install planner only schedules a
+	// `dlcappid`-tagged depot when that DLC's appid is in package 0's
+	// AppIdVec.  Registering them here (rather than only doing a one-shot
+	// manual inject) keeps them present across package-0 reloads — e.g.
+	// the reload the license reconcile triggers — the same way the
+	// AdditionalApps are kept.  Merged with AdditionalApps at inject
+	// time; deduplicated.  Replaces any previously-set extra list.
+	void setExtraAppIds(const std::vector<uint32_t>& appIds);
+
 	// Retry the one-shot post-injection license reconcile.  Called from
 	// a hook that reliably has a valid local user (CheckAppOwnership) so
 	// the LicensesUpdated_t broadcast can happen even when the package-0

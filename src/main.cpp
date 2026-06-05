@@ -304,9 +304,30 @@ static void load()
 	// LoadPackage detour has already seeded the same ids.
 	{
 		const auto added = g_config.addedAppIds.get();
-		if (!added.empty())
+		std::vector<uint32_t> ids(added.begin(), added.end());
+
+		// Also inject the DLC appids advertised by each AddedApp's
+		// provisioned appinfo (extended.listofdlc / depots.*.dlcappid).
+		// Steam's install planner only schedules a `dlcappid`-tagged
+		// depot when the DLC's appid is present in package 0's AppIdVec
+		// — ownership alone is not enough (proven on the VM 2026-06-05
+		// with Binding of Isaac 250900: the base installed but its DLC
+		// depots were filtered out until the DLC ids were in package 0).
+		// These are NOT added to addedAppIds, so they skip the per-app
+		// provisioning path (a DLC appid has no own depots).  Their
+		// depots are already eligible (depot keys recorded under the
+		// base) and their manifests already stage via PICS recv.
+		//
+		// Register them with PackagePatch so the LoadPackage detour
+		// keeps re-injecting them across package-0 reloads (e.g. the
+		// reload the license reconcile triggers), then do the one-shot
+		// manual inject for the case Steam already loaded package 0.
+		const auto dlcIds = AppInfoProvision::collectDlcAppIdsForAddedApps();
+		PackagePatch::setExtraAppIds(dlcIds);
+		ids.insert(ids.end(), dlcIds.begin(), dlcIds.end());
+
+		if (!ids.empty())
 		{
-			std::vector<uint32_t> ids(added.begin(), added.end());
 			PackagePatch::injectIntoPackage0(ids);
 		}
 	}

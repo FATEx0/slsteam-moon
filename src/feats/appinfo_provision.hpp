@@ -40,9 +40,23 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace AppInfoProvision
 {
+
+// Collect the DLC appids advertised by every provisioned AdditionalApp,
+// read from the on-disk `picsbuffer_<appid>.bin` buffers (their
+// `extended.listofdlc` and `depots.<id>.dlcappid` fields).  Returns the
+// deduplicated set, excluding the AddedApp base ids themselves.
+//
+// These ids must be injected into Steam's package-0 AppIdVec so the
+// install planner schedules the DLC depots — ownership alone is not
+// enough (proven on the VM 2026-06-05 with Binding of Isaac 250900).
+// They are intentionally NOT added to g_config.addedAppIds, so they
+// skip the per-app provisioning path (a DLC appid has no own depots and
+// would only emit a "JSON has no depots" provisioning warning).
+std::vector<uint32_t> collectDlcAppIdsForAddedApps();
 
 // Fetch and persist a synthetic PICS buffer for `appId` if needed.
 // `appinfoVdfPath` is the path to Steam's appcache/appinfo.vdf and is
