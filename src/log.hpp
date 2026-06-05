@@ -72,13 +72,13 @@ class CLog
 		{
 			//TODO: Fix possible breakage when there's only one " in formatted
 			case LogLevel::NotifyShort:
-				notifySS << "notify-send -t 10000 -u \"normal\" \"SLSsteam\" \"" << formatted.c_str() << "\"";
+				notifySS << "notify-send -t 10000 -u \"normal\" \"SLSsteam-moon\" \"" << formatted.c_str() << "\"";
 				break;
 			case LogLevel::NotifyLong:
-				notifySS << "notify-send -t 30000 -u \"normal\" \"SLSsteam\" \"" << formatted.c_str() << "\"";
+				notifySS << "notify-send -t 30000 -u \"normal\" \"SLSsteam-moon\" \"" << formatted.c_str() << "\"";
 				break;
 			case LogLevel::Warn:
-				notifySS << "notify-send -u \"critical\" \"SLSsteam\" \"" << formatted.c_str() << "\"";
+				notifySS << "notify-send -u \"critical\" \"SLSsteam-moon\" \"" << formatted.c_str() << "\"";
 				break;
 
 			default:
