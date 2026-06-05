@@ -2,6 +2,7 @@
 #include "pics.hpp"
 
 #include "depotkey.hpp"
+#include "prewarm.hpp"
 
 #include "../config.hpp"
 #include "../globals.hpp"
@@ -120,91 +121,10 @@ bool persistAppBuffer(uint32_t appId, uint32_t changeNumber,
 
 std::vector<std::pair<uint32_t, uint64_t>> extractDepotsAndGids(const std::string& buf)
 {
-	std::vector<std::pair<uint32_t, uint64_t>> results;
-	size_t depotsPos = buf.find("\"depots\"");
-	if (depotsPos == std::string::npos) return results;
-
-	size_t openBrace = buf.find('{', depotsPos + 8);
-	if (openBrace == std::string::npos) return results;
-
-	int depth = 1;
-	size_t scan = openBrace + 1;
-	uint32_t currentDepotId = 0;
-	std::string currentSection;
-	std::string currentBranch;
-
-	while (scan < buf.size() && depth > 0)
-	{
-		char c = buf[scan];
-		if (c == '"')
-		{
-			size_t end = buf.find('"', scan + 1);
-			if (end == std::string::npos) break;
-			std::string token = buf.substr(scan + 1, end - scan - 1);
-			scan = end + 1;
-
-			if (depth == 1)
-			{
-				bool isDigits = !token.empty();
-				for (char ch : token)
-				{
-					if (ch < '0' || ch > '9') { isDigits = false; break; }
-				}
-				if (isDigits)
-				{
-					try { currentDepotId = std::stoul(token); }
-					catch (...) { currentDepotId = 0; }
-				}
-			}
-			else if (depth == 2)
-			{
-				currentSection = token;
-			}
-			else if (depth == 3 && currentSection == "manifests")
-			{
-				currentBranch = token;
-			}
-			else if (depth == 4 && currentSection == "manifests" && currentBranch == "public" && token == "gid" && currentDepotId != 0)
-			{
-				size_t valStart = buf.find('"', scan);
-				if (valStart != std::string::npos)
-				{
-					size_t valEnd = buf.find('"', valStart + 1);
-					if (valEnd != std::string::npos)
-					{
-						std::string valToken = buf.substr(valStart + 1, valEnd - valStart - 1);
-						bool isDigits = !valToken.empty();
-						for (char ch : valToken)
-						{
-							if (ch < '0' || ch > '9') { isDigits = false; break; }
-						}
-						if (isDigits)
-						{
-							try
-							{
-								uint64_t gid = std::stoull(valToken);
-								results.push_back({currentDepotId, gid});
-							}
-							catch (...) {}
-						}
-						scan = valEnd + 1;
-					}
-				}
-			}
-			continue;
-		}
-		if (c == '{') ++depth;
-		else if (c == '}')
-		{
-			--depth;
-			if (depth == 1)
-			{
-				currentDepotId = 0;
-			}
-		}
-		++scan;
-	}
-	return results;
+	// Single definition shared with the background pre-warm worker
+	// (feats/prewarm.hpp) so the install path and the warm path mine the
+	// provisioned buffer identically.
+	return Prewarm::extractDepotsAndGids(buf);
 }
 
 // Read a previously-persisted product-info buffer from our cache.
@@ -422,6 +342,17 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 		}
 		g_pLog->debug("PICS: unknown_appids=[%s]\n", ss.str().c_str());
 	}
+
+	// Start the background manifest pre-warm worker now that we're on a
+	// real Steam worker thread (post-login PICS recv).  ensureStarted() is
+	// idempotent, so calling it on every recv is cheap.  It keeps every
+	// AddedApp's depot manifests (all OSes we hold a key for, incl. DLC)
+	// staged on disk, healing the post-commit purge so a later planning
+	// pass — e.g. the user forcing a Proton compat tool, which re-plans to
+	// the windows depots without a fresh PICS request — finds the manifests
+	// already present and skips BYldRequestDepotManifest (no ~30s retry).
+	// MUST NOT be started from load()/setup() (HANDOFF DEAD END #2).
+	Prewarm::ensureStarted();
 }
 
 void recvMsg(CProtoBufMsgBase* msg)
