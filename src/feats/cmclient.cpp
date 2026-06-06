@@ -430,6 +430,7 @@ std::string buildCmPacket(uint32_t emsg, const std::string& body,
 // PICS response with response_pending==false arrives.
 void handlePacket(const std::string& pkt, Session& session,
                   std::unordered_map<uint32_t, std::string>& out,
+                  std::unordered_map<uint32_t, uint32_t>* changes,
                   bool& gotLogon, bool& picsDone)
 {
 	uint32_t emsg = 0;
@@ -448,7 +449,7 @@ void handlePacket(const std::string& pkt, Session& session,
 			payload.swap(inflated);
 		}
 		for (const auto& inner : CmWire::expandMultiBody(payload))
-			handlePacket(inner, session, out, gotLogon, picsDone);
+			handlePacket(inner, session, out, changes, gotLogon, picsDone);
 		return;
 	}
 
@@ -472,7 +473,7 @@ void handlePacket(const std::string& pkt, Session& session,
 
 	if (emsg == EMSG_PICS_PRODUCT_INFO_RESPONSE)
 	{
-		const bool pending = CmWire::parsePicsResponse(body, out);
+		const bool pending = CmWire::parsePicsResponse(body, out, changes);
 		if (!pending) picsDone = true;
 		return;
 	}
@@ -483,6 +484,7 @@ void handlePacket(const std::string& pkt, Session& session,
 template <typename Pred>
 bool pumpUntil(TlsSocket& sock, Session& session,
                std::unordered_map<uint32_t, std::string>& out,
+               std::unordered_map<uint32_t, uint32_t>* changes,
                bool& gotLogon, bool& picsDone, Pred predicate)
 {
 	for (;;)
@@ -499,7 +501,7 @@ bool pumpUntil(TlsSocket& sock, Session& session,
 			if (opcode == 0x8) return false;          // close
 			if (opcode == 0x9 || opcode == 0xA) continue; // ping/pong: ignore
 			if (opcode == 0x2 || opcode == 0x0)
-				handlePacket(payload, session, out, gotLogon, picsDone);
+				handlePacket(payload, session, out, changes, gotLogon, picsDone);
 		}
 		if (predicate()) return true;
 		if (sock.expired()) return false;
@@ -508,7 +510,8 @@ bool pumpUntil(TlsSocket& sock, Session& session,
 }
 
 bool runSession(const Endpoint& ep, const std::vector<uint32_t>& appids,
-                std::unordered_map<uint32_t, std::string>& out)
+                std::unordered_map<uint32_t, std::string>& out,
+                std::unordered_map<uint32_t, uint32_t>* changes)
 {
 	TlsSocket sock;
 	sock.startDeadline();
@@ -522,7 +525,7 @@ bool runSession(const Endpoint& ep, const std::vector<uint32_t>& appids,
 	const std::string logonBody = CmWire::buildAnonLogon();
 	if (!sock.sendAll(wsFrame(buildCmPacket(EMSG_CLIENT_LOGON, logonBody, session))))
 		return false;
-	if (!pumpUntil(sock, session, out, gotLogon, picsDone,
+	if (!pumpUntil(sock, session, out, changes, gotLogon, picsDone,
 	               [&] { return gotLogon; }))
 		return false;
 	if (!gotLogon) return false;
@@ -532,7 +535,7 @@ bool runSession(const Endpoint& ep, const std::vector<uint32_t>& appids,
 	if (!sock.sendAll(wsFrame(buildCmPacket(EMSG_PICS_PRODUCT_INFO_REQUEST,
 	                                        picsBody, session))))
 		return false;
-	if (!pumpUntil(sock, session, out, gotLogon, picsDone,
+	if (!pumpUntil(sock, session, out, changes, gotLogon, picsDone,
 	               [&] { return picsDone; }))
 		return false;
 
@@ -543,7 +546,8 @@ bool runSession(const Endpoint& ep, const std::vector<uint32_t>& appids,
 
 
 bool fetchProductInfo(const std::vector<uint32_t>& appids,
-                      std::unordered_map<uint32_t, std::string>& out)
+                      std::unordered_map<uint32_t, std::string>& out,
+                      std::unordered_map<uint32_t, uint32_t>* changesOut)
 {
 	if (appids.empty()) return false;
 	if (!loadCurl())
@@ -564,10 +568,11 @@ bool fetchProductInfo(const std::vector<uint32_t>& appids,
 	for (size_t i = 0; i < maxTries; ++i)
 	{
 		out.clear();
+		if (changesOut) changesOut->clear();
 		const auto& ep = cms[i];
 		g_pLog->info("CmClient: trying CM %s:%d (%zu apps)\n",
 		             ep.host.c_str(), ep.port, appids.size());
-		if (runSession(ep, appids, out))
+		if (runSession(ep, appids, out, changesOut))
 		{
 			g_pLog->info("CmClient: fetched %zu/%zu apps via %s\n",
 			             out.size(), appids.size(), ep.host.c_str());
@@ -575,6 +580,7 @@ bool fetchProductInfo(const std::vector<uint32_t>& appids,
 		}
 	}
 	out.clear();
+	if (changesOut) changesOut->clear();
 	g_pLog->info("CmClient: all CM attempts failed, falling back\n");
 	return false;
 }

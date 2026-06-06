@@ -136,16 +136,21 @@ inline std::string buildPicsRequest(const std::vector<uint32_t>& appids)
 
 // Parse a PICS product-info response body.  Fills `out[appid] = buffer`
 // for every app that carries a non-empty wire buffer (the public
-// product-info VDF).  Returns true if the CM signalled more responses are
+// product-info VDF).  When `changesOut` is non-null, also records each
+// such app's `change_number` (used as part of the appinfo.vdf
+// idempotency key).  Returns true if the CM signalled more responses are
 // pending (response_pending) — the caller keeps reading until false.
 inline bool parsePicsResponse(const std::string& body,
-                              std::unordered_map<uint32_t, std::string>& out)
+                              std::unordered_map<uint32_t, std::string>& out,
+                              std::unordered_map<uint32_t, uint32_t>* changesOut = nullptr)
 {
 	CMsgClientPICSProductInfoResponse r;
 	if (!r.ParseFromString(body)) return false;
 	for (const auto& app : r.apps())
 	{
-		if (!app.buffer().empty()) out[app.appid()] = app.buffer();
+		if (app.buffer().empty()) continue;
+		out[app.appid()] = app.buffer();
+		if (changesOut) (*changesOut)[app.appid()] = app.change_number();
 	}
 	return r.response_pending();
 }

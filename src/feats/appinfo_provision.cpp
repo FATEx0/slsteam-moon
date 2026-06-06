@@ -4,6 +4,7 @@
 
 #include "appinfo_provision.hpp"
 
+#include "cmclient.hpp"
 #include "depotkey.hpp"
 #include "dlcids.hpp"
 #include "manifestid.hpp"
@@ -759,6 +760,195 @@ void injectProtonMappings()
 	             added, added == 1 ? "y" : "ies");
 }
 
+// ---------------------------------------------------------------------------
+// Native CM provider: parse the wire-text VDF buffer the anonymous CM
+// returns into the same YAML::Node shape extractAppNode produces from
+// steamcmd's JSON, so it flows through the identical prune/render/persist
+// path.  The CM buffer is `"appinfo" { ... }` KV1 text (verified live);
+// we parse its inner body into a map.
+// ---------------------------------------------------------------------------
+
+// Minimal KV1-text reader: builds a YAML::Node tree from a VDF-text body.
+// `p`/`end` bracket the buffer.  Returns the node for the object whose
+// opening brace has already been consumed by the caller (or, at top
+// level, the single "appinfo" wrapper's body).  Defensive: bails to an
+// empty node on malformed input.
+class CmVdfReader
+{
+public:
+	CmVdfReader(const char* p, const char* end) : p_(p), end_(end) {}
+
+	// Parse the top-level `"appinfo" { ... }` and return the inner body
+	// node (equivalent to steamcmd's data[appid]).  Empty on failure.
+	YAML::Node parseAppinfo()
+	{
+		std::string key;
+		Tok t = next(key);
+		if (t != Tok::String) return YAML::Node(YAML::NodeType::Undefined);
+		t = next(key /*reused as scratch*/);
+		// After the top key we expect an opening brace.
+		if (t != Tok::OpenBrace) return YAML::Node(YAML::NodeType::Undefined);
+		return parseObject();
+	}
+
+private:
+	enum class Tok { String, OpenBrace, CloseBrace, End };
+
+	YAML::Node parseObject()
+	{
+		YAML::Node node(YAML::NodeType::Map);
+		std::string key;
+		for (;;)
+		{
+			Tok t = next(key);
+			if (t == Tok::CloseBrace || t == Tok::End) break;
+			if (t != Tok::String) break; // malformed
+			std::string val;
+			Tok vt = next(val);
+			if (vt == Tok::OpenBrace)
+			{
+				node[key] = parseObject();
+			}
+			else if (vt == Tok::String)
+			{
+				node[key] = val;
+			}
+			else
+			{
+				break; // malformed
+			}
+		}
+		return node;
+	}
+
+	Tok next(std::string& out)
+	{
+		out.clear();
+		skipWs();
+		if (p_ >= end_) return Tok::End;
+		const char c = *p_;
+		if (c == '{') { ++p_; return Tok::OpenBrace; }
+		if (c == '}') { ++p_; return Tok::CloseBrace; }
+		if (c == '"') return readQuoted(out);
+		return readBare(out);
+	}
+
+	void skipWs()
+	{
+		while (p_ < end_)
+		{
+			const unsigned char c = static_cast<unsigned char>(*p_);
+			if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { ++p_; continue; }
+			if (c == '/' && p_ + 1 < end_ && p_[1] == '/')
+			{
+				while (p_ < end_ && *p_ != '\n') ++p_;
+				continue;
+			}
+			break;
+		}
+	}
+
+	Tok readQuoted(std::string& out)
+	{
+		++p_;
+		while (p_ < end_)
+		{
+			const char c = *p_++;
+			if (c == '"') return Tok::String;
+			if (c == '\\' && p_ < end_)
+			{
+				const char e = *p_++;
+				switch (e)
+				{
+					case 'n':  out.push_back('\n'); break;
+					case 't':  out.push_back('\t'); break;
+					case 'r':  out.push_back('\r'); break;
+					case '"':  out.push_back('"');  break;
+					case '\\': out.push_back('\\'); break;
+					default:   out.push_back(e);    break;
+				}
+				continue;
+			}
+			out.push_back(c);
+		}
+		return Tok::End;
+	}
+
+	Tok readBare(std::string& out)
+	{
+		while (p_ < end_)
+		{
+			const unsigned char c = static_cast<unsigned char>(*p_);
+			if (c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+			    c == '{' || c == '}' || c == '"') break;
+			out.push_back(*p_++);
+		}
+		return Tok::String;
+	}
+
+	const char* p_;
+	const char* end_;
+};
+
+// Render+prune+sha+persist a parsed appinfo node (shared tail used by
+// both the CM and steamcmd paths).  Returns true if a buffer was
+// written.  `changeNumber` is the PICS/JSON change number for the meta
+// record.
+bool renderAndPersist(uint32_t appId, const YAML::Node& appNode,
+                      uint32_t changeNumber)
+{
+	std::string wire;
+	if (!renderAppinfoBuffer(appNode, appId, wire))
+	{
+		g_pLog->warn("AppInfoProvision: app=%u render failed (likely empty body)\n", appId);
+		return false;
+	}
+	if (wire.find("\"depots\"") == std::string::npos)
+	{
+		g_pLog->warn("AppInfoProvision: app=%u buffer has no depots, skipping\n", appId);
+		return false;
+	}
+
+	std::string sha20;
+	{
+		std::uint8_t tmp[20];
+		sha1Bytes(wire.data(), wire.size(), tmp);
+		sha20.assign(reinterpret_cast<const char*>(tmp), 20);
+	}
+
+	if (!persistBuffer(appId, changeNumber, sha20, wire))
+	{
+		g_pLog->warn("AppInfoProvision: app=%u failed to persist buffer to cache\n", appId);
+		return false;
+	}
+
+	g_pLog->infoOnce("AppInfoProvision: app=%u provisioned (change=%u, %zu bytes wire)\n",
+	             appId, changeNumber, wire.size());
+	return true;
+}
+
+// Provision one app from a native-CM wire buffer.  Returns true on
+// success (buffer persisted).  Mirrors the steamcmd path's tail but skips
+// the JSON parse — the CM buffer is already wire-text VDF.
+bool provisionAppFromCmBuffer(uint32_t appId, const std::string& cmWire,
+                              uint32_t changeNumber)
+{
+	if (cmWire.empty()) return false;
+	CmVdfReader reader(cmWire.data(), cmWire.data() + cmWire.size());
+	YAML::Node appNode = reader.parseAppinfo();
+	if (!appNode || !appNode.IsMap() || appNode.size() == 0)
+	{
+		g_pLog->info("AppInfoProvision: app=%u CM buffer parse failed, fallback\n", appId);
+		return false;
+	}
+	return renderAndPersist(appId, appNode, changeNumber);
+}
+
+// Batch map populated once per provisionAllAddedApps pass: appid -> CM
+// wire buffer, and appid -> change number.  Consumed by provisionApp.
+std::unordered_map<uint32_t, std::string> g_cmBuffers;
+std::unordered_map<uint32_t, uint32_t>    g_cmChanges;
+
 
 } // namespace
 
@@ -797,6 +987,26 @@ bool provisionApp(uint32_t appId, const std::string& appinfoVdfPath)
 			g_pLog->debug("AppInfoProvision: app=%u reusing cached buffer (age<%llds)\n",
 			              appId, ttl);
 			return true;
+		}
+	}
+
+	// Native CM batch result (fetched once per provisionAllAddedApps pass,
+	// directly from Valve — the PRIMARY source).  Falls through to the
+	// steamcmd.net HTTP chain below if this app wasn't in the batch (CM
+	// failed, or it was provisioned individually).
+	{
+		auto it = g_cmBuffers.find(appId);
+		if (it != g_cmBuffers.end())
+		{
+			uint32_t cn = 0;
+			if (auto ci = g_cmChanges.find(appId); ci != g_cmChanges.end())
+				cn = ci->second;
+			if (provisionAppFromCmBuffer(appId, it->second, cn))
+			{
+				g_pLog->info("AppInfoProvision: app=%u provisioned via CM\n", appId);
+				return true;
+			}
+			g_pLog->info("AppInfoProvision: app=%u CM buffer unusable, trying steamcmd\n", appId);
 		}
 	}
 
@@ -920,6 +1130,44 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath)
 	const auto added = g_config.addedAppIds.get();
 	if (added.empty()) return 0;
 
+	// PRIMARY source: one batched anonymous-CM product-info request to
+	// Valve for the whole fleet (≈0.3s for dozens of apps; replaces the
+	// per-app steamcmd.net round-trips).  Best-effort: any miss falls
+	// through to the steamcmd.net HTTP chain inside provisionApp.  Skip
+	// only those apps whose buffer is still fresh on disk (the cache TTL
+	// would short-circuit them anyway), so a warm relaunch makes no CM
+	// request at all.  Disable entirely via SLSSTEAM_DISABLE_CM=1.
+	g_cmBuffers.clear();
+	g_cmChanges.clear();
+	const bool cmDisabled = [] {
+		const char* v = std::getenv("SLSSTEAM_DISABLE_CM");
+		return v && *v && std::string(v) != "0";
+	}();
+	if (!cmDisabled)
+	{
+		std::vector<uint32_t> toFetch;
+		const long long ttl = provisionTtlSecs();
+		const long long now = static_cast<long long>(std::time(nullptr));
+		for (uint32_t appId : added)
+		{
+			long long mtime = 0;
+			const bool present = statBuffer(appId, mtime);
+			if (!cache::isBufferReusable(present, mtime, now, ttl))
+				toFetch.push_back(appId);
+		}
+		if (!toFetch.empty())
+		{
+			g_pLog->info("AppInfoProvision: fetching %zu app(s) via native CM\n",
+			             toFetch.size());
+			if (!CmClient::fetchProductInfo(toFetch, g_cmBuffers, &g_cmChanges))
+			{
+				g_cmBuffers.clear();
+				g_cmChanges.clear();
+				g_pLog->info("AppInfoProvision: native CM batch failed, using steamcmd fallback\n");
+			}
+		}
+	}
+
 	int provisioned = 0;
 	for (uint32_t appId : added)
 	{
@@ -933,6 +1181,11 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath)
 		g_pLog->info("AppInfoProvision: %d/%zu AdditionalApps provisioned\n",
 		             provisioned, added.size());
 	}
+
+	// Drop the batch buffers; they can be large and are only needed for
+	// this pass.
+	g_cmBuffers.clear();
+	g_cmChanges.clear();
 
 	// Ensure windows-only AddedApps get a Proton CompatToolMapping so
 	// Steam will download + run them on Linux.  Safe no-op if none.

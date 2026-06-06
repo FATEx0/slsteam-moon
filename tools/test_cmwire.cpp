@@ -134,6 +134,19 @@ int main()
 		CHECK(out.count(3035500u) && out[3035500u] == "X", "buffer mapped by appid");
 		CHECK(out.count(999u) == 0, "empty-buffer app skipped");
 
+		// The optional change-number sink captures each non-empty app's
+		// change_number (used as part of the appinfo.vdf idempotency key).
+		CMsgClientPICSProductInfoResponse resp2;
+		auto* b = resp2.add_apps();
+		b->set_appid(3035500u);
+		b->set_buffer("X");
+		b->set_change_number(4242u);
+		std::unordered_map<uint32_t, std::string> out3;
+		std::unordered_map<uint32_t, uint32_t> changes;
+		CmWire::parsePicsResponse(resp2.SerializeAsString(), out3, &changes);
+		CHECK(changes.count(3035500u) && changes[3035500u] == 4242u,
+		      "change_number captured");
+
 		// A response with response_pending unset reports no more pending.
 		CMsgClientPICSProductInfoResponse done;
 		done.set_response_pending(false);

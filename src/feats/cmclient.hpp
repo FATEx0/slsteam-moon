@@ -40,7 +40,11 @@ namespace CmClient
 // (the caller should fall back to another provider).  Best-effort: a
 // partial result (some apps present, some missing) still returns true so
 // the caller can use what it got and fall back for the rest.
+//
+// When `changesOut` is non-null it also receives each returned app's
+// `change_number` (used as part of the appinfo.vdf idempotency key).
 bool fetchProductInfo(const std::vector<uint32_t>& appids,
-                      std::unordered_map<uint32_t, std::string>& out);
+                      std::unordered_map<uint32_t, std::string>& out,
+                      std::unordered_map<uint32_t, uint32_t>* changesOut = nullptr);
 
 } // namespace CmClient

@@ -44,6 +44,12 @@ int main(int argc, char** argv)
 		const bool hasDepots = it->second.find("\"depots\"") != std::string::npos;
 		std::printf("  app %u: %zu bytes, depots=%s\n",
 		            a, it->second.size(), hasDepots ? "yes" : "no");
+		if (const char* dump = std::getenv("DUMP"))
+		{
+			(void)dump;
+			std::printf("----- buffer for %u -----\n%.700s\n-----\n",
+			            a, it->second.c_str());
+		}
 	}
 	return ok ? 0 : 1;
 }
