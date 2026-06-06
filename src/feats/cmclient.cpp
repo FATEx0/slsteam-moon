@@ -23,6 +23,9 @@
 
 #include "cmclient.hpp"
 
+#include "cmlist_cache.hpp"
+
+#include "../config.hpp"
 #include "../log.hpp"
 
 #include "../sdk/protobufs/steammessages_base.pb.h"
@@ -38,9 +41,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <random>
+#include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -143,18 +150,10 @@ bool httpsGet(const std::string& url, std::string& body)
 
 struct Endpoint { std::string host; int port; };
 
-std::vector<Endpoint> fetchCmList()
+// Parse "endpoint":"host:port" entries out of the GetCMListForConnect
+// JSON (or our cached copy, which stores one host:port per line).
+void parseEndpointsFromJson(const std::string& body, std::vector<Endpoint>& out)
 {
-	std::vector<Endpoint> out;
-	const std::string url =
-		"https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/"
-		"?cellid=0&cmtype=websockets&format=json";
-	std::string body;
-	if (!httpsGet(url, body)) return out;
-
-	// Extract every "endpoint":"host:port" with a lightweight string scan.
-	// (Avoids a full JSON/YAML parse of a large, float-heavy document for
-	// what is just a flat list of host:port strings.)
 	const std::string needle = "\"endpoint\":\"";
 	size_t pos = 0;
 	while ((pos = body.find(needle, pos)) != std::string::npos)
@@ -172,6 +171,87 @@ std::vector<Endpoint> fetchCmList()
 		catch (...) { continue; }
 		if (!e.host.empty() && e.port > 0) out.push_back(std::move(e));
 	}
+}
+
+// On-disk CM-list cache path (alongside the provisioning picsbuffers).
+std::string cmListCachePath()
+{
+	const std::string dir = g_config.getDir() + "/cache";
+	std::error_code ec;
+	if (!std::filesystem::exists(dir)) std::filesystem::create_directories(dir, ec);
+	return dir + "/cmlist.txt";
+}
+
+// Freshness window for the CM-list cache (seconds).  The list is stable
+// bootstrap infra, so a long TTL is safe; a stale entry self-heals
+// because CmClient re-fetches when every cached endpoint fails to
+// connect.  Override via SLSSTEAM_CMLIST_TTL (0 disables).
+long long cmListTtlSecs()
+{
+	if (const char* ov = std::getenv("SLSSTEAM_CMLIST_TTL"); ov && *ov)
+	{
+		try { return std::stoll(ov); } catch (...) {}
+	}
+	return 24 * 3600; // 1 day
+}
+
+bool readCachedCmList(std::vector<Endpoint>& out)
+{
+	const auto path = cmListCachePath();
+	struct stat st{};
+	if (stat(path.c_str(), &st) != 0 || st.st_size <= 0) return false;
+	const long long now = static_cast<long long>(std::time(nullptr));
+	if (!cache::isCmListReusable(true, static_cast<long long>(st.st_mtime),
+	                             now, cmListTtlSecs()))
+		return false;
+	std::ifstream ifs(path);
+	if (!ifs.is_open()) return false;
+	std::string line;
+	while (std::getline(ifs, line))
+	{
+		const auto colon = line.rfind(':');
+		if (colon == std::string::npos) continue;
+		Endpoint e;
+		e.host = line.substr(0, colon);
+		try { e.port = std::stoi(line.substr(colon + 1)); }
+		catch (...) { continue; }
+		if (!e.host.empty() && e.port > 0) out.push_back(std::move(e));
+	}
+	return !out.empty();
+}
+
+void writeCachedCmList(const std::vector<Endpoint>& eps)
+{
+	if (eps.empty()) return;
+	const auto path = cmListCachePath();
+	std::ofstream ofs(path, std::ios::trunc);
+	if (!ofs.is_open()) return;
+	for (const auto& e : eps) ofs << e.host << ':' << e.port << '\n';
+}
+
+std::vector<Endpoint> fetchCmList()
+{
+	// Reuse a fresh on-disk cache first — skips the ~400ms HTTP GET on
+	// cold boots.  A stale/missing cache falls through to the live fetch.
+	{
+		std::vector<Endpoint> cached;
+		if (readCachedCmList(cached))
+		{
+			g_pLog->info("CmClient: reusing cached CM list (%zu endpoints)\n",
+			             cached.size());
+			return cached;
+		}
+	}
+
+	std::vector<Endpoint> out;
+	const std::string url =
+		"https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/"
+		"?cellid=0&cmtype=websockets&format=json";
+	std::string body;
+	if (!httpsGet(url, body)) return out;
+
+	parseEndpointsFromJson(body, out);
+	writeCachedCmList(out);
 	return out;
 }
 
@@ -556,7 +636,7 @@ bool fetchProductInfo(const std::vector<uint32_t>& appids,
 		return false;
 	}
 
-	const auto cms = fetchCmList();
+	auto cms = fetchCmList();
 	if (cms.empty())
 	{
 		g_pLog->info("CmClient: empty CM list, falling back\n");
@@ -564,19 +644,45 @@ bool fetchProductInfo(const std::vector<uint32_t>& appids,
 	}
 
 	// Try a few CMs before giving up; a single edge may refuse/drop.
-	const size_t maxTries = std::min<size_t>(cms.size(), 4);
-	for (size_t i = 0; i < maxTries; ++i)
+	// If they ALL fail, the cached list may be stale — drop it and refetch
+	// a fresh one once before conceding to the steamcmd fallback.
+	for (int round = 0; round < 2; ++round)
 	{
-		out.clear();
-		if (changesOut) changesOut->clear();
-		const auto& ep = cms[i];
-		g_pLog->info("CmClient: trying CM %s:%d (%zu apps)\n",
-		             ep.host.c_str(), ep.port, appids.size());
-		if (runSession(ep, appids, out, changesOut))
+		const size_t maxTries = std::min<size_t>(cms.size(), 4);
+		for (size_t i = 0; i < maxTries; ++i)
 		{
-			g_pLog->info("CmClient: fetched %zu/%zu apps via %s\n",
-			             out.size(), appids.size(), ep.host.c_str());
-			return true;
+			out.clear();
+			if (changesOut) changesOut->clear();
+			const auto& ep = cms[i];
+			g_pLog->info("CmClient: trying CM %s:%d (%zu apps)\n",
+			             ep.host.c_str(), ep.port, appids.size());
+			if (runSession(ep, appids, out, changesOut))
+			{
+				g_pLog->info("CmClient: fetched %zu/%zu apps via %s\n",
+				             out.size(), appids.size(), ep.host.c_str());
+				return true;
+			}
+		}
+		// All cached endpoints failed on the first round: invalidate the
+		// on-disk cache and refetch a fresh list for one more round.
+		if (round == 0)
+		{
+			std::error_code ec;
+			std::filesystem::remove(cmListCachePath(), ec);
+			std::vector<Endpoint> fresh;
+			const std::string url =
+				"https://api.steampowered.com/ISteamDirectory/GetCMListForConnect/v1/"
+				"?cellid=0&cmtype=websockets&format=json";
+			std::string body;
+			if (httpsGet(url, body))
+			{
+				parseEndpointsFromJson(body, fresh);
+				writeCachedCmList(fresh);
+			}
+			if (fresh.empty()) break;
+			g_pLog->info("CmClient: cached CMs failed, retrying with fresh list (%zu)\n",
+			             fresh.size());
+			cms.swap(fresh);
 		}
 	}
 	out.clear();
