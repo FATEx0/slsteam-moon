@@ -276,6 +276,15 @@ if [ -z "$STEAM_BIN" ]; then
 	exit 127
 fi
 
+# CloudRedirect (optional): load its 32-bit cloud-save hook via LD_PRELOAD if
+# present. CloudRedirect only acts inside the Steam client process and removes
+# itself from LD_PRELOAD for child processes, so setting it here is safe. It is
+# loaded alongside (not instead of) SLSsteam's LD_AUDIT injection.
+CR_SO="$HOME/.local/share/CloudRedirect/cloud_redirect.so"
+if [ -f "$CR_SO" ]; then
+	export LD_PRELOAD="$CR_SO${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+
 LD_AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so${LD_AUDIT:+:$LD_AUDIT}" exec "$STEAM_BIN" "$@"
 EOF
 
