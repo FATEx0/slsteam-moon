@@ -244,10 +244,11 @@ create_steam_wrapper()
 	# /usr/games/steam and an Arch-style /usr/bin/steam).
 	cat > "$SLSDIR/path/steam" << 'EOF'
 #!/bin/sh
-# slsteam-moon wrapper. Injects via LD_AUDIT (rtld-audit) so the audit
+# slsteam-moon wrapper. Injects SLSsteam via LD_AUDIT (rtld-audit) so the audit
 # namespace can't interpose on Steam's own copies of protobuf / yaml-cpp /
 # libstdc++. library-inject.so redirects libcurl to the system copy and must
-# come first.
+# come first. CloudRedirect (cloud saves) is injected separately via LD_PRELOAD
+# (see its block below).
 SLSDIR="$HOME/.local/share/SLSsteam"
 
 # Resolve the real Steam binary, skipping our own wrapper.
@@ -276,17 +277,21 @@ if [ -z "$STEAM_BIN" ]; then
 	exit 127
 fi
 
-# CloudRedirect (optional): chain its 32-bit cloud-save hook into the SAME
-# LD_AUDIT list as SLSsteam (the 2.0.4 build is an rtld-audit library: it
-# exports la_objopen and attaches event-driven when steamclient.so loads, so it
-# has no timeout to miss). It MUST come AFTER library-inject.so + SLSsteam.so so
-# our libcurl redirect and Steam-copy protection stay first. CloudRedirect only
-# acts inside the Steam client process, so chaining it here is safe.
+# CloudRedirect (optional): inject its 32-bit cloud-save hook via LD_PRELOAD.
+# Our bundled build is CloudRedirect 2.1.5 (correct save restore via
+# StripCasShaLeaf) with the steamclient.so wait extended 10s -> 120s so it
+# attaches on slow-bootstrap distros (Arch/CachyOS) too. It is a plain
+# LD_PRELOAD library: loading it as an LD_AUDIT auditor corrupts the client
+# heap (realloc(): invalid pointer) during init, so it must NOT go in the
+# LD_AUDIT list. SLSsteam stays on LD_AUDIT (library-inject.so first).
+# CloudRedirect's constructor self-removes itself from LD_PRELOAD so child
+# processes (the game, steamwebhelper) don't inherit it.
 CR_SO="$HOME/.local/share/CloudRedirect/cloud_redirect.so"
-AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so"
 if [ -f "$CR_SO" ]; then
-	AUDIT="$AUDIT:$CR_SO"
+	export LD_PRELOAD="$CR_SO${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
+
+AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so"
 
 LD_AUDIT="$AUDIT${LD_AUDIT:+:$LD_AUDIT}" exec "$STEAM_BIN" "$@"
 EOF
