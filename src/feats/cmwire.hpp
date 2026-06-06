@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Pure Steam CM websocket wire helpers (no I/O).
+//
+// These back the native anonymous CM product-info client (feats/cmclient)
+// that replaces the external api.steamcmd.net dependency.  Everything here
+// is a deterministic byte transform so it can be unit tested on the host
+// without a network (tools/test_cmwire.cpp); the transport (TLS, websocket
+// handshake, CM server list) lives in cmclient.cpp.
+//
+// Steam CM packet framing, per websocket binary message:
+//   <uint32 emsg (high bit = proto mask 0x80000000)>
+//   <uint32 header_len>
+//   <CMsgProtoBufHeader bytes>
+//   <body protobuf bytes>
+//
+// Treat every byte off the wire as untrusted: bounds-check each length
+// before slicing, and fail closed (return false / empty) on anything
+// malformed rather than risk an overrun.
+
+#pragma once
+
+#include <cstdint>
+#include <cstring>
+#include <string>
+
+namespace CmWire
+{
+
+// High bit of the emsg field marks a protobuf-framed message.
+constexpr uint32_t PROTO_MASK = 0x80000000u;
+
+// Frame a protobuf message into a CM websocket packet.  `emsg` is the
+// raw EMsg value (the proto mask is OR'd in here); `hdr` is the
+// serialised CMsgProtoBufHeader; `body` is the serialised message body.
+inline std::string packPacket(uint32_t emsg, const std::string& hdr,
+                              const std::string& body)
+{
+	std::string out;
+	const uint32_t e  = emsg | PROTO_MASK;
+	const uint32_t hl = static_cast<uint32_t>(hdr.size());
+	out.resize(8);
+	std::memcpy(&out[0], &e, 4);
+	std::memcpy(&out[4], &hl, 4);
+	out += hdr;
+	out += body;
+	return out;
+}
+
+// Parse a CM websocket packet into its emsg (proto mask stripped), header
+// bytes, and body bytes.  Returns false on any malformed/truncated input.
+inline bool parsePacket(const std::string& d, uint32_t& emsg,
+                        std::string& hdr, std::string& body)
+{
+	if (d.size() < 8) return false;
+	uint32_t e = 0, hl = 0;
+	std::memcpy(&e, &d[0], 4);
+	std::memcpy(&hl, &d[4], 4);
+	if (static_cast<uint64_t>(8) + hl > d.size()) return false;
+	emsg = e & ~PROTO_MASK;
+	hdr  = d.substr(8, hl);
+	body = d.substr(8 + hl);
+	return true;
+}
+
+} // namespace CmWire
