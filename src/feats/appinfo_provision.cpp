@@ -7,6 +7,7 @@
 #include "depotkey.hpp"
 #include "dlcids.hpp"
 #include "manifestid.hpp"
+#include "provision_cache.hpp"
 #include "retry.hpp"
 
 #include "../config.hpp"
@@ -27,6 +28,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -473,6 +475,34 @@ std::string getMetaPath(uint32_t appId)
 	return getCacheDir() + "/picsbuffer_" + std::to_string(appId) + ".yaml";
 }
 
+// Return the last-modified time (epoch seconds) of `appId`'s on-disk
+// provisioned buffer, and whether it exists and is non-empty.  Used by
+// provisionApp's short-lived cache to skip the network fetch during the
+// setup() re-exec storm of a single boot.
+bool statBuffer(uint32_t appId, long long& mtimeSecsOut)
+{
+	struct stat st{};
+	if (stat(getBufferPath(appId).c_str(), &st) != 0) return false;
+	if (st.st_size <= 0) return false;
+	mtimeSecsOut = static_cast<long long>(st.st_mtime);
+	return true;
+}
+
+// Freshness window for the provisioning cache, in seconds.  Short by
+// design: it must cover Steam's setup() re-exec storm within one boot
+// (so the 8-app fleet is fetched once, not once per pass) without
+// surviving into a later genuine relaunch, where we re-fetch the live
+// public gid (see provision_cache.hpp for the gid-staleness rationale).
+// Override via SLSSTEAM_PROVISION_TTL (seconds; 0 disables the cache).
+long long provisionTtlSecs()
+{
+	if (const char* ov = std::getenv("SLSSTEAM_PROVISION_TTL"); ov && *ov)
+	{
+		try { return std::stoll(ov); } catch (...) {}
+	}
+	return 300; // 5 minutes
+}
+
 bool persistBuffer(uint32_t appId, uint32_t changeNumber,
                    const std::string& sha20, const std::string& wire)
 {
@@ -742,17 +772,33 @@ bool provisionApp(uint32_t appId, const std::string& appinfoVdfPath)
 	(void)appinfoVdfPath;
 	if (appId == 0) return false;
 
-	// We deliberately do NOT skip when a cached picsbuffer already
-	// exists, nor when the on-disk appinfo.vdf already has depots.
-	// The provisioned buffer depends on live state (the user's current
-	// DepotKey / ManifestId catalogues, which decide depot pruning and
-	// GID pinning).  A stale cache from a previous session — e.g. one
-	// produced before a manifest pin was added, or before the depot
-	// prune logic existed — would otherwise be reused verbatim and
-	// pin the wrong manifest GID, causing Steam to request a manifest
-	// we never staged.  Re-fetching is cheap (once per startup) and
-	// the AppInfoVdf splice is idempotent on (appid, change, sha), so
-	// re-provisioning every launch is safe and correct.
+	// Short-lived on-disk cache to tame startup cost.  Steam re-execs
+	// setup() several times during a single cold boot (observed 4x on
+	// the Zorin VM), and each pass would otherwise issue one synchronous
+	// HTTP GET per AddedApp — so the boot cost grew O(n_apps * n_passes)
+	// and stalled Steam's launch the more games the user added.
+	//
+	// If we already wrote picsbuffer_<appid>.bin within the (short) TTL,
+	// reuse it and skip the network: the buffer the earlier pass produced
+	// reflects the SAME live state (DepotKeys; pins are disabled), so the
+	// AppInfoVdf splice — idempotent on (appid, change, sha) — is a no-op
+	// the second time anyway.  The TTL is deliberately short so a genuine
+	// relaunch (minutes/hours later, > TTL) re-fetches the live public
+	// gid; we must NOT serve a stale cross-session buffer, or we'd
+	// reintroduce the staged-gid vs requested-gid mismatch the
+	// install-first-attempt fix resolved.
+	{
+		const long long ttl = provisionTtlSecs();
+		long long mtime = 0;
+		const bool present = statBuffer(appId, mtime);
+		const long long now = static_cast<long long>(std::time(nullptr));
+		if (cache::isBufferReusable(present, mtime, now, ttl))
+		{
+			g_pLog->debug("AppInfoProvision: app=%u reusing cached buffer (age<%llds)\n",
+			              appId, ttl);
+			return true;
+		}
+	}
 
 	std::string body, diag;
 	std::string url;
