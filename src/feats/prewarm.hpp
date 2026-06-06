@@ -266,6 +266,67 @@ inline std::vector<DepotGid> planStageTargets(
 	return out;
 }
 
+// Mine a workshop ACF (steamapps/workshop/appworkshop_<appid>.acf) for the
+// manifest gids of subscribed workshop items, returning them as
+// (appId, gid) pairs.  The workshop "depot" Steam plans has
+// depotId == appId and a DYNAMIC per-item manifest gid that is NOT in the
+// appinfo `depots` block (there, the appid only appears as the value of
+// `workshopdepot`), so neither extractDepotsAndGids nor planStageTargets
+// can see it.  The actual gids live in this ACF, in two blocks:
+//   * WorkshopItemsInstalled.<itemId>.manifest    — what is installed now
+//   * WorkshopItemDetails.<itemId>.latest_manifest — what is available
+// We collect both (an update bumps latest_manifest before it installs, and
+// Steam plans the latest gid), keyed by appId since that is the depotId
+// Steam requests.  gid "0" (no item) is ignored.  Deduped.
+//
+// Pure string parsing so it is unit-testable without Steam or disk
+// (tools/test_prewarm.cpp).  Robust to a missing/garbage ACF (returns {}).
+inline std::vector<DepotGid> extractWorkshopManifests(const std::string& acf,
+                                                      uint32_t appId)
+{
+	std::vector<DepotGid> out;
+	std::unordered_set<uint64_t> seen;
+
+	auto collectKey = [&](const std::string& key) {
+		std::size_t pos = 0;
+		const std::string needle = "\"" + key + "\"";
+		while ((pos = acf.find(needle, pos)) != std::string::npos)
+		{
+			pos += needle.size();
+			// Find the opening quote of the value that follows.
+			std::size_t q1 = acf.find('"', pos);
+			if (q1 == std::string::npos) break;
+			std::size_t q2 = acf.find('"', q1 + 1);
+			if (q2 == std::string::npos) break;
+			const std::string val = acf.substr(q1 + 1, q2 - q1 - 1);
+			pos = q2 + 1;
+
+			bool isDigits = !val.empty();
+			for (char ch : val)
+			{
+				if (ch < '0' || ch > '9') { isDigits = false; break; }
+			}
+			if (!isDigits) continue;
+
+			uint64_t gid = 0;
+			try { gid = std::stoull(val); }
+			catch (...) { continue; }
+			if (gid == 0) continue;
+
+			if (seen.insert(gid).second)
+			{
+				out.push_back({appId, gid});
+			}
+		}
+	};
+
+	// Both the currently-installed manifest and the latest available one.
+	collectKey("manifest");
+	collectKey("latest_manifest");
+	return out;
+}
+
+
 // --- Impure runtime API (implemented in prewarm.cpp) ----------------------
 
 // Start the background pre-warm worker exactly once.  Idempotent and

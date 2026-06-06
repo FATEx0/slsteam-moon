@@ -215,6 +215,80 @@ int main()
 		      "plan: empty buffer -> empty");
 	}
 
+	// --- Workshop manifests -------------------------------------------------
+	//
+	// The workshop depot has depotId == appId (e.g. 250900) and a DYNAMIC
+	// per-item manifest gid that is NOT in the appinfo `depots` block — it
+	// only appears as the value of `workshopdepot`.  The actual gids live in
+	// steamapps/workshop/appworkshop_<appid>.acf, both the currently-
+	// installed manifest (WorkshopItemsInstalled) and the latest available
+	// (WorkshopItemDetails.latest_manifest).  So neither extractDepotsAndGids
+	// nor planStageTargets can see them; we mine the ACF separately and warm
+	// (appId, gid) so a workshop update/re-validate finds the manifest on
+	// disk and skips BYldRequestDepotManifest (the ~30s first-attempt retry,
+	// proven on the Zorin VM 2026-06-05 with BoI 250900).
+	{
+		// The real BoI 250900 ACF shape (two subscribed items).
+		const std::string acf =
+			"\"AppWorkshop\"\n{\n"
+			"\t\"appid\"\t\t\"250900\"\n"
+			"\t\"WorkshopItemsInstalled\"\n\t{\n"
+			"\t\t\"3735300204\"\n\t\t{\n"
+			"\t\t\t\"size\"\t\t\"8160\"\n"
+			"\t\t\t\"manifest\"\t\t\"7988188911654056057\"\n\t\t}\n"
+			"\t\t\"3735369753\"\n\t\t{\n"
+			"\t\t\t\"size\"\t\t\"208273\"\n"
+			"\t\t\t\"manifest\"\t\t\"9070506685956686971\"\n\t\t}\n"
+			"\t}\n"
+			"\t\"WorkshopItemDetails\"\n\t{\n"
+			"\t\t\"3735300204\"\n\t\t{\n"
+			"\t\t\t\"manifest\"\t\t\"7988188911654056057\"\n"
+			"\t\t\t\"latest_manifest\"\t\t\"7988188911654056057\"\n\t\t}\n"
+			"\t\t\"3735369753\"\n\t\t{\n"
+			"\t\t\t\"manifest\"\t\t\"9070506685956686971\"\n"
+			"\t\t\t\"latest_manifest\"\t\t\"9070506685956686971\"\n\t\t}\n"
+			"\t}\n}\n";
+		auto w = Prewarm::extractWorkshopManifests(acf, 250900);
+		CHECK(w.size() == 2, "workshop: two distinct item manifests, deduped");
+		CHECK(hasDepot(w, 250900, 7988188911654056057ULL),
+		      "workshop: installed manifest of item 1 (depotId==appId)");
+		CHECK(hasDepot(w, 250900, 9070506685956686971ULL),
+		      "workshop: installed manifest of item 2 (depotId==appId)");
+	}
+
+	// 11) extractWorkshopManifests: the LATEST manifest is warmed even when
+	//     it differs from the currently-installed one (an update is pending,
+	//     so Steam will plan the latest gid).
+	{
+		const std::string acf =
+			"\"AppWorkshop\"\n{\n"
+			"\t\"appid\"\t\t\"250900\"\n"
+			"\t\"WorkshopItemsInstalled\"\n\t{\n"
+			"\t\t\"111\"\n\t\t{\n\t\t\t\"manifest\"\t\t\"1000\"\n\t\t}\n\t}\n"
+			"\t\"WorkshopItemDetails\"\n\t{\n"
+			"\t\t\"111\"\n\t\t{\n"
+			"\t\t\t\"manifest\"\t\t\"1000\"\n"
+			"\t\t\t\"latest_manifest\"\t\t\"2000\"\n\t\t}\n\t}\n}\n";
+		auto w = Prewarm::extractWorkshopManifests(acf, 250900);
+		CHECK(w.size() == 2, "workshop: installed + differing latest both warmed");
+		CHECK(hasDepot(w, 250900, 1000ULL), "workshop: currently-installed gid");
+		CHECK(hasDepot(w, 250900, 2000ULL), "workshop: pending latest gid");
+	}
+
+	// 12) extractWorkshopManifests: missing/empty/garbage ACF is safe, and a
+	//     manifest "0" (no item) is ignored.
+	{
+		CHECK(Prewarm::extractWorkshopManifests("", 250900).empty(),
+		      "workshop: empty ACF -> empty");
+		CHECK(Prewarm::extractWorkshopManifests("no manifests here", 250900).empty(),
+		      "workshop: garbage ACF -> empty");
+		const std::string zero =
+			"\"AppWorkshop\"\n{\n\t\"WorkshopItemsInstalled\"\n\t{\n"
+			"\t\t\"1\"\n\t\t{\n\t\t\t\"manifest\"\t\t\"0\"\n\t\t}\n\t}\n}\n";
+		CHECK(Prewarm::extractWorkshopManifests(zero, 250900).empty(),
+		      "workshop: manifest '0' ignored");
+	}
+
 	if (g_failures == 0) { std::printf("\nALL PASS\n"); return 0; }
 	std::printf("\n%d CHECK(S) FAILED\n", g_failures);
 	return 1;

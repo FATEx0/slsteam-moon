@@ -13,10 +13,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <ios>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -35,6 +37,51 @@ std::string bufferPath(uint32_t appId)
 	std::stringstream ss;
 	ss << g_config.getDir() << "/cache/picsbuffer_" << appId << ".bin";
 	return ss.str();
+}
+
+// Resolve the Steam root (same candidate list ManifestFetch uses) so we
+// can locate steamapps/workshop/appworkshop_<appid>.acf.
+std::string findSteamRoot()
+{
+	const char* home = std::getenv("HOME");
+	if (!home) return {};
+	static const char* suffixes[] = {
+		"/.steam/steam",
+		"/.steam/debian-installation",
+		"/.local/share/Steam",
+	};
+	for (const char* suffix : suffixes)
+	{
+		const std::string candidate = std::string(home) + suffix;
+		std::error_code ec;
+		if (std::filesystem::exists(candidate + "/steam.sh", ec))
+		{
+			return candidate;
+		}
+	}
+	return {};
+}
+
+// Read an AddedApp's workshop ACF, if present.  The workshop depot's
+// per-item manifest gids are DYNAMIC and live only here (not in the
+// provisioned picsbuffer), so the warm loop mines this separately.  Steam
+// keeps the file under steamapps/workshop/appworkshop_<appid>.acf; some
+// installs mirror it under both ~/.steam/steam and the debian-installation
+// root, so we try the resolved root's path.
+std::string readWorkshopAcf(const std::string& steamRoot, uint32_t appId)
+{
+	if (steamRoot.empty()) return {};
+	const std::string path = steamRoot + "/steamapps/workshop/appworkshop_"
+	                         + std::to_string(appId) + ".acf";
+	std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+	if (!ifs.is_open()) return {};
+	const std::streamsize sz = ifs.tellg();
+	if (sz <= 0 || sz > (8LL << 20)) return {};
+	std::string out;
+	out.resize(static_cast<std::size_t>(sz));
+	ifs.seekg(0);
+	if (!ifs.read(out.data(), sz)) return {};
+	return out;
 }
 
 // Read an AddedApp's provisioned appinfo buffer (written by
@@ -88,13 +135,45 @@ void runLoop()
 			const auto hasKey = [](uint32_t depotId) {
 				return !DepotKey::getCachedKey(depotId).key.empty();
 			};
-			const auto targets = planStageTargets(buffers, hasKey);
+			auto targets = planStageTargets(buffers, hasKey);
+
+			// Workshop depots are NOT in the provisioned picsbuffer's
+			// `depots` block (the appid only appears as the value of
+			// `workshopdepot`), and their per-item manifest gids are
+			// DYNAMIC — they live in steamapps/workshop/appworkshop_<id>.acf.
+			// So Steam's workshop update plans a depotId==appId manifest we
+			// never staged -> BYldRequestDepotManifest -> 'Access Denied' ->
+			// one ~30s retry (proven on the VM 2026-06-05, BoI 250900).
+			// Mine the ACF and keep those manifests warm too, so the workshop
+			// update finds the manifest on disk and skips BYld.
+			//
+			// LIMIT: a brand-new subscription's manifest isn't in the ACF
+			// until after its first download, so the very first download of a
+			// freshly-subscribed item still costs one retry; every subsequent
+			// update / re-validate / relaunch is then first-attempt.
+			const std::string steamRoot = findSteamRoot();
+			std::size_t workshopCount = 0;
+			for (uint32_t appId : added)
+			{
+				const std::string acf = readWorkshopAcf(steamRoot, appId);
+				if (acf.empty()) continue;
+				// The workshop depot id equals the appid; only warm it if we
+				// hold that depot key (else the content can't decrypt/install
+				// anyway and the fetch is wasted).
+				if (!hasKey(appId)) continue;
+				for (const auto& wm : extractWorkshopManifests(acf, appId))
+				{
+					targets.push_back(wm);
+					++workshopCount;
+				}
+			}
 
 			if (!targets.empty())
 			{
 				g_pLog->debug(
-				    "Prewarm: keeping %zu manifest(s) warm across %zu AddedApp(s)\n",
-				    targets.size(), added.size());
+				    "Prewarm: keeping %zu manifest(s) warm across %zu AddedApp(s) "
+				    "(incl. %zu workshop)\n",
+				    targets.size(), added.size(), workshopCount);
 			}
 
 			for (const auto& [depotId, gid] : targets)
