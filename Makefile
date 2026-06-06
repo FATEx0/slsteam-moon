@@ -96,5 +96,22 @@ test-cmwire: obj/sdk/protobufs/steammessages_base.pb.o \
 		-lpthread -o /tmp/test_cmwire
 	/tmp/test_cmwire
 
+# Live integration harness for the native CM product-info client (talks
+# to real Valve CMs — NOT a unit test).  Links cmclient + its deps.
+test-cmclient-live: build
+	$(CXX) $(CXXFLAGS) -DCMWIRE_PROTOBUF \
+		-I include -isysteminclude tools/test_cmclient_live.cpp \
+		obj/feats/cmclient.o obj/log.o obj/config.o obj/globals.o obj/update.o obj/filewatcher.o \
+		obj/sdk/protobufs/steammessages_base.pb.o \
+		obj/sdk/protobufs/steammessages_clientserver_appinfo.pb.o \
+		obj/sdk/protobufs/steammessages_clientserver_login.pb.o \
+		obj/sdk/protobufs/steammessages_clientserver.pb.o \
+		obj/sdk/protobufs/steammessages_clientserver_2.pb.o \
+		obj/sdk/protobufs/steammessages_clientserver_friends.pb.o \
+		obj/sdk/protobufs/steammessages_clientserver_userstats.pb.o \
+		obj/sdk/protobufs/encrypted_app_ticket.pb.o \
+		lib/libprotobuf-lite.a lib/libyaml-cpp.a \
+		-lpthread -ldl -lcurl -o /tmp/test_cmclient_live
+
 release:
 	bash scripts/release.sh
