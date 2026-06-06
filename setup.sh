@@ -276,16 +276,19 @@ if [ -z "$STEAM_BIN" ]; then
 	exit 127
 fi
 
-# CloudRedirect (optional): load its 32-bit cloud-save hook via LD_PRELOAD if
-# present. CloudRedirect only acts inside the Steam client process and removes
-# itself from LD_PRELOAD for child processes, so setting it here is safe. It is
-# loaded alongside (not instead of) SLSsteam's LD_AUDIT injection.
+# CloudRedirect (optional): chain its 32-bit cloud-save hook into the SAME
+# LD_AUDIT list as SLSsteam (the 2.0.4 build is an rtld-audit library: it
+# exports la_objopen and attaches event-driven when steamclient.so loads, so it
+# has no timeout to miss). It MUST come AFTER library-inject.so + SLSsteam.so so
+# our libcurl redirect and Steam-copy protection stay first. CloudRedirect only
+# acts inside the Steam client process, so chaining it here is safe.
 CR_SO="$HOME/.local/share/CloudRedirect/cloud_redirect.so"
+AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so"
 if [ -f "$CR_SO" ]; then
-	export LD_PRELOAD="$CR_SO${LD_PRELOAD:+:$LD_PRELOAD}"
+	AUDIT="$AUDIT:$CR_SO"
 fi
 
-LD_AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so${LD_AUDIT:+:$LD_AUDIT}" exec "$STEAM_BIN" "$@"
+LD_AUDIT="$AUDIT${LD_AUDIT:+:$LD_AUDIT}" exec "$STEAM_BIN" "$@"
 EOF
 
 	chmod +x "$SLSDIR/path/steam"
