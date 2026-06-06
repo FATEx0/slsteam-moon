@@ -86,8 +86,10 @@ NotifyInit: yes
 #Enable sending commands to SLSsteam via /tmp/SLSsteam.API
 API: no
 
-#Disable cloud saves for unlocked games. Set to "no" if using CloudRedirect or similar.
-DisableCloud: yes
+#Disable cloud saves for unlocked games. Default "no" so CloudRedirect (shipped
+#with this stack) can sync saves to your own provider. Set to "yes" if you are
+#NOT using CloudRedirect, to avoid a doomed cloud sync that Steam rejects.
+DisableCloud: no
 
 #Changes your account's E-Mail clientsided. Leave blank to disable
 FakeEmail: ""
