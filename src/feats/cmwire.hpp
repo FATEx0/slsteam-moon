@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace CmWire
 {
@@ -61,6 +62,30 @@ inline bool parsePacket(const std::string& d, uint32_t& emsg,
 	hdr  = d.substr(8, hl);
 	body = d.substr(8 + hl);
 	return true;
+}
+
+// Split a decompressed CMsgMulti `message_body` into its inner packets.
+// The body is a sequence of <uint32 len><len bytes> records.  Returns the
+// inner packets in order, or an empty vector if the stream is malformed
+// (a length prefix that would over-read the buffer).
+inline std::vector<std::string> expandMultiBody(const std::string& blob)
+{
+	std::vector<std::string> out;
+	size_t off = 0;
+	while (off + 4 <= blob.size())
+	{
+		uint32_t sz = 0;
+		std::memcpy(&sz, &blob[off], 4);
+		off += 4;
+		if (static_cast<uint64_t>(off) + sz > blob.size())
+		{
+			out.clear();
+			break;
+		}
+		out.emplace_back(blob.substr(off, sz));
+		off += sz;
+	}
+	return out;
 }
 
 } // namespace CmWire

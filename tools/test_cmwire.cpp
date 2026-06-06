@@ -73,6 +73,29 @@ int main()
 		      "oversized header length rejected");
 	}
 
+	// --- Task 2: CMsgMulti inner-packet expansion -------------------------
+	{
+		// A (decompressed) multi body is a sequence of <u32 len><bytes>.
+		const std::string inner1 = "AAA", inner2 = "BBBB";
+		std::string blob;
+		const uint32_t l1 = 3, l2 = 4;
+		blob.append(reinterpret_cast<const char*>(&l1), 4); blob += inner1;
+		blob.append(reinterpret_cast<const char*>(&l2), 4); blob += inner2;
+
+		const auto parts = CmWire::expandMultiBody(blob);
+		CHECK(parts.size() == 2, "two inner packets");
+		CHECK(parts.size() == 2 && parts[0] == "AAA" && parts[1] == "BBBB",
+		      "inner slices");
+
+		// An empty body yields no packets (a valid, fully-consumed stream).
+		CHECK(CmWire::expandMultiBody("").empty(), "empty multi body");
+
+		// A length prefix that runs past the buffer must reject the whole
+		// blob rather than over-read.
+		const auto bad = CmWire::expandMultiBody(std::string("\x05\x00\x00\x00""AB", 6));
+		CHECK(bad.empty(), "short inner rejected");
+	}
+
 	if (g_failures == 0) std::printf("\nall cmwire checks passed\n");
 	else                 std::printf("\n%d cmwire check(s) FAILED\n", g_failures);
 	return g_failures == 0 ? 0 : 1;
