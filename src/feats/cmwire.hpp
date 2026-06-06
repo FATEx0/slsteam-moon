@@ -89,3 +89,67 @@ inline std::vector<std::string> expandMultiBody(const std::string& blob)
 }
 
 } // namespace CmWire
+
+// ---------------------------------------------------------------------------
+// Protobuf-backed body builders / parsers.
+//
+// Guarded by CMWIRE_PROTOBUF so the pure framing helpers above (Tasks 1-2)
+// stay unit-testable on the host without linking protobuf.  The real
+// build (cmclient.cpp) and the `make test-cmwire` target define this.
+// ---------------------------------------------------------------------------
+#ifdef CMWIRE_PROTOBUF
+
+#include "../sdk/protobufs/steammessages_clientserver_appinfo.pb.h"
+#include "../sdk/protobufs/steammessages_clientserver_login.pb.h"
+
+#include <unordered_map>
+#include <vector>
+
+namespace CmWire
+{
+
+// Anonymous-user logon body.  The header steamid is the anon identity
+// ((1<<56)|(10<<52)) and is set by the caller on the CMsgProtoBufHeader;
+// these are just the client identity fields the CM expects.
+inline std::string buildAnonLogon()
+{
+	CMsgClientLogon b;
+	b.set_protocol_version(65580);
+	b.set_client_package_version(1561159470);
+	b.set_client_os_type(4); // Linux
+	return b.SerializeAsString();
+}
+
+// A batched PICS product-info request for the given appids (full data,
+// not metadata-only) — one round-trip for the whole AdditionalApps fleet.
+inline std::string buildPicsRequest(const std::vector<uint32_t>& appids)
+{
+	CMsgClientPICSProductInfoRequest r;
+	r.set_meta_data_only(false);
+	for (uint32_t a : appids)
+	{
+		auto* e = r.add_apps();
+		e->set_appid(a);
+	}
+	return r.SerializeAsString();
+}
+
+// Parse a PICS product-info response body.  Fills `out[appid] = buffer`
+// for every app that carries a non-empty wire buffer (the public
+// product-info VDF).  Returns true if the CM signalled more responses are
+// pending (response_pending) — the caller keeps reading until false.
+inline bool parsePicsResponse(const std::string& body,
+                              std::unordered_map<uint32_t, std::string>& out)
+{
+	CMsgClientPICSProductInfoResponse r;
+	if (!r.ParseFromString(body)) return false;
+	for (const auto& app : r.apps())
+	{
+		if (!app.buffer().empty()) out[app.appid()] = app.buffer();
+	}
+	return r.response_pending();
+}
+
+} // namespace CmWire
+
+#endif // CMWIRE_PROTOBUF

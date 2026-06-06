@@ -25,6 +25,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 
 static int g_failures = 0;
 
@@ -95,6 +96,52 @@ int main()
 		const auto bad = CmWire::expandMultiBody(std::string("\x05\x00\x00\x00""AB", 6));
 		CHECK(bad.empty(), "short inner rejected");
 	}
+
+	// --- Task 3: build logon/PICS bodies, parse PICS response -------------
+	// Only compiled when the project protobufs are linked in (the
+	// `make test-cmwire` target defines CMWIRE_PROTOBUF).
+#ifdef CMWIRE_PROTOBUF
+	{
+		// PICS request: two apps, full data (not metadata-only).
+		const auto reqBytes = CmWire::buildPicsRequest({3035500u, 250900u});
+		CMsgClientPICSProductInfoRequest rt;
+		CHECK(rt.ParseFromString(reqBytes), "req parses");
+		CHECK(rt.apps_size() == 2, "two apps in request");
+		CHECK(rt.apps_size() == 2 && rt.apps(0).appid() == 3035500u &&
+		      rt.apps(1).appid() == 250900u, "request appids");
+		CHECK(rt.meta_data_only() == false, "meta_data_only false");
+
+		// Anonymous logon body: the documented client identity fields.
+		const auto logonBytes = CmWire::buildAnonLogon();
+		CMsgClientLogon lt;
+		CHECK(lt.ParseFromString(logonBytes), "logon parses");
+		CHECK(lt.protocol_version() == 65580u, "logon protocol_version");
+
+		// PICS response parse: one app with a buffer, response_pending set.
+		CMsgClientPICSProductInfoResponse resp;
+		auto* a = resp.add_apps();
+		a->set_appid(3035500u);
+		a->set_buffer("X");
+		auto* empty = resp.add_apps();
+		empty->set_appid(999u); // no buffer -> must be skipped
+		resp.set_response_pending(true);
+		const std::string respBytes = resp.SerializeAsString();
+
+		std::unordered_map<uint32_t, std::string> out;
+		const bool pending = CmWire::parsePicsResponse(respBytes, out);
+		CHECK(pending, "response_pending propagated");
+		CHECK(out.size() == 1, "only non-empty buffers kept");
+		CHECK(out.count(3035500u) && out[3035500u] == "X", "buffer mapped by appid");
+		CHECK(out.count(999u) == 0, "empty-buffer app skipped");
+
+		// A response with response_pending unset reports no more pending.
+		CMsgClientPICSProductInfoResponse done;
+		done.set_response_pending(false);
+		std::unordered_map<uint32_t, std::string> out2;
+		CHECK(!CmWire::parsePicsResponse(done.SerializeAsString(), out2),
+		      "no pending when flag unset");
+	}
+#endif
 
 	if (g_failures == 0) std::printf("\nall cmwire checks passed\n");
 	else                 std::printf("\n%d cmwire check(s) FAILED\n", g_failures);

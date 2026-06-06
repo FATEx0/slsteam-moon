@@ -38,7 +38,7 @@ ifeq ($(shell type mold &> /dev/null && echo "found"),found)
 	LDFLAGS += -fuse-ld=mold
 endif
 
-.PHONY: all build rebuild clean install release
+.PHONY: all build rebuild clean install release test-cmwire
 .NOTPARALLEL: clean rebuild
 
 all: build
@@ -77,6 +77,24 @@ clean:
 
 install:
 	sh setup.sh install
+
+# Unit test for cmwire.hpp's protobuf-backed helpers (Task 3).  Links the
+# already-compiled protobuf objects + libprotobuf-lite.a, matching the
+# main build's 32-bit + pre-C++11 ABI so the static lib is compatible.
+# The pure framing tests (Tasks 1-2) also build standalone without this:
+#   g++ -std=c++20 -I include tools/test_cmwire.cpp -o /tmp/test_cmwire
+test-cmwire: obj/sdk/protobufs/steammessages_base.pb.o \
+             obj/sdk/protobufs/steammessages_clientserver_appinfo.pb.o \
+             obj/sdk/protobufs/steammessages_clientserver_login.pb.o \
+             obj/sdk/protobufs/steammessages_clientserver.pb.o \
+             obj/sdk/protobufs/steammessages_clientserver_2.pb.o \
+             obj/sdk/protobufs/steammessages_clientserver_friends.pb.o \
+             obj/sdk/protobufs/steammessages_clientserver_userstats.pb.o \
+             obj/sdk/protobufs/encrypted_app_ticket.pb.o
+	$(CXX) -m32 -std=c++20 -D_GLIBCXX_USE_CXX11_ABI=0 -DCMWIRE_PROTOBUF \
+		-I include tools/test_cmwire.cpp $^ lib/libprotobuf-lite.a \
+		-lpthread -o /tmp/test_cmwire
+	/tmp/test_cmwire
 
 release:
 	bash scripts/release.sh
