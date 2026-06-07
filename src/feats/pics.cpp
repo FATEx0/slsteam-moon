@@ -8,6 +8,7 @@
 #include "../globals.hpp"
 #include "../log.hpp"
 #include "../sdk/CProtoBufMsgBase.hpp"
+#include "../update.hpp"
 
 #include "../utils/ManifestFetch.hpp"
 
@@ -353,6 +354,12 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	// already present and skips BYldRequestDepotManifest (no ~30s retry).
 	// MUST NOT be started from load()/setup() (HANDOFF DEAD END #2).
 	Prewarm::ensureStarted();
+
+	// Refresh the safe-mode-hash cache (updates.yaml) off the boot path.
+	// init() served it from disk synchronously so Steam's launch never
+	// blocks on GitHub; this brings it up to date from a real worker
+	// thread, gated by a TTL so we don't fetch on every relaunch.
+	Updater::refreshInBackgroundIfStale();
 }
 
 void recvMsg(CProtoBufMsgBase* msg)

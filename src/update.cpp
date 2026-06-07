@@ -7,61 +7,182 @@
 #include "utils.hpp"
 #include "version.hpp"
 
+#include "update_cache.hpp"
 
+#include <sys/stat.h>
+
+#include <atomic>
+#include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <map>
-#include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 
 std::map<uint64_t, std::unordered_set<std::string>> Updater::clientHashMap = std::map<uint64_t, std::unordered_set<std::string>>();
 
-bool Updater::init()
+namespace
 {
-	std::string data;
-	int res = Curl::getString("https://raw.githubusercontent.com/AceSLS/SLSsteam/refs/heads/main/res/updates.yaml", data);
-	g_pLog->info("Curl Res: %u\n", res);
+	// Guards clientHashMap so the background refresh thread and the
+	// load()-time verifySafeModeHash() reader never race.
+	std::mutex g_hashMapMtx;
 
-	if(res != 0)
+	// Ensures we only ever spawn one background refresh worker.
+	std::atomic<bool> g_refreshStarted{false};
+
+	constexpr const char* kUpdatesUrl =
+	    "https://raw.githubusercontent.com/AceSLS/SLSsteam/refs/heads/main/res/updates.yaml";
+
+	// Freshness window for the on-disk updates.yaml cache.  The safe-mode
+	// hash list changes only when Steam ships a new steamclient.so, so a
+	// day is plenty; this keeps the default user off the network on every
+	// relaunch.  Override via SLSSTEAM_UPDATES_TTL (seconds; 0 = always
+	// refresh).
+	long long updatesTtlSecs()
 	{
-		data = loadFromCache();
-		if(data.size() < 1)
+		if (const char* ov = std::getenv("SLSSTEAM_UPDATES_TTL"); ov && *ov)
+		{
+			try { return std::stoll(ov); } catch (...) {}
+		}
+		return 24 * 3600; // 1 day
+	}
+
+	// Parse a updates.yaml document into the version->hashes map.  Pure
+	// w.r.t. the network; returns false on malformed input.
+	bool parseHashMap(const std::string& data,
+	                  std::map<uint64_t, std::unordered_set<std::string>>& out)
+	{
+		try
+		{
+			YAML::Node node = YAML::Load(data);
+			std::map<uint64_t, std::unordered_set<std::string>> parsed;
+			for (const auto& sub : node["SafeModeHashes"])
+			{
+				uint64_t version = sub.first.as<uint64_t>();
+				parsed[version] = std::unordered_set<std::string>();
+				for (const auto& hash : sub.second)
+				{
+					parsed[version].emplace(hash.as<std::string>());
+				}
+			}
+			out = std::move(parsed);
+			return true;
+		}
+		catch (...)
 		{
 			return false;
 		}
-
-		g_pLog->info("Using cached updates.yaml\n");
 	}
 
-	g_pLog->debug("updates.yaml:\n%s\n", data.c_str());
-
-	try
+	// epoch-seconds mtime of the cache file, or -1 if absent/empty.
+	long long cacheMtimeSecs()
 	{
-		YAML::Node node = YAML::Load(data);
-		for (const auto& sub : node["SafeModeHashes"])
+		struct stat st{};
+		const auto path = Updater::getCacheFilePath();
+		if (stat(path.c_str(), &st) != 0) return -1;
+		if (st.st_size <= 0) return -1;
+		return static_cast<long long>(st.st_mtime);
+	}
+
+	// Fetch updates.yaml from GitHub, parse it, swap it into the shared
+	// map and persist the cache.  Returns true on success.  Safe to call
+	// from any thread.
+	bool fetchParseAndStore()
+	{
+		std::string data;
+		const int res = Curl::getString(kUpdatesUrl, data);
+		if (res != 0 || data.empty())
 		{
-			uint64_t version = sub.first.as<uint64_t>();
-			clientHashMap[version] = std::unordered_set<std::string>();
+			g_pLog->debug("Updater: network fetch failed (curl=%d)\n", res);
+			return false;
+		}
 
-			g_pLog->debug("Parsing version %llu\n", version);
+		std::map<uint64_t, std::unordered_set<std::string>> parsed;
+		if (!parseHashMap(data, parsed))
+		{
+			g_pLog->info("Failed to parse updates!\n");
+			return false;
+		}
 
-			for(const auto& hash : sub.second)
-			{
-				auto str = hash.as<std::string>();
-				clientHashMap[version].emplace(str);
+		{
+			std::lock_guard<std::mutex> lk(g_hashMapMtx);
+			Updater::clientHashMap = std::move(parsed);
+		}
+		Updater::saveToCache(data);
+		return true;
+	}
+}
 
-				g_pLog->debug("Added %s to SLSsteam version %llu\n", str.c_str(), version);
-			}
+bool Updater::init()
+{
+	// When the safe-mode hash data actually gates behaviour this session
+	// (SafeMode aborts, WarnHashMissmatch warns), it must be authoritative
+	// before load()'s verifySafeModeHash() runs — so fetch synchronously,
+	// exactly as before.  Falls back to the on-disk cache on a failed GET.
+	if (cache::mustFetchSynchronously(g_config.safeMode.get(),
+	                                  g_config.warnHashMissmatch.get()))
+	{
+		if (fetchParseAndStore())
+		{
+			return true;
+		}
+		const std::string cached = loadFromCache();
+		if (cached.empty()) return false;
+		g_pLog->info("Using cached updates.yaml\n");
+		std::map<uint64_t, std::unordered_set<std::string>> parsed;
+		if (!parseHashMap(cached, parsed)) return false;
+		std::lock_guard<std::mutex> lk(g_hashMapMtx);
+		clientHashMap = std::move(parsed);
+		return true;
+	}
+
+	// Default path: do NOT touch the network on the preinit critical path.
+	// Serve whatever cache we have synchronously (so verifySafeModeHash()
+	// still has data), and let a background worker refresh it later off
+	// the boot path (see refreshInBackgroundIfStale, called from a real
+	// Steam worker thread in pics.cpp).
+	const std::string cached = loadFromCache();
+	if (!cached.empty())
+	{
+		std::map<uint64_t, std::unordered_set<std::string>> parsed;
+		if (parseHashMap(cached, parsed))
+		{
+			std::lock_guard<std::mutex> lk(g_hashMapMtx);
+			clientHashMap = std::move(parsed);
 		}
 	}
-	catch(...)
+	return true;
+}
+
+void Updater::refreshInBackgroundIfStale()
+{
+	// Idempotent: only one refresh per process.  MUST be called from a
+	// real Steam worker thread (e.g. the PICS recv path), never from the
+	// LD_AUDIT load()/setup() path — spawning a thread there crashes Steam
+	// (HANDOFF dead-end #2).
+	bool expected = false;
+	if (!g_refreshStarted.compare_exchange_strong(expected, true))
 	{
-		g_pLog->info("Failed to parse updates!\n");
-		return false;
+		return;
 	}
 
-	saveToCache(data);
-	return true;
+	const long long ttl = updatesTtlSecs();
+	const long long mtime = cacheMtimeSecs();
+	const long long now = static_cast<long long>(std::time(nullptr));
+	if (cache::isCacheFresh(mtime >= 0, mtime, now, ttl))
+	{
+		g_pLog->debug("Updater: cache fresh (age<%llds), skipping refresh\n", ttl);
+		return;
+	}
+
+	std::thread([] {
+		if (fetchParseAndStore())
+		{
+			g_pLog->debug("Updater: background refresh of updates.yaml done\n");
+		}
+	}).detach();
 }
 
 std::string Updater::getCacheFilePath()
@@ -108,6 +229,7 @@ bool Updater::verifySafeModeHash()
 		std::string sha256 = Utils::getFileSHA256(path.c_str());
 		g_pLog->info("steamclient.so hash is %s\n", sha256.c_str());
 
+		std::lock_guard<std::mutex> lk(g_hashMapMtx);
 		if (!clientHashMap.contains(VERSION))
 		{
 			return false;
