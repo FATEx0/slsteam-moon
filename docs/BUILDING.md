@@ -17,7 +17,7 @@ slsteam-moon is a 32-bit shared library that hooks into Steam through
 | Produce the release zip               | `scripts/release.sh`             |
 | Install onto your own Steam           | `make install`                   |
 
-[rel]: https://github.com/nwrafael/slsteam-moon/releases/latest
+[rel]: https://codeberg.org/unplausible/slsteam-moon/releases/latest
 
 `make` on its own is equivalent to `scripts/build.sh --host`.
 
