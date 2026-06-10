@@ -57,6 +57,14 @@ bool Patterns::init()
 				);
 				continue;
 			}
+			// Required pattern missing: log WHICH one so a Steam-client
+			// update that drifts a signature is diagnosable from the log
+			// instead of just "Failed to find all patterns".
+			g_pLog->warn
+			(
+				"Required pattern '%s' not found\n",
+				pattern->name.c_str()
+			);
 			found = false;
 		}
 	}
@@ -393,7 +401,11 @@ namespace Patterns
 		{
 			"CRemoteClientManager::RecvPkt",
 			"55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 83 EC 1C "
-			"8B 86 B0 08 00 00 8B 00 85 C0 0F 85 ? ? ? ? "
+			// [esi+0x8XX]: PIC-relative global slot whose displacement
+			// drifts between Steam client builds (0x8B0 -> 0x8B4 on
+			// 1781041600).  Wildcard the displacement byte so the match
+			// survives that shift; the rest of the body keeps it unique.
+			"8B 86 ? 08 00 00 8B 00 85 C0 0F 85 ? ? ? ? "
 			"C7 45 E4 00 00 00 00 83 EC 08 89 F3 6A 01 FF 75 0C "
 			"E8 ? ? ? ? 89 C7 83 C4 10 85 C0 0F 84 ? ? ? ? 83 EC 0C 50",
 			SigFollowMode::None
