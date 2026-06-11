@@ -291,6 +291,21 @@ if [ -f "$CR_SO" ]; then
 	export LD_PRELOAD="$CR_SO${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 
+# Lumen (millennium-less LuaTools bridge): ensure Steam's CEF remote-debugging
+# endpoint is enabled, then launch the Lumen sidecar DETACHED and WITHOUT the
+# loader env (it must use its own static libs, not Steam's 32-bit runtime).
+# Lumen injects the LuaTools frontend via CDP and hosts the backend in-process.
+# Single-instance guarded so a second wrapper invocation doesn't stack sidecars.
+LUMEN_DIR="$HOME/.local/share/Lumen"
+if [ -x "$LUMEN_DIR/lumen" ] && ! pgrep -f "$LUMEN_DIR/lumen" >/dev/null 2>&1; then
+	touch "$HOME/.steam/steam/.cef-enable-remote-debugging" 2>/dev/null || true
+	touch "$HOME/.steam/debian-installation/.cef-enable-remote-debugging" 2>/dev/null || true
+	env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH \
+	    LUMEN_BACKEND_DIR="$LUMEN_DIR/luatools/backend" \
+	    LUMEN_LUA_DIR="$LUMEN_DIR/lua" \
+	    setsid "$LUMEN_DIR/lumen" >/dev/null 2>&1 < /dev/null &
+fi
+
 AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so"
 
 LD_AUDIT="$AUDIT${LD_AUDIT:+:$LD_AUDIT}" exec "$STEAM_BIN" "$@"
