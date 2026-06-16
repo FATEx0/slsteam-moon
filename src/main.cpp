@@ -10,6 +10,7 @@
 
 #include "feats/appinfo_provision.hpp"
 #include "feats/appinfo_vdf.hpp"
+#include "feats/cefport.hpp"
 #include "feats/depotkey.hpp"
 #include "feats/manifestid.hpp"
 #include "feats/packagepatch.hpp"
@@ -90,6 +91,13 @@ static void unload()
 //TODO: Remove when unload() works properly since it should not be needed anymore after that
 static bool setupSuccess = false;
 
+// CEF debug port chosen ONCE for this Steam-client session (see la_symbind32
+// block below). Picked in load() so it's decided in the long-lived client and
+// inherited by every webhelper-launching fork-child via fork() — the port then
+// stays stable across webhelper restarts (no re-pick, no bindability re-check),
+// which is what keeps the Lumen sidecar reconnecting to the same endpoint.
+static uint16_t g_cefSessionPort = 0;
+
 static void setup()
 {
 	lm_process_t proc {};
@@ -129,6 +137,26 @@ static void setup()
 	{
 		unload();
 		return;
+	}
+
+	// Decide this session's CEF debug port ONCE, as EARLY as possible (this is
+	// la_preinit, before the client can spawn the webhelper) and publish it to
+	// the contract file the Lumen sidecar reads. Picking it here — not in the
+	// ephemeral fork-child that execs the webhelper, nor at the end of load()
+	// after the slow CM provisioning — means g_cefSessionPort is already set
+	// when the exec hook fires, so the live CEF port and the contract file can
+	// never diverge, and the port stays fixed across webhelper restarts.
+	// resolveSessionPort reuses a still-bindable port from a previous session,
+	// else picks a fresh free loopback port.
+	g_cefSessionPort = CefPort::resolveSessionPort(CefPort::contractPath());
+	if (g_cefSessionPort != 0)
+	{
+		g_pLog->info("CEF: remote-debugging port -> %u (frees 8080), published to %s\n",
+		             g_cefSessionPort, CefPort::contractPath().c_str());
+	}
+	else
+	{
+		g_pLog->warn("CEF: could not pick a debug port; Steam will keep 8080\n");
 	}
 
 	// Splice cached PICS buffers into appcache/appinfo.vdf before
@@ -400,6 +428,7 @@ static void load()
 #include <thread>
 #include <chrono>
 #include <link.h>
+#include <spawn.h>
 
 // ───────────────────────────────────────────────────────────────────────
 // Injection model: LD_AUDIT (rtld-audit).
@@ -435,6 +464,178 @@ extern "C" unsigned int la_version(unsigned int)
 	return LAV_CURRENT;
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// CEF debug-port rewrite (frees TCP 8080).
+//
+// Steam launches the CEF webhelper with a HARD-CODED
+// `--remote-debugging-port=8080` (the .cef-enable-remote-debugging flag's
+// content is ignored, and Steam restores its launcher scripts from bootstrap
+// on every boot, so static edits don't stick — both verified on the VM).
+// That squats on TCP 8080. We rewrite the argument in flight to a free
+// loopback port and publish it to ~/.local/share/Lumen/cef_port for the Lumen
+// sidecar to read.
+//
+// Mechanism: rtld-audit symbol binding. la_objopen flags every object
+// BINDFROM|BINDTO so la_symbind32 is invoked for each binding; for the exec
+// family we return a wrapper that rewrites argv, otherwise the original
+// address (a no-op redirect). The client launches the webhelper via execv,
+// with the switch embedded inside a `sh -c "exec steamwebhelper.sh ..."`
+// wrapper string, so a substring rewrite is used (CefPort::rewritePortArg).
+// This lives in SLSsteam.so itself — no extra preloaded library.
+// ───────────────────────────────────────────────────────────────────────
+namespace
+{
+	using execv_t  = int (*)(const char*, char* const[]);
+	using execve_t = int (*)(const char*, char* const[], char* const[]);
+	using spawn_t  = int (*)(pid_t*, const char*, const posix_spawn_file_actions_t*,
+	                         const posix_spawnattr_t*, char* const[], char* const[]);
+
+	execv_t  g_realExecv     = nullptr;
+	execv_t  g_realExecvp    = nullptr;
+	execve_t g_realExecve    = nullptr;
+	execve_t g_realExecvpe   = nullptr;
+	spawn_t  g_realSpawn     = nullptr;
+	spawn_t  g_realSpawnp    = nullptr;
+
+	// Returns a heap argv copy with the CEF debug port rewritten to a free
+	// loopback port, or nullptr if argv carries no such switch (caller then
+	// uses the original). The copy is intentionally leaked: the caller is
+	// about to exec.
+	char** cefRewriteArgv(char* const argv[])
+	{
+		if (!argv)
+		{
+			return nullptr;
+		}
+
+		int n = 0;
+		bool any = false;
+		for (; argv[n]; ++n)
+		{
+			const char* p = std::strstr(argv[n], CefPort::kSwitchPrefix);
+			if (p && std::isdigit(static_cast<unsigned char>(p[std::strlen(CefPort::kSwitchPrefix)])))
+			{
+				any = true;
+			}
+		}
+		if (!any)
+		{
+			return nullptr;
+		}
+
+		static uint16_t port = 0;
+		if (port == 0)
+		{
+			// Prefer the session port decided in load() (stable across webhelper
+			// restarts). Fall back to a lazy resolve only if a webhelper launch
+			// somehow beats load() (it shouldn't: the UI/webhelper come up well
+			// after steamclient.so maps).
+			port = g_cefSessionPort != 0
+			           ? g_cefSessionPort
+			           : CefPort::resolveSessionPort(CefPort::contractPath());
+		}
+		if (port == 0)
+		{
+			return nullptr; // no port available: leave Steam on 8080
+		}
+
+		char** out = static_cast<char**>(std::malloc(sizeof(char*) * (n + 1)));
+		if (!out)
+		{
+			return nullptr;
+		}
+		for (int i = 0; i < n; ++i)
+		{
+			auto [s, changed] = CefPort::rewritePortArg(argv[i], port);
+			out[i] = changed ? strdup(s.c_str()) : argv[i];
+		}
+		out[n] = nullptr;
+
+		if (g_pLog)
+		{
+			g_pLog->info("CEF: rewrote --remote-debugging-port to %u (8080 freed)\n", port);
+		}
+		return out;
+	}
+
+	int cefExecv(const char* path, char* const argv[])
+	{
+		char** rw = cefRewriteArgv(argv);
+		return g_realExecv(path, rw ? rw : argv);
+	}
+	int cefExecvp(const char* file, char* const argv[])
+	{
+		char** rw = cefRewriteArgv(argv);
+		return g_realExecvp(file, rw ? rw : argv);
+	}
+	int cefExecve(const char* path, char* const argv[], char* const envp[])
+	{
+		char** rw = cefRewriteArgv(argv);
+		return g_realExecve(path, rw ? rw : argv, envp);
+	}
+	int cefExecvpe(const char* file, char* const argv[], char* const envp[])
+	{
+		char** rw = cefRewriteArgv(argv);
+		return g_realExecvpe(file, rw ? rw : argv, envp);
+	}
+	int cefSpawn(pid_t* pid, const char* path, const posix_spawn_file_actions_t* fa,
+	             const posix_spawnattr_t* attr, char* const argv[], char* const envp[])
+	{
+		char** rw = cefRewriteArgv(argv);
+		return g_realSpawn(pid, path, fa, attr, rw ? rw : argv, envp);
+	}
+	int cefSpawnp(pid_t* pid, const char* file, const posix_spawn_file_actions_t* fa,
+	              const posix_spawnattr_t* attr, char* const argv[], char* const envp[])
+	{
+		char** rw = cefRewriteArgv(argv);
+		return g_realSpawnp(pid, file, fa, attr, rw ? rw : argv, envp);
+	}
+}
+
+extern "C" uintptr_t la_symbind32(Elf32_Sym* sym,
+                                  __attribute__((unused)) unsigned int ndx,
+                                  __attribute__((unused)) uintptr_t* refcook,
+                                  __attribute__((unused)) uintptr_t* defcook,
+                                  __attribute__((unused)) unsigned int* flags,
+                                  const char* symname)
+{
+	if (symname)
+	{
+		const auto orig = static_cast<uintptr_t>(sym->st_value);
+		if (std::strcmp(symname, "execv") == 0)
+		{
+			if (!g_realExecv) g_realExecv = reinterpret_cast<execv_t>(orig);
+			return reinterpret_cast<uintptr_t>(&cefExecv);
+		}
+		if (std::strcmp(symname, "execvp") == 0)
+		{
+			if (!g_realExecvp) g_realExecvp = reinterpret_cast<execv_t>(orig);
+			return reinterpret_cast<uintptr_t>(&cefExecvp);
+		}
+		if (std::strcmp(symname, "execve") == 0)
+		{
+			if (!g_realExecve) g_realExecve = reinterpret_cast<execve_t>(orig);
+			return reinterpret_cast<uintptr_t>(&cefExecve);
+		}
+		if (std::strcmp(symname, "execvpe") == 0)
+		{
+			if (!g_realExecvpe) g_realExecvpe = reinterpret_cast<execve_t>(orig);
+			return reinterpret_cast<uintptr_t>(&cefExecvpe);
+		}
+		if (std::strcmp(symname, "posix_spawn") == 0)
+		{
+			if (!g_realSpawn) g_realSpawn = reinterpret_cast<spawn_t>(orig);
+			return reinterpret_cast<uintptr_t>(&cefSpawn);
+		}
+		if (std::strcmp(symname, "posix_spawnp") == 0)
+		{
+			if (!g_realSpawnp) g_realSpawnp = reinterpret_cast<spawn_t>(orig);
+			return reinterpret_cast<uintptr_t>(&cefSpawnp);
+		}
+	}
+	return sym->st_value;
+}
+
 extern "C" unsigned int la_objopen(struct link_map* map,
                                    __attribute__((unused)) Lmid_t lmid,
                                    __attribute__((unused)) uintptr_t* cookie)
@@ -450,7 +651,10 @@ extern "C" unsigned int la_objopen(struct link_map* map,
 		load();
 	}
 
-	return 0;
+	// Flag every object BINDFROM|BINDTO so la_symbind32 is invoked for its
+	// symbol bindings — required for the CEF debug-port rewrite. Without these
+	// flags the loader never calls la_symbind*.
+	return LA_FLG_BINDFROM | LA_FLG_BINDTO;
 }
 
 extern "C" void la_preinit(__attribute__((unused)) uintptr_t* cookie)
