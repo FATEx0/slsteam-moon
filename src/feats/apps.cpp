@@ -206,7 +206,13 @@ bool Apps::shouldDisableUpdates(uint32_t appId)
 			return false;  // allow the install/download to start
 		}
 	}
-	return true;
+
+	// Locked apps freeze on their pinned build (updates off); unlocked
+	// AddedApps get updates ENABLED so they grab the latest (per-DLC
+	// redirects still apply via manifestbind).  HANDOFF warning: with the
+	// two-hook redirect, online installed-gid == planned-gid, so enabling
+	// updates here must NOT reintroduce the perpetual "update queued" loop.
+	return g_config.isAppLocked(appId);
 }
 
 void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
