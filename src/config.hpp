@@ -2,6 +2,7 @@
 
 #include "mtvar.hpp"
 #include "log.hpp"
+#include "feats/manifestpins.hpp"
 
 #include "yaml-cpp/exceptions.h"
 #include "yaml-cpp/node/node.h"
@@ -51,6 +52,13 @@ public:
 	MTVariable<FakeGame_t> idleStatus;
 	MTVariable<std::unordered_map<uint32_t, std::string>> gameTitles;
 	MTVariable<std::unordered_map<uint32_t, uint32_t>> subscriptionTimestamps;
+
+	// Manifest pinning (design.md §3/§4).  manifestPins is the flattened
+	// depot->gid redirect index; lockedApps drives shouldDisableUpdates;
+	// manifestPinsByApp is the structured source kept for purge.
+	MTVariable<std::unordered_map<uint32_t, uint64_t>> manifestPins;
+	MTVariable<std::unordered_set<uint32_t>> lockedApps;
+	MTVariable<ManifestPins::PinMap> manifestPinsByApp;
 
 	MTVariable<std::unordered_map<uint32_t, std::unordered_set<uint32_t>>> denuvoGames;
 
@@ -187,6 +195,10 @@ public:
 
 	bool isAddedAppId(uint32_t appId);
 	bool addAdditionalAppId(uint32_t appId);
+
+	uint64_t getManifestPin(uint32_t depotId);
+	bool isAppLocked(uint32_t appId);
+	void purgePinsForApps(const std::unordered_set<uint32_t>& appIds);
 
 	bool shouldExcludeAppId(uint32_t appId);
 	uint32_t getDenuvoGameOwner(uint32_t appId);

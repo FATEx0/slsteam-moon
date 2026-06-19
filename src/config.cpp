@@ -275,6 +275,52 @@ bool CConfig::loadSettings()
 		setError(ELoadError::MissingKey);
 	}
 
+	// ManifestPins (design.md §3): nested  appid -> { locked, depots: {depot: "gid"} }.
+	// gids are STRINGS (uint64 exceeds YAML int safety).  Missing key is fine.
+	{
+		ManifestPins::PinMap pinMap;
+		const auto pinsNode = node["ManifestPins"];
+		if (pinsNode)
+		{
+			for (auto& appNode : pinsNode)
+			{
+				try
+				{
+					const uint32_t appId = appNode.first.as<uint32_t>();
+					ManifestPins::AppPins app;
+
+					const auto lockedNode = appNode.second["locked"];
+					if (lockedNode) app.locked = lockedNode.as<bool>();
+
+					const auto depotsNode = appNode.second["depots"];
+					if (depotsNode)
+					{
+						for (auto& d : depotsNode)
+						{
+							const uint32_t depotId = d.first.as<uint32_t>();
+							const uint64_t gid =
+							    std::stoull(d.second.as<std::string>());
+							app.depots[depotId] = gid;
+						}
+					}
+					pinMap[appId] = app;
+				}
+				catch (...)
+				{
+					setError(ELoadError::ParsingException);
+				}
+			}
+		}
+
+		// Belt-and-suspenders (design §4.4): drop pins for apps no longer in
+		// AdditionalApps (plugin remove-game is the primary purge).
+		ManifestPins::purgeOrphans(pinMap, addedAppIds.get());
+
+		manifestPinsByApp.set(pinMap);
+		manifestPins.set(ManifestPins::flattenDepots(pinMap));
+		lockedApps.set(ManifestPins::lockedAppSet(pinMap));
+	}
+
 	switch(__loadErrors.get())
 	{
 		case ELoadError::MissingKey:
@@ -295,6 +341,25 @@ bool CConfig::loadSettings()
 bool CConfig::isAddedAppId(uint32_t appId)
 {
 	return addedAppIds.get().contains(appId);
+}
+
+uint64_t CConfig::getManifestPin(uint32_t depotId)
+{
+	return ManifestPins::getPin(manifestPins.get(), depotId);
+}
+
+bool CConfig::isAppLocked(uint32_t appId)
+{
+	return ManifestPins::isLocked(lockedApps.get(), appId);
+}
+
+void CConfig::purgePinsForApps(const std::unordered_set<uint32_t>& appIds)
+{
+	auto pinMap = manifestPinsByApp.get();
+	ManifestPins::purgeApps(pinMap, appIds);
+	manifestPinsByApp.set(pinMap);
+	manifestPins.set(ManifestPins::flattenDepots(pinMap));
+	lockedApps.set(ManifestPins::lockedAppSet(pinMap));
 }
 
 bool CConfig::shouldExcludeAppId(uint32_t appId)
