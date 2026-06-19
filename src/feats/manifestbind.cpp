@@ -145,7 +145,7 @@ namespace
 		    appId   && g_config.isAddedAppId(appId),
 		    depotId && g_config.isAddedAppId(depotId),
 		    DepotKey::isManagedDepot(depotId),
-		    /*depotHasPin=*/false);
+		    /*depotHasPin=*/g_config.getManifestPin(depotId) != 0);
 	}
 
 	// Shared redirect decision: when the planned (public) gid's manifest is
@@ -155,6 +155,22 @@ namespace
 	uint64_t redirectGid(const char* site, uint32_t appId, uint32_t depotId,
 	                     uint64_t manifestId)
 	{
+		// Explicit pin (design §4.2): honour it UNCONDITIONALLY, even when
+		// the public manifest is on disk.  Capture the current depotcache
+		// state first, then ensure the pinned gid is staged (online, BYld
+		// fetches its request code if absent) and redirect to it.
+		const uint64_t pin = g_config.getManifestPin(depotId);
+		if (pin)
+		{
+			ManifestStore::archiveDepot(depotId);
+			ManifestStore::restoreToDepotcache(depotId, pin);
+			g_pLog->info("ManifestBind[%s]: depot=%u pinned to gid=%llu "
+			             "(unconditional redirect)\n",
+			             site, depotId,
+			             static_cast<unsigned long long>(pin));
+			return pin;
+		}
+
 		if (!(g_fallbackEnabled && manifestId && depotId
 		      && depotInScope(appId, depotId)))
 		{
