@@ -53,7 +53,7 @@ public:
 	MTVariable<std::unordered_map<uint32_t, std::string>> gameTitles;
 	MTVariable<std::unordered_map<uint32_t, uint32_t>> subscriptionTimestamps;
 
-	// Manifest pinning (design.md §3/§4).  manifestPins is the flattened
+	// Manifest pinning.  manifestPins is the flattened
 	// depot->gid redirect index; lockedApps drives shouldDisableUpdates;
 	// manifestPinsByApp is the structured source kept for purge.
 	MTVariable<std::unordered_map<uint32_t, uint64_t>> manifestPins;

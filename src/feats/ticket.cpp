@@ -264,7 +264,7 @@ void Ticket::recvAppTicket(CMsgClientGetAppOwnershipTicketResponse* msg)
 	// Stamp eresult=OK on the parsed message so the downloader proceeds.
 	// We intentionally do NOT touch the `ticket` string field — that
 	// lives in Steam's protobuf arena and rewriting it has corrupted the
-	// heap in past experiments (see HANDOFF.md "DO NOT").  set_eresult is
+	// heap in past experiments.  set_eresult is
 	// a trivial int32 mutation, no allocation.  If Steam's later pipeline
 	// strictly validates the ticket bytes we may need to re-route this
 	// through a fresh message buffer (mirror what hkBRouteMsgToJob does

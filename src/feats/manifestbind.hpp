@@ -22,7 +22,7 @@
 // subsequent gid-keyed table lookup use the SAME gid.  Redirecting only the
 // inner acquisition routine leaves the table keyed by the zip gid while the
 // outer frame looks up the original public gid -> NULL deref -> SIGSEGV at
-// Reconfiguring (see .kiro/research/manifest-fallback-rootcause.md).
+// Reconfiguring.
 // appinfo.vdf and the PICS product-info buffer are left untouched, so this
 // never trips the changelist SHA-1 integrity check that makes splicing
 // appinfo.vdf a dead end.

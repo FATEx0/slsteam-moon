@@ -1,5 +1,4 @@
-// Standalone test for the pure AppInfoPin gid-rewrite logic
-// (manifest-pin-NEXT-STEPS.md §3, Approach A).
+// Standalone test for the pure AppInfoPin gid-rewrite logic.
 // Build (from repo root):
 //   g++ -std=c++20 -I include tools/test_appinfopin.cpp \
 //       lib/libyaml-cpp.a -o /tmp/test_appinfopin && /tmp/test_appinfopin

@@ -14,7 +14,7 @@
 // key comes from the user's Lua, separately — so we need neither the
 // user's account, ownership, nor any access token for these apps.
 //
-// Constraints (see HANDOFF.md dead ends):
+// Constraints (hard-won dead ends):
 //   - Uses its own socket/session; never touches the Steam client's CM
 //     connection or any in-flight buffer (avoids the SHA-1 cold-loop).
 //   - Fully SYNCHRONOUS, called from setup()'s provisioning pass on a

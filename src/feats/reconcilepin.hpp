@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// ReconcilePin — the downgrade-loop fix (manifest-pin-HANDOFF-v2.md §6/§7).
+// ReconcilePin — the downgrade-loop fix.
 //
 // Hooks CDepotDownloadMgr::EvaluateConfigChanges (entry VA 0xfe425a on build
 // cfe99f0c) — the post-commit reconcile that diffs an app's ACTIVE (installed)

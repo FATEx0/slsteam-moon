@@ -275,7 +275,7 @@ bool CConfig::loadSettings()
 		setError(ELoadError::MissingKey);
 	}
 
-	// ManifestPins (design.md §3): nested  appid -> { locked, depots: {depot: "gid"} }.
+	// ManifestPins: nested  appid -> { locked, depots: {depot: "gid"} }.
 	// gids are STRINGS (uint64 exceeds YAML int safety).  Missing key is fine.
 	{
 		ManifestPins::PinMap pinMap;

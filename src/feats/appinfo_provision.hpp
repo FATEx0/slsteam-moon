@@ -14,7 +14,7 @@
 // We previously tried to enrich the in-flight PICS buffer.  Steam
 // validates the buffer against the SHA-1 it received in the PICS
 // changelist, so any rewrite tripped the integrity check and looped the
-// cold-cache login forever (see HANDOFF.md §3, FINDINGS.md).
+// cold-cache login forever.
 //
 // This module addresses that case at a different layer: it pulls a
 // complete product-info text buffer from a public mirror and splices

@@ -2,14 +2,14 @@
 //
 // AppInfoPin — pure helper that rewrites the public-branch manifest gid of a
 // LOCKED app's pinned depots inside a provisioned appinfo body
-// (manifest-pin-NEXT-STEPS.md §3, Approach A).
+// (the "locked app" provisioning approach).
 //
 // Why this exists: Steam's post-commit reconcile compares the INSTALLED depot
 // gid against the IN-MEMORY appinfo gid (loaded from the provisioned
 // appinfo.vdf at startup).  When the user pins a game to an older build, Steam
 // downloads + commits the pinned depot gid, but appinfo still carries the live
-// public gid — so the reconcile flags "Update Required" forever (proven loop,
-// planner-port.md §14/§16).  Emitting the pinned gid into the provisioned
+// public gid — so the reconcile flags "Update Required" forever (a proven loop).
+// Emitting the pinned gid into the provisioned
 // appinfo makes installed==appinfo for the locked app: the loop never starts,
 // while the older build still downloads once (appinfo's pinned gid != the
 // installed public build, so Steam does run the one downgrade).

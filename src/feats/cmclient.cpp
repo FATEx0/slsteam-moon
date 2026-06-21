@@ -57,8 +57,8 @@ namespace CmClient
 namespace
 {
 
-// EMsg values (canonical, cross-checked against the reference enums in
-// .kiro/research/.../Enums.h — NOT the mis-transcribed values that
+// EMsg values (canonical, cross-checked against the reference Steam
+// enums — NOT the mis-transcribed values that
 // appeared in an early handoff draft).
 constexpr uint32_t EMSG_MULTI                       = 1;
 constexpr uint32_t EMSG_CLIENT_LOGON                = 5514;

@@ -7,9 +7,8 @@
 // b9052d72350d38af101463fb2b5334b8 by reverse engineering CPackageInfo's
 // constructor, LoadPackage body and BUpdateLicenses subscriber loop.
 //
-// See `.kiro/research/lumacore/LINUX_PATTERNS.md` for the offsets and
-// reasoning. The first 0x58 bytes of PackageInfo match LumaCore's Windows
-// layout; the trailing bytes (0x58..0x77) are cache tracking and not
+// The first 0x58 bytes of PackageInfo match LumaCore's Windows layout;
+// the trailing bytes (0x58..0x77) are cache tracking and not
 // touched by us.
 
 #pragma once

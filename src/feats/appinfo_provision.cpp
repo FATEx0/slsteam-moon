@@ -420,8 +420,8 @@ void pruneUnsupportedDepots(YAML::Node& body, uint32_t appId)
 
 // SLSSTEAM_PIN_PLANNER gate (shared with the manifestbind planner patch):
 // when set, a LOCKED app's pinned depot gids are emitted into the provisioned
-// appinfo so Steam's reconcile sees installed==appinfo and stops looping
-// (manifest-pin-NEXT-STEPS.md §3).  Read fresh each call (cheap; provisioning
+// appinfo so Steam's reconcile sees installed==appinfo and stops looping.
+// Read fresh each call (cheap; provisioning
 // is a startup-only path) so a filewatcher config reload doesn't need a
 // cached copy.  Default OFF keeps a normal launch on the live public gid.
 bool pinAppinfoEnabled()
@@ -477,7 +477,7 @@ bool renderAppinfoBuffer(const YAML::Node& appNode, uint32_t appId, std::string&
 	// in-memory appinfo (loaded from this buffer at startup) matches the
 	// build Steam commits.  Without this, the post-commit reconcile compares
 	// the installed pinned gid against appinfo's public gid and loops
-	// "Update Required" forever (manifest-pin-NEXT-STEPS.md §3, Approach A).
+	// "Update Required" forever.
 	//
 	// This is DISTINCT from the general unowned-install path (see
 	// provisionApp's note): that path deliberately keeps the LIVE public gid
@@ -621,8 +621,8 @@ bool hasDepotsForApp(const std::string& appinfoVdfPath, uint32_t appId)
 	ifs.read(buf.data(), sz);
 
 	// Linear scan for the appid little-endian followed by enough header
-	// bytes to be a real entry header.  Per .kiro/research/appinfo-vdf-
-	// format/README.md, header layout is:
+	// bytes to be a real entry header.  The appinfo.vdf entry header
+	// layout is:
 	//   uint32 appid; uint32 size; uint32 info_state; uint64 last_updated;
 	//   uint64 token; bytes sha[20]; uint32 change#; bytes binsha[20]
 	// total = 72 bytes.
@@ -1154,7 +1154,7 @@ bool provisionApp(uint32_t appId, const std::string& appinfoVdfPath)
 	// gid we pre-stage in PICS recv == the gid Steam requests == BYld is
 	// skipped == first-attempt install succeeds.
 	//
-	// EXCEPTION (manifest-pin-NEXT-STEPS.md §3, Approach A): a LOCKED app
+	// EXCEPTION: a LOCKED app
 	// is an explicit user downgrade to an older build, and renderAppinfoBuffer
 	// (above, gated on SLSSTEAM_PIN_PLANNER) DOES rewrite that app's depot
 	// gid to the pin — so installed==appinfo and the post-commit reconcile

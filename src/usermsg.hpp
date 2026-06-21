@@ -127,7 +127,7 @@ inline std::string suppressedSuffix(Lang lang, int n)
 }
 
 // The catalog. EN + PT for every UserMsg. First-draft wording — reviewed and
-// tuned by hand (see .kiro/error-messages-review.md). Keep it: short, calm,
+// tuned by hand. Keep it: short, calm,
 // plain-language, and actionable (tell the user what to do next).
 inline UiMessage messageFor(UserMsg m, Lang lang)
 {

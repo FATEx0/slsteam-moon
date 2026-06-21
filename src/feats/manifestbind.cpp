@@ -54,7 +54,7 @@ namespace
 	                           uint64_t, uint32_t);
 
 	// FUNC_1141 / CDepotDownloadMgr::BuildDepotDependency — the install-plan
-	// consumer (manifest-pin-planner-port.md §12).  cdecl, 4 dwords:
+	// consumer.  cdecl, 4 dwords:
 	//   (void* ctx, uint32_t flag, CUtlVector<DepotEntry>* depots, uint32_t a3)
 	using BuildDepFn_t = void*(*)(void*, uint32_t, void*, uint32_t);
 
@@ -102,7 +102,7 @@ namespace
 
 	// --- DIAGNOSTIC: install-planner runtime trace (env SLSSTEAM_PLAN_TRACE) -
 	//
-	// §11 of manifest-pin-planner-port.md: static analysis could not tie the
+	// Static analysis could not tie the
 	// depot-list BUILDER (the LumaCore `BuildDepotDependency` equivalent) back
 	// to an external caller — the consumer `sub_FDFD00` (VA 0xfdfd00) appears
 	// to have no static caller, no vtable slot, no GOT entry.  The unblocking
@@ -388,7 +388,7 @@ namespace
 
 	// CDepotDownloadMgr::BuildDepotDependency — patch the PLAN in place.
 	//
-	// This is the real manifest-pin lever (manifest-pin-planner-port.md §12).
+	// This is the real manifest-pin lever.
 	// Steam decides the depot gid + build it installs/commits from the
 	// already-built DepotEntry vector this function consumes; redirecting the
 	// gid downstream (ProcessDepotManifest/PrepareDepotDownload) only changes

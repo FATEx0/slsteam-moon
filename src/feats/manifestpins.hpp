@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // ManifestPins — pure container logic for the manifest-pinning feature
-// (design.md §3/§4).  A "pin" locks a depot to a specific manifest gid the
+// A "pin" locks a depot to a specific manifest gid the
 // user has archived; CConfig parses config.yaml's `ManifestPins:` map into
 // the structured PinMap and derives a flattened depot->gid index (the
 // redirect lookup) plus a locked-app set (the update-lock).  Kept free of

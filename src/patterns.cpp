@@ -377,8 +377,8 @@ namespace Patterns
 		//     per-download table BY the gid it was called with and derefs the
 		//     per-manifest state pointer.  If the leaf was redirected to the
 		//     zip gid but this frame still looks up the public gid -> miss ->
-		//     NULL deref -> SIGSEGV at Reconfiguring (core-dump confirmed; see
-		//     .kiro/research/manifest-fallback-rootcause.md).  Redirecting the
+		//     NULL deref -> SIGSEGV at Reconfiguring (core-dump confirmed).
+		//     Redirecting the
 		//     gid here too keeps the leaf call and the table lookup consistent.
 		//     PIC get_pc_thunk is at +5 (after the 5-byte prologue we relocate)
 		//     so fixPICThunkCall is a harmless no-op for this hook point.
@@ -399,7 +399,7 @@ namespace Patterns
 		};
 
 		// (3) BuildDepotDependency (the install-plan CONSUMER, located via a
-		//     runtime stack trace — see manifest-pin-planner-port.md §12).  The
+		//     runtime stack trace).  The
 		//     per-app planner: receives an already-built CUtlVector<DepotEntry>
 		//     (arg2 = [ebp+0x10]; count @ +0xc, element base @ +0, stride 0x20)
 		//     and, per entry, copies ManifestGid (+0x8) into the context's
@@ -420,7 +420,7 @@ namespace Patterns
 		};
 
 		// (4) EvaluateConfigChanges (the post-commit reconcile, located via
-		//     static RE — manifest-pin-HANDOFF-v2.md §6).  Emits the
+		//     static RE).  Emits the
 		//     content_log "AppID %u ...config changed : added/removed/updated
 		//     depots %s" lines and decides "Update Required".  It diffs the
 		//     app's installed depot vector (ptr @ ctx+0x78, count @ ctx+0x84,
