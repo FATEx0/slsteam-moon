@@ -43,6 +43,8 @@ bool Patterns::init()
 	CUser::NotifyLicensesUpdated.optional = true;
 	CDepotDownloadMgr::ProcessDepotManifest.optional = true;
 	CDepotDownloadMgr::PrepareDepotDownload.optional = true;
+	CDepotDownloadMgr::BuildDepotDependency.optional = true;
+	CDepotDownloadMgr::EvaluateConfigChanges.optional = true;
 	for(auto& pattern : patterns())
 	{
 		if (!pattern->find())
@@ -393,6 +395,51 @@ namespace Patterns
 		{
 			"CDepotDownloadMgr::PrepareDepotDownload",
 			"55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 83 EC 60 8B 7D 08 8B 45 18 8B 55 1C FF 75 20 89 45 98 52 50 FF 75 14 89 55 9C FF 75 10 FF 75 0C 57 E8 ? ? ? ? 8B 47 4C 83 C4 20 83 F8 FF",
+			SigFollowMode::None
+		};
+
+		// (3) BuildDepotDependency (the install-plan CONSUMER, located via a
+		//     runtime stack trace — see manifest-pin-planner-port.md §12).  The
+		//     per-app planner: receives an already-built CUtlVector<DepotEntry>
+		//     (arg2 = [ebp+0x10]; count @ +0xc, element base @ +0, stride 0x20)
+		//     and, per entry, copies ManifestGid (+0x8) into the context's
+		//     planned-gid vector (ctx+0x664) AND drives ProcessDepotManifest /
+		//     the shared-depot handler.  Patching depots[i].ManifestGid here
+		//     (before the original runs) is the LumaCore manifest-override
+		//     point: it mutates the SOURCE the commit reads from, not the
+		//     by-value gid the acquisition leaf gets (which the commit ignores).
+		//     PIC get_pc_thunk is the FIRST insn (like ProcessDepotManifest) ->
+		//     fixPICThunkCall repairs the relocated thunk in the tramp.
+		//     Verified: 1 match in .text (entry VA 0x11413e0 on build
+		//     cfe99f0cc8fee644e2a8e3d1a0794e49).
+		Pattern_t BuildDepotDependency
+		{
+			"CDepotDownloadMgr::BuildDepotDependency",
+			"E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 81 EC 8C 04 00 00 8B 55 10 8B 7D 0C 89 85 A0 FB FF FF 8B 45 08",
+			SigFollowMode::None
+		};
+
+		// (4) EvaluateConfigChanges (the post-commit reconcile, located via
+		//     static RE — manifest-pin-HANDOFF-v2.md §6).  Emits the
+		//     content_log "AppID %u ...config changed : added/removed/updated
+		//     depots %s" lines and decides "Update Required".  It diffs the
+		//     app's installed depot vector (ptr @ ctx+0x78, count @ ctx+0x84,
+		//     stride 0x20, ManifestGid @ +0x8) against an appinfo-derived
+		//     target list, flagging a depot "updated" when the two gids differ
+		//     (the movq/pxor compare at VA 0xfe4598).  THIS is what perpetually
+		//     re-flags a downgraded (pinned) install whose appinfo still
+		//     carries the public gid -> the loop.  Hook target for the (B) fix.
+		//     Calling convention: a global anchor/manager pointer comes in EAX
+		//     (used as both the manager object and the PIC string anchor); the
+		//     three args are on the stack (ctx @ ebp+0x8, appId @ ctx+0x8).
+		//     The prologue's first insn is `push ebp` (NOT a get_pc_thunk), so
+		//     no fixPICThunkCall is needed; a regparm(1) detour preserves EAX.
+		//     Verified: 1 match in .text (entry VA 0xfe425a on build
+		//     cfe99f0cc8fee644e2a8e3d1a0794e49).
+		Pattern_t EvaluateConfigChanges
+		{
+			"CDepotDownloadMgr::EvaluateConfigChanges",
+			"55 89 E5 57 56 53 81 EC DC 00 00 00 89 85 50 FF FF FF 8B 45 10 89 85 40 FF FF FF 8B 45 08 8B 40 04",
 			SigFollowMode::None
 		};
 	}
