@@ -13,7 +13,153 @@
 
 #include "fakeappid.hpp"
 
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
+#include <sys/stat.h>
+
+namespace
+{
+	// --- pin-aware update suppression helpers (apps.cpp-local) -------------
+	//
+	// A locked, pinned app must let Steam run the update ONCE to install the
+	// pinned build, then freeze.  If we suppress unconditionally Steam never
+	// applies the pin (it stays on the installed/public build); if we never
+	// suppress Steam loops forever reconciling the pinned gid against appinfo's
+	// public gid.  So suppress IFF the app's installed depots already match its
+	// pins.  That needs the installed manifest gids, read from the app's
+	// appmanifest_<appId>.acf across all Steam library folders.
+
+	std::string steamRootForManifests()
+	{
+		const char* home = std::getenv("HOME");
+		if (!home) return {};
+		const std::string roots[] = {
+			std::string(home) + "/.steam/steam",
+			std::string(home) + "/.steam/debian-installation",
+			std::string(home) + "/.local/share/Steam",
+		};
+		for (const auto& r : roots)
+		{
+			struct stat st{};
+			if (stat((r + "/steamapps/libraryfolders.vdf").c_str(), &st) == 0)
+				return r;
+		}
+		return {};
+	}
+
+	// All library steamapps dirs (main root + every "path" in libraryfolders).
+	std::vector<std::string> librarySteamappsDirs()
+	{
+		std::vector<std::string> dirs;
+		const std::string root = steamRootForManifests();
+		if (root.empty()) return dirs;
+		dirs.push_back(root + "/steamapps");
+
+		std::ifstream f(root + "/steamapps/libraryfolders.vdf");
+		if (!f) return dirs;
+		std::string line;
+		while (std::getline(f, line))
+		{
+			// "path"  "/some/library"
+			const auto k = line.find("\"path\"");
+			if (k == std::string::npos) continue;
+			const auto q1 = line.find('"', k + 6);
+			if (q1 == std::string::npos) continue;
+			const auto q2 = line.find('"', q1 + 1);
+			if (q2 == std::string::npos) continue;
+			dirs.push_back(line.substr(q1 + 1, q2 - q1 - 1) + "/steamapps");
+		}
+		return dirs;
+	}
+
+	std::string findAppManifestPath(uint32_t appId)
+	{
+		const std::string name = "/appmanifest_" + std::to_string(appId) + ".acf";
+		for (const auto& d : librarySteamappsDirs())
+		{
+			const std::string p = d + name;
+			struct stat st{};
+			if (stat(p.c_str(), &st) == 0) return p;
+		}
+		return {};
+	}
+
+	// depot -> installed manifest gid, parsed from the .acf InstalledDepots
+	// block.  Each depot block opens with `"<depot>" {` and (per Steam's
+	// writer) lists `"manifest" "<gid>"` first; no nested braces inside.
+	std::unordered_map<uint32_t, uint64_t> installedDepotGids(uint32_t appId)
+	{
+		std::unordered_map<uint32_t, uint64_t> out;
+		const std::string path = findAppManifestPath(appId);
+		if (path.empty()) return out;
+
+		std::ifstream f(path);
+		if (!f) return out;
+		std::stringstream ss;
+		ss << f.rdbuf();
+		const std::string s = ss.str();
+
+		const auto idStart = s.find("\"InstalledDepots\"");
+		if (idStart == std::string::npos) return out;
+		// Scope to the InstalledDepots block: from its '{' to the matching '}'.
+		auto pos = s.find('{', idStart);
+		if (pos == std::string::npos) return out;
+		int depth = 1;
+		size_t i = pos + 1;
+		uint32_t curDepot = 0;
+		while (i < s.size() && depth > 0)
+		{
+			const char c = s[i];
+			if (c == '{') { ++depth; ++i; continue; }
+			if (c == '}') { --depth; ++i; continue; }
+			if (c == '"')
+			{
+				const auto end = s.find('"', i + 1);
+				if (end == std::string::npos) break;
+				const std::string tok = s.substr(i + 1, end - i - 1);
+				i = end + 1;
+				if (depth == 1)
+				{
+					// depot id key
+					try { curDepot = static_cast<uint32_t>(std::stoul(tok)); }
+					catch (...) { curDepot = 0; }
+				}
+				else if (depth == 2 && tok == "manifest" && curDepot)
+				{
+					const auto v1 = s.find('"', i);
+					if (v1 == std::string::npos) break;
+					const auto v2 = s.find('"', v1 + 1);
+					if (v2 == std::string::npos) break;
+					try {
+						out[curDepot] =
+						    std::stoull(s.substr(v1 + 1, v2 - v1 - 1));
+					} catch (...) {}
+					i = v2 + 1;
+				}
+				continue;
+			}
+			++i;
+		}
+		return out;
+	}
+
+	// True iff every pinned depot of `appId` is installed at its pinned gid.
+	bool appAtPinnedGids(uint32_t appId)
+	{
+		const auto pins = g_config.getAppPinnedDepots(appId);
+		if (pins.empty()) return false;
+		const auto installed = installedDepotGids(appId);
+		if (installed.empty()) return false;
+		for (const auto& [depot, gid] : pins)
+		{
+			const auto it = installed.find(depot);
+			if (it == installed.end() || it->second != gid) return false;
+		}
+		return true;
+	}
+}
 
 bool Apps::applistRequested;
 std::map<uint32_t, int> Apps::appIdOwnerOverride;
@@ -207,12 +353,24 @@ bool Apps::shouldDisableUpdates(uint32_t appId)
 		}
 	}
 
-	// Locked apps freeze on their pinned build (updates off); unlocked
-	// AddedApps get updates ENABLED so they grab the latest (per-DLC
-	// redirects still apply via manifestbind).  HANDOFF warning: with the
-	// two-hook redirect, online installed-gid == planned-gid, so enabling
-	// updates here must NOT reintroduce the perpetual "update queued" loop.
-	return g_config.isAppLocked(appId);
+	// Locked apps freeze on their pinned build.  But suppressing updates
+	// UNCONDITIONALLY means Steam never installs the pinned build in the first
+	// place (it stays on whatever is installed); allowing them unconditionally
+	// makes Steam loop forever reconciling the pinned depot gid against
+	// appinfo's public gid (commit pinned -> "Update Required" -> re-plan ->
+	// commit -> ...).  Resolve both: suppress IFF the app's installed depots
+	// already match its pins.  Not-yet-pinned -> allow the ONE downgrade to
+	// run; once installed==pinned -> suppress so it freezes without looping.
+	if (!g_config.isAppLocked(appId))
+	{
+		return false;  // unlocked AddedApp: updates enabled (grab latest)
+	}
+
+	const bool atPinned = appAtPinnedGids(appId);
+	g_pLog->infoOnce("Pin-lock %u: installed%s at pinned build -> updates %s\n",
+	                 appId, atPinned ? "" : " NOT",
+	                 atPinned ? "frozen" : "allowed (apply pin)");
+	return atPinned;
 }
 
 void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
