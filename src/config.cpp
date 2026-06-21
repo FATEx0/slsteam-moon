@@ -292,6 +292,9 @@ bool CConfig::loadSettings()
 					const auto lockedNode = appNode.second["locked"];
 					if (lockedNode) app.locked = lockedNode.as<bool>();
 
+					const auto buildIdNode = appNode.second["build_id"];
+					if (buildIdNode) app.buildId = buildIdNode.as<uint32_t>();
+
 					const auto depotsNode = appNode.second["depots"];
 					if (depotsNode)
 					{
@@ -351,6 +354,23 @@ uint64_t CConfig::getManifestPin(uint32_t depotId)
 bool CConfig::isAppLocked(uint32_t appId)
 {
 	return ManifestPins::isLocked(lockedApps.get(), appId);
+}
+
+std::unordered_map<uint32_t, uint64_t>
+CConfig::getAppPinnedDepots(uint32_t appId)
+{
+	const auto pinMap = manifestPinsByApp.get();
+	const auto it = pinMap.find(appId);
+	if (it == pinMap.end()) return {};
+	return it->second.depots;
+}
+
+uint32_t CConfig::getAppPinnedBuildId(uint32_t appId)
+{
+	const auto pinMap = manifestPinsByApp.get();
+	const auto it = pinMap.find(appId);
+	if (it == pinMap.end()) return 0;
+	return it->second.buildId;
 }
 
 void CConfig::purgePinsForApps(const std::unordered_set<uint32_t>& appIds)

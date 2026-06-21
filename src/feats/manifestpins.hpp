@@ -18,6 +18,7 @@ namespace ManifestPins
 	struct AppPins
 	{
 		bool locked = false;
+		uint32_t buildId = 0; // pinned build NUMBER (0 = none); GetAppBuildId
 		std::unordered_map<uint32_t, uint64_t> depots; // depot -> gid
 	};
 

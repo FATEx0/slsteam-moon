@@ -198,6 +198,13 @@ public:
 
 	uint64_t getManifestPin(uint32_t depotId);
 	bool isAppLocked(uint32_t appId);
+	// The depot->gid pins for one app (empty if none).  Used to check whether
+	// an app's installed depots already match its pins (pin-aware update
+	// suppression: allow the one downgrade, then freeze).
+	std::unordered_map<uint32_t, uint64_t> getAppPinnedDepots(uint32_t appId);
+	// The pinned build NUMBER for an app (0 if none).  Emitted into the
+	// provisioned appinfo branch buildid so GetAppBuildId reports it.
+	uint32_t getAppPinnedBuildId(uint32_t appId);
 	void purgePinsForApps(const std::unordered_set<uint32_t>& appIds);
 
 	bool shouldExcludeAppId(uint32_t appId);
