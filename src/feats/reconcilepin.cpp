@@ -117,6 +117,138 @@ namespace
 		}
 	}
 
+	// --- the TARGET-LOCAL fix (the -0x90(ebp) CUtlVector) -----------------
+	//
+	// applyTargetPin above rewrites the gid in the ctx vector ([ctx+0x78]).
+	// For some apps that vector already holds the pin and the DIVERGENT
+	// (still-public) gid the reconcile actually compares against lives in a
+	// FUNCTION-LOCAL CUtlVector at -0x90(ebp) instead — which an entry hook
+	// cannot reach (it isn't built yet at the prologue).  Live trace, app
+	// 3525970: [ctx+0x78]=pin (no rewrite) but the local=public -> mismatch ->
+	// perpetual "updated depots" loop while installing.
+	//
+	// That local is filled by a shared appinfo->depot-vector builder (the
+	// function EvaluateConfigChanges calls right after constructing the local).
+	// The builder receives &targetVec as an argument and the appId, so a
+	// function-replacement hook can patch the local AFTER it is populated — no
+	// fragile mid-function detour / ebp gymnastics.  But the builder has SIX
+	// callers; patching its output globally would contaminate the chunk-diff
+	// baseline path (the proven 0-file-commit dead end).  So we act ONLY when
+	// the return address is EvaluateConfigChanges' own call site, i.e. the
+	// local being filled is THIS reconcile's TARGET vector.
+	//
+	// The builder + its call-site return address are derived from the matched
+	// EvaluateConfigChanges pattern (offsets confirmed on build cfe99f0c):
+	//   call site `e8 rel32` @ EvalAddr+0x183 -> builder = site+5+rel32;
+	//   return addr (the patch gate) = EvalAddr+0x188.
+	// A function-replacement hook on the builder needs no PIC fixup: its
+	// get_pc_thunk is its 5th instruction, outside the stolen 5 prologue bytes.
+	//
+	// CUtlVector<DepotEntry>: element base @ +0x0, count @ +0xc.
+	constexpr size_t kBuilderCallOff = 0x183;  // EvalAddr -> the `e8` opcode
+	constexpr size_t kBuilderRetOff = 0x188;   // EvalAddr -> insn after the call
+	constexpr size_t kVecBaseOff = 0x00;
+	constexpr size_t kVecCountOff = 0x0c;
+
+	using BuildTargetFn_t = void* (*)(void*, uint32_t, void*, void*, void*,
+	                                  void*, void*, void*);
+	BuildTargetFn_t g_origBuild = nullptr;
+	lm_address_t    g_buildAddr = LM_ADDRESS_BAD;
+	lm_address_t    g_buildTramp = LM_ADDRESS_BAD;
+	lm_size_t       g_buildSize = 0;
+	uintptr_t       g_buildRet = 0;  // EvaluateConfigChanges call-site return addr
+
+	// Walk the appinfo-derived TARGET CUtlVector and force each pinned depot's
+	// gid to the pin (same DepotEntry layout as everywhere).  This is ALWAYS
+	// the appinfo/desired side (never the installed/active side), so forcing it
+	// to the pin is unconditionally safe: a still-public install reads
+	// active(public) != target(pin) and the one downgrade fires; afterwards
+	// active(pin) == target(pin) and the loop never starts.
+	void patchTargetVec(void* vecv, uint32_t appId)
+	{
+		if (!vecv) return;
+		auto* vec = reinterpret_cast<uint8_t*>(vecv);
+		auto* base = *reinterpret_cast<uint8_t* const*>(vec + kVecBaseOff);
+		const int32_t count =
+		    *reinterpret_cast<const int32_t*>(vec + kVecCountOff);
+		if (!base || count <= 0 || count > kMaxDepots) return;
+
+		auto* e = base;
+		for (int32_t i = 0; i < count; ++i, e += kDepotEntryStride)
+		{
+			const uint32_t depotId = *reinterpret_cast<const uint32_t*>(e);
+			const uint64_t pin = g_config.getManifestPin(depotId);
+			if (!pin) continue;
+			auto* gidp = reinterpret_cast<uint64_t*>(e + kDepotEntryGidOff);
+			if (*gidp != pin)
+			{
+				g_pLog->info("ReconcilePin: app=%u target-local depot=%u "
+				             "gid=%llu -> pinned gid=%llu\n",
+				             appId, depotId,
+				             static_cast<unsigned long long>(*gidp),
+				             static_cast<unsigned long long>(pin));
+				*gidp = pin;
+			}
+		}
+	}
+
+	__attribute__((noinline))
+	void* hkBuildTarget(void* a0, uint32_t appId, void* a2, void* targetVec,
+	                    void* a4, void* ctx, void* a6, void* a7)
+	{
+		// Capture the call-site BEFORE invoking the original (the builder is a
+		// jmp-detoured cdecl function, so our frame's return address is the
+		// caller's — EvaluateConfigChanges when the gate matches).
+		const bool ours =
+		    reinterpret_cast<uintptr_t>(__builtin_return_address(0)) == g_buildRet;
+		const bool act =
+		    g_pinActive && ours && targetVec && g_config.isAppLocked(appId);
+
+		void* r = g_origBuild(a0, appId, a2, targetVec, a4, ctx, a6, a7);
+
+		if (act) patchTargetVec(targetVec, appId);
+		return r;
+	}
+
+	// Resolve + hook the target-vector builder, derived from EvalAddr.  Returns
+	// false (and installs nothing) on any drift so the loop fix degrades to the
+	// ctx-vector patch alone rather than hooking a wrong address.
+	bool installBuildTargetHook(lm_address_t evalAddr)
+	{
+		const auto* site = reinterpret_cast<const uint8_t*>(evalAddr)
+		                   + kBuilderCallOff;
+		if (site[0] != 0xE8)  // expected `call rel32`
+		{
+			g_pLog->warn("ReconcilePin: builder call site not `call rel32` "
+			             "(got 0x%02x); target-local fix disabled\n", site[0]);
+			return false;
+		}
+		int32_t rel = 0;
+		__builtin_memcpy(&rel, site + 1, sizeof(rel));
+		g_buildAddr = reinterpret_cast<lm_address_t>(
+		    const_cast<uint8_t*>(site) + 5 + rel);
+		g_buildRet = reinterpret_cast<uintptr_t>(evalAddr) + kBuilderRetOff;
+
+		g_buildSize = LM_HookCode(g_buildAddr,
+		                          reinterpret_cast<lm_address_t>(&hkBuildTarget),
+		                          &g_buildTramp);
+		if (!g_buildSize || g_buildTramp == LM_ADDRESS_BAD)
+		{
+			g_pLog->warn("ReconcilePin: failed to hook target-vector builder; "
+			             "target-local fix disabled\n");
+			g_buildAddr = LM_ADDRESS_BAD;
+			g_buildTramp = LM_ADDRESS_BAD;
+			g_buildSize = 0;
+			return false;
+		}
+		g_origBuild = reinterpret_cast<BuildTargetFn_t>(g_buildTramp);
+		g_pLog->info("ReconcilePin: hooked target-vector builder at %p "
+		             "(gate ret=%p)\n",
+		             reinterpret_cast<void*>(g_buildAddr),
+		             reinterpret_cast<void*>(g_buildRet));
+		return true;
+	}
+
 	__attribute__((regparm(1)))
 	void* hkEvaluate(void* mgr, void* ctx, void* a1, void* a2)
 	{
@@ -188,11 +320,30 @@ namespace ReconcilePin
 		             "(pin=%d trace=%d)\n",
 		             reinterpret_cast<void*>(g_addr),
 		             static_cast<int>(g_pinActive), static_cast<int>(g_trace));
+
+		// Also patch the appinfo-derived TARGET local (the -0x90(ebp)
+		// CUtlVector) via a caller-gated hook on its builder, for apps whose
+		// divergent gid lives there instead of in [ctx+0x78].  Only meaningful
+		// when the gid rewrite is on; a drift degrades to the ctx-vector patch.
+		if (g_pinActive)
+		{
+			installBuildTargetHook(g_addr);
+		}
 		return true;
 	}
 
 	void remove()
 	{
+		if (g_buildSize && g_buildAddr != LM_ADDRESS_BAD
+		    && g_buildTramp != LM_ADDRESS_BAD)
+		{
+			LM_UnhookCode(g_buildAddr, g_buildTramp, g_buildSize);
+		}
+		g_origBuild = nullptr;
+		g_buildAddr = LM_ADDRESS_BAD;
+		g_buildTramp = LM_ADDRESS_BAD;
+		g_buildSize = 0;
+
 		if (g_size && g_addr != LM_ADDRESS_BAD && g_tramp != LM_ADDRESS_BAD)
 		{
 			LM_UnhookCode(g_addr, g_tramp, g_size);

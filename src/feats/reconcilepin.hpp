@@ -10,15 +10,31 @@
 // carried the installed gid, target call carried the public appinfo gid,
 // matching content_log "active: ... target: ...").
 //
-// The fix: for a LOCKED app, on the TARGET call (flags & 0x8) only, rewrite the
-// depot ManifestGid in the ctx vector (ptr @ ctx+0x78, count @ ctx+0x84,
-// stride 0x20, gid @ +0x8) to the configured pin.  Then a still-public install
-// (active=public != target=pin) triggers the one downgrade, and afterwards
-// (active=pin == target=pin) the reconcile finds "no changes" -> the perpetual
-// "Update Required" loop never starts.  Patching the TARGET side in memory is
-// downstream of appinfo, so an in-session RequestAppInfoUpdate cannot defeat it
-// (unlike the appinfo.vdf provision pin).  The active side is left untouched so
-// a real pending downgrade is never masked.
+// The fix has TWO cooperating parts, both for a LOCKED app only:
+//
+//  (1) ctx-vector patch: on the TARGET call (flags & 0x8), rewrite the depot
+//      ManifestGid in the ctx vector (ptr @ ctx+0x78, count @ ctx+0x84,
+//      stride 0x20, gid @ +0x8) to the configured pin.
+//
+//  (2) target-local patch: EvaluateConfigChanges also compares against an
+//      appinfo-derived TARGET CUtlVector built as a function LOCAL at
+//      -0x90(ebp).  For some apps the divergent (still-public) gid lives THERE,
+//      not in [ctx+0x78] (live trace, app 3525970: ctx vector already held the
+//      pin, the local held public -> mismatch -> perpetual "updated depots"
+//      loop while installing).  An entry hook can't reach a not-yet-built
+//      local, so we hook the shared appinfo->depot-vector builder that fills it
+//      (derived from the EvaluateConfigChanges call site) and patch the local
+//      AFTER population — but ONLY when the return address is this function's
+//      call site (the builder has 6 callers; patching its output globally would
+//      contaminate the chunk-diff baseline path).  The local is always the
+//      appinfo/desired side, so forcing it to the pin is unconditionally safe.
+//
+// Together: a still-public install (active=public != target=pin) triggers the
+// one downgrade, and afterwards (active=pin == target=pin) the reconcile finds
+// "no changes" -> the perpetual "Update Required" loop never starts.  Patching
+// the TARGET side in memory is downstream of appinfo, so an in-session
+// RequestAppInfoUpdate cannot defeat it (unlike the appinfo.vdf provision pin).
+// The active side is left untouched so a real pending downgrade is never masked.
 //
 // Calling convention (REd): a global anchor/manager pointer arrives in EAX; the
 // three args are on the stack (ctx = arg0 @ ebp+0x8).  Modelled with a
