@@ -16,6 +16,7 @@
 #include "../config.hpp"
 #include "../globals.hpp"
 #include "../log.hpp"
+#include "../cainfo.hpp"
 
 #include "../utils/ManifestFetch.hpp"
 
@@ -124,6 +125,12 @@ bool httpGetJson(const std::string& url, std::string& body, std::string& diag)
 	// Same multi-thread safety justification as ManifestFetch::httpGet.
 	p_curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
 	p_curl_easy_setopt(c, CURLOPT_USERAGENT, "SLSsteam-AppInfoProvision/0.1");
+	// Pin the system trust store (see cainfo.hpp): the libcurl Steam loads
+	// otherwise fails CA verification on SteamOS/Arch with curl error 60
+	// ("Peer certificate cannot be authenticated"), the exact failure that
+	// sinks the steamcmd.net fallback. No-op when no bundle is found.
+	if (const char* f = ca::bundleFile()) p_curl_easy_setopt(c, CURLOPT_CAINFO, f);
+	if (const char* d = ca::bundleDir())  p_curl_easy_setopt(c, CURLOPT_CAPATH, d);
 
 	const CURLcode rc = p_curl_easy_perform(c);
 	long status = 0;

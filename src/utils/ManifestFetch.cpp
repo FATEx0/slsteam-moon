@@ -3,6 +3,7 @@
 
 #include "../config.hpp"
 #include "../log.hpp"
+#include "../cainfo.hpp"
 
 #include <curl/curl.h>
 
@@ -227,6 +228,10 @@ HttpResponse httpGet(const std::string& url)
     // NOSIGNAL switches libcurl to signal-free timeouts.
     p_curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     p_curl_easy_setopt(c, CURLOPT_USERAGENT, "SLSsteam-ManifestFetch/0.1");
+    // Pin the system trust store (see cainfo.hpp) so the https manifest
+    // providers verify on SteamOS/Arch; no-op when no bundle is found.
+    if (const char* f = ca::bundleFile()) p_curl_easy_setopt(c, CURLOPT_CAINFO, f);
+    if (const char* d = ca::bundleDir())  p_curl_easy_setopt(c, CURLOPT_CAPATH, d);
     const CURLcode rc = p_curl_easy_perform(c);
     if (rc != CURLE_OK)
     {

@@ -27,6 +27,7 @@
 
 #include "../config.hpp"
 #include "../log.hpp"
+#include "../cainfo.hpp"
 
 #include "../sdk/protobufs/steammessages_base.pb.h"
 
@@ -136,6 +137,11 @@ bool httpsGet(const std::string& url, std::string& body)
 	p_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
 	p_setopt(c, CURLOPT_NOSIGNAL, 1L);
 	p_setopt(c, CURLOPT_USERAGENT, "SLSsteam-CmClient/0.1");
+	// Pin the system trust store (see cainfo.hpp): without it the libcurl
+	// Steam loads fails CA verification on SteamOS/Arch and this GET returns
+	// nothing -> "empty CM list". No-op when no bundle is found.
+	if (const char* f = ca::bundleFile()) p_setopt(c, CURLOPT_CAINFO, f);
+	if (const char* d = ca::bundleDir())  p_setopt(c, CURLOPT_CAPATH, d);
 	const CURLcode rc = p_perform(c);
 	long status = 0;
 	p_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
@@ -316,6 +322,10 @@ public:
 		p_setopt(m_c, CURLOPT_CONNECTTIMEOUT, 6L);
 		p_setopt(m_c, CURLOPT_TIMEOUT, static_cast<long>(kTotalTimeoutSecs));
 		p_setopt(m_c, CURLOPT_NOSIGNAL, 1L);
+		// Pin the system trust store so the wss:// TLS handshake verifies on
+		// SteamOS/Arch (see cainfo.hpp); no-op when no bundle is found.
+		if (const char* f = ca::bundleFile()) p_setopt(m_c, CURLOPT_CAINFO, f);
+		if (const char* d = ca::bundleDir())  p_setopt(m_c, CURLOPT_CAPATH, d);
 		const CURLcode rc = p_perform(m_c);
 		return rc == CURLE_OK;
 	}

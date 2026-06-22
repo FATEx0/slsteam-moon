@@ -1,4 +1,5 @@
 #include "curl.hpp"
+#include "cainfo.hpp"
 #include "log.hpp"
 
 #include <curl/curl.h>
@@ -46,6 +47,11 @@ int Curl::getString(const char* url, std::string& out)
 	p_curl_easy_setopt(curl, CURLOPT_URL, url);
 	p_curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
 	p_curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+	// Pin the system trust store so TLS verification works even when the
+	// libcurl Steam loads can't find a CA bundle on its compiled-in default
+	// (SteamOS/Arch). No-op when nothing is found -> curl keeps its default.
+	if (const char* f = ca::bundleFile()) p_curl_easy_setopt(curl, CURLOPT_CAINFO, f);
+	if (const char* d = ca::bundleDir())  p_curl_easy_setopt(curl, CURLOPT_CAPATH, d);
 	// Signal-free timeouts: this can be called off the main thread, and
 	// libcurl's default SIGALRM/siglongjmp timeout path is not thread-safe
 	// (it aborts via __longjmp_chk when the signal lands on another
