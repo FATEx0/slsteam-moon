@@ -6,6 +6,7 @@
 
 #include "appinfopin.hpp"
 #include "cmclient.hpp"
+#include "compattool.hpp"
 #include "depotkey.hpp"
 #include "dlcids.hpp"
 #include "manifestid.hpp"
@@ -751,7 +752,9 @@ std::string steamRootForConfig()
 // `config/config.vdf`, so Steam runs them through Proton.  Best-effort,
 // text-level edit (same approach as DepotKey::disableShaderCache).  Only
 // adds entries that are missing; never overwrites a user's existing
-// choice.
+// choice.  Each entry uses the user's default Steam Play tool (the "0" key
+// of CompatToolMapping); Proton Experimental is only the fallback when no
+// default is configured.
 void injectProtonMappings()
 {
 	if (g_needProton.empty()) return;
@@ -792,6 +795,13 @@ void injectProtonMappings()
 	}
 	if (mapBrace == std::string::npos) return;
 
+	// Honour the user's default Steam Play compatibility tool (Settings ->
+	// Compatibility -> Default compatibility tool), stored as the special
+	// "0" key in this same block.  Fall back to Proton Experimental only
+	// when the user has not chosen a default.
+	std::string toolName = CompatTool::parseDefaultTool(content);
+	if (toolName.empty()) toolName = "proton_experimental";
+
 	int added = 0;
 	for (uint32_t appId : g_needProton)
 	{
@@ -806,7 +816,7 @@ void injectProtonMappings()
 		}
 		const std::string entry =
 			"\n\t\t\t\t\t\t" + key + "\n\t\t\t\t\t\t{\n"
-			"\t\t\t\t\t\t\t\"name\"\t\t\"proton_experimental\"\n"
+			"\t\t\t\t\t\t\t\"name\"\t\t\"" + toolName + "\"\n"
 			"\t\t\t\t\t\t\t\"config\"\t\t\"\"\n"
 			"\t\t\t\t\t\t\t\"priority\"\t\t\"250\"\n"
 			"\t\t\t\t\t\t}";
@@ -821,8 +831,8 @@ void injectProtonMappings()
 		if (!ofs.is_open()) return;
 		ofs << content;
 	}
-	g_pLog->infoOnce("AppInfoProvision: injected %d Proton CompatToolMapping entr%s into config.vdf\n",
-	             added, added == 1 ? "y" : "ies");
+	g_pLog->infoOnce("AppInfoProvision: injected %d Proton CompatToolMapping entr%s (tool=%s) into config.vdf\n",
+	             added, added == 1 ? "y" : "ies", toolName.c_str());
 }
 
 // ---------------------------------------------------------------------------
