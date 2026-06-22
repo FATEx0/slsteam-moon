@@ -48,11 +48,4 @@ namespace ManifestId
 	// Importer: scans `<Steam>/config/stplug-in/*.lua`, extracts every
 	// `setManifestid(<depotId>, "<gid>")` and ingests into the catalog.
 	void importLuaScripts();
-
-	// Rewrite the `manifests.public.gid` value for every depot id in
-	// the catalog that appears in `wireBuffer`.  Returns the modified
-	// buffer (or the original if no rewrite applied).  The wireBuffer
-	// is the v39-inline text-format KeyValues body sitting in
-	// `CMsgClientPICSProductInfoResponse.AppInfo.buffer`.
-	std::string applyToWireBuffer(const std::string& wireBuffer);
 }
