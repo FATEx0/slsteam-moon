@@ -468,6 +468,12 @@ bool pinAppinfoEnabled()
 	// env-gated.  Only LOCKED apps reach applyDepotGidPins (caller guards on
 	// isAppLocked), so a normal install is untouched.  SLSSTEAM_NO_APPINFO_PIN
 	// above stays as an opt-out escape hatch.
+	//
+	// Keeping it ON makes appinfo.vdf carry the pinned gid, so on a clean
+	// startup Steam's reconcile reads appinfo==installed==pin and SETTLES (no
+	// loop).  Turning it OFF was tried and REGRESSED the restart case: appinfo
+	// then reads the live gid, mismatching the installed pin on every boot ->
+	// loop without even installing (verified live, app 3525970).
 	return true;
 }
 

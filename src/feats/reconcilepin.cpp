@@ -53,9 +53,13 @@ namespace
 	void traceLog(uint32_t appId, uint32_t flags, void* base, int32_t count)
 	{
 		if (!g_trace) return;
-		if (g_traceBudget.fetch_sub(1) <= 0) return;
 		const bool added = g_config.isAddedAppId(appId);
 		const bool locked = g_config.isAppLocked(appId);
+		// Locked apps are the ones we're debugging: never let the global
+		// budget (exhausted by the startup batch of all apps) hide their
+		// reconcile calls, especially mid-loop.  Non-locked apps still
+		// respect the budget so the log doesn't flood.
+		if (!locked && g_traceBudget.fetch_sub(1) <= 0) return;
 		g_pLog->info("ReconcilePin[trace]: app=%u flags=0x%x added=%d locked=%d "
 		             "side=%s depots@%p count=%d\n",
 		             appId, flags, static_cast<int>(added),
