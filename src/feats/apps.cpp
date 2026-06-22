@@ -145,19 +145,32 @@ namespace
 		return out;
 	}
 
-	// True iff every pinned depot of `appId` is installed at its pinned gid.
+	// True iff every pinned depot Steam ACTUALLY installs is on its pinned
+	// gid.  A pin map can legitimately list depots Steam never mounts for this
+	// machine: a depot with no usable key, a different-OS depot, or one pruned
+	// from the public branch / dropped in a newer build than the pinned one.
+	// Such a depot is never in InstalledDepots, so requiring EVERY pinned depot
+	// to be installed made this return false forever -> shouldDisableUpdates
+	// never froze the app -> Steam re-planned endlessly (the scheduled/
+	// unscheduled "Update Required" loop, content_log "0 updated files").
+	// Only the pinned depots that are installed must match; require at least
+	// one so a not-yet-installed app doesn't freeze vacuously.
 	bool appAtPinnedGids(uint32_t appId)
 	{
 		const auto pins = g_config.getAppPinnedDepots(appId);
 		if (pins.empty()) return false;
 		const auto installed = installedDepotGids(appId);
 		if (installed.empty()) return false;
+
+		bool anyInstalledPinMatched = false;
 		for (const auto& [depot, gid] : pins)
 		{
 			const auto it = installed.find(depot);
-			if (it == installed.end() || it->second != gid) return false;
+			if (it == installed.end()) continue;   // depot not installed here
+			if (it->second != gid) return false;    // installed but wrong gid
+			anyInstalledPinMatched = true;
 		}
-		return true;
+		return anyInstalledPinMatched;
 	}
 }
 
