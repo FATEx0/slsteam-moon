@@ -107,8 +107,15 @@ public:
 		{
 			 return node[name].as<T>();
 		}
-		catch (YAML::BadConversion& er)
+		catch (...)
 		{
+			// Catch-all on purpose: an out-of-range scalar makes yaml-cpp
+			// throw YAML::TypedBadConversion<T>, a template subclass that is
+			// not tagged YAML_CPP_API. Catching the BadConversion base failed
+			// to match it under the release build (-O3 -flto), so the throw
+			// escaped and aborted Steam (a huge FakeWalletBalance bricked the
+			// client on every launch). catch (...) needs no RTTI base-walk and
+			// always contains it, matching the other loadSettings blocks.
 			//g_pLog->notify("Failed to parse value of %s! Using default\n", name);
 			setError(ELoadError::ParsingException);
 			return defVal;
