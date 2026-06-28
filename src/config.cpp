@@ -5,12 +5,33 @@
 #include "log.hpp"
 #include "yaml-cpp/yaml.h"
 
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+
+namespace
+{
+	// Non-throwing uint64 parse for pin gids.  std::stoull THROWS on an empty /
+	// non-numeric / overflowing string, and under the release build
+	// (-O3 -flto -freorder-blocks-and-partition) such a throw can escape the
+	// surrounding catch (the .cold-partition EH defect documented in
+	// config.hpp), aborting the client at startup.  Returns false on any bad
+	// input so the caller skips the entry instead of throwing.
+	bool parsePinGid(const std::string& s, uint64_t& out)
+	{
+		if (s.empty()) return false;
+		errno = 0;
+		char* end = nullptr;
+		const unsigned long long v = std::strtoull(s.c_str(), &end, 10);
+		if (errno != 0 || end == s.c_str() || *end != '\0') return false;
+		out = static_cast<uint64_t>(v);
+		return true;
+	}
+}
 
 
 std::string CConfig::getDir()
@@ -286,33 +307,56 @@ bool CConfig::loadSettings()
 
 	// ManifestPins: nested  appid -> { locked, depots: {depot: "gid"} }.
 	// gids are STRINGS (uint64 exceeds YAML int safety).  Missing key is fine.
+	//
+	// Parse defensively with non-throwing accessors and explicit node-type
+	// guards: a malformed block (a scalar where a map is expected, a stray
+	// "<depot>: gid" line at app level, a non-numeric gid) must be SKIPPED, not
+	// thrown.  The catch (...) below is a last resort only -- under the release
+	// build a yaml-cpp/std::stoull throw can escape it (the .cold-partition EH
+	// defect noted in config.hpp), which is exactly what aborts the client at
+	// startup, so we must not rely on it for routine bad input.
 	{
 		ManifestPins::PinMap pinMap;
 		const auto pinsNode = node["ManifestPins"];
-		if (pinsNode)
+		if (pinsNode && pinsNode.IsMap())
 		{
 			for (auto& appNode : pinsNode)
 			{
 				try
 				{
-					const uint32_t appId = appNode.first.as<uint32_t>();
+					const auto& idNode = appNode.first;
+					const auto& body = appNode.second;
+
+					// The app key must be a number; skip junk keys.
+					const uint32_t appId =
+					    idNode.IsScalar() ? idNode.as<uint32_t>(0) : 0;
+					if (appId == 0) continue;
+
+					// A pin entry is a map { locked, depots, ... }.  A scalar
+					// value here means a malformed/legacy line (e.g. a stray
+					// "<depot>: gid" emitted at app level) -- skip it instead of
+					// indexing a non-map node, which can throw.
+					if (!body.IsMap()) continue;
+
 					ManifestPins::AppPins app;
+					app.locked = body["locked"].as<bool>(false);
+					app.buildId = body["build_id"].as<uint32_t>(0);
 
-					const auto lockedNode = appNode.second["locked"];
-					if (lockedNode) app.locked = lockedNode.as<bool>();
-
-					const auto buildIdNode = appNode.second["build_id"];
-					if (buildIdNode) app.buildId = buildIdNode.as<uint32_t>();
-
-					const auto depotsNode = appNode.second["depots"];
-					if (depotsNode)
+					const auto depotsNode = body["depots"];
+					if (depotsNode.IsMap())
 					{
 						for (auto& d : depotsNode)
 						{
-							const uint32_t depotId = d.first.as<uint32_t>();
-							const uint64_t gid =
-							    std::stoull(d.second.as<std::string>());
-							app.depots[depotId] = gid;
+							if (!d.first.IsScalar() || !d.second.IsScalar())
+								continue;
+							const uint32_t depotId = d.first.as<uint32_t>(0);
+							if (depotId == 0) continue;
+							uint64_t gid = 0;
+							if (parsePinGid(d.second.as<std::string>(""), gid) &&
+							    gid != 0)
+							{
+								app.depots[depotId] = gid;
+							}
 						}
 					}
 					pinMap[appId] = app;
