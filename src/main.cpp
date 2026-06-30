@@ -103,6 +103,14 @@ static bool setupSuccess = false;
 // which is what keeps the Lumen sidecar reconnecting to the same endpoint.
 static uint16_t g_cefSessionPort = 0;
 
+// When true, we deliberately leave Steam's CEF endpoint on its hard-coded 8080
+// instead of rewriting it to an ephemeral port. Set in setup() when Decky
+// Loader is present: Decky's injector is hard-coded to 8080 and can't follow
+// our port, so we share 8080 (Lumen falls back to it). This gates BOTH the
+// setup() port pick and the exec-time rewrite (cefRewriteArgv), so the lazy
+// fallback resolve in the exec hook can't pick a port behind our back.
+static bool g_cefKeepDefaultPort = false;
+
 static void setup()
 {
 	lm_process_t proc {};
@@ -157,15 +165,33 @@ static void setup()
 	// and publish it later, from the exec hook, when THIS tree actually launches
 	// the webhelper (see cefRewriteArgv). resolveSessionPortNoPersist reuses a
 	// still-bindable port from a previous session, else picks a fresh one.
-	g_cefSessionPort = CefPort::resolveSessionPortNoPersist(CefPort::contractPath());
-	if (g_cefSessionPort != 0)
+	//
+	// EXCEPTION — Decky coexistence: Decky Loader's injector is hard-coded to
+	// localhost:8080 and runs as a persistent daemon, so it can't follow our
+	// ephemeral port. When Decky is installed we leave CEF on 8080 (no rewrite,
+	// no contract) and let Lumen fall back to 8080; both share the endpoint
+	// (multiple CDP clients coexist on one CEF target — verified on Bazzite). We
+	// also drop any STALE contract from a previous ephemeral session so Lumen
+	// doesn't connect to a dead port instead of falling back to 8080.
+	if (CefPort::deckyPresent())
 	{
-		g_pLog->info("CEF: remote-debugging port -> %u (frees 8080); published when this client launches the webhelper\n",
-		             g_cefSessionPort);
+		g_cefKeepDefaultPort = true;
+		g_cefSessionPort = 0;
+		CefPort::removeContract(CefPort::contractPath());
+		g_pLog->info("CEF: Decky Loader detected -> keeping debug port on 8080 (not rewriting); Lumen + Decky share it\n");
 	}
 	else
 	{
-		g_pLog->warn("CEF: could not pick a debug port; Steam will keep 8080\n");
+		g_cefSessionPort = CefPort::resolveSessionPortNoPersist(CefPort::contractPath());
+		if (g_cefSessionPort != 0)
+		{
+			g_pLog->info("CEF: remote-debugging port -> %u (frees 8080); published when this client launches the webhelper\n",
+			             g_cefSessionPort);
+		}
+		else
+		{
+			g_pLog->warn("CEF: could not pick a debug port; Steam will keep 8080\n");
+		}
 	}
 
 	// Splice cached PICS buffers into appcache/appinfo.vdf before
@@ -547,6 +573,15 @@ namespace
 	char** cefRewriteArgv(char* const argv[])
 	{
 		if (!argv)
+		{
+			return nullptr;
+		}
+
+		// Decky coexistence: leave Steam on its hard-coded 8080 — no rewrite, no
+		// contract. Gating here (not just via g_cefSessionPort) is essential: the
+		// lazy fallback below would otherwise pick a fresh ephemeral port and
+		// rewrite anyway.
+		if (g_cefKeepDefaultPort)
 		{
 			return nullptr;
 		}

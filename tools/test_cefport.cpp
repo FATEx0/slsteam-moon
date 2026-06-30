@@ -260,10 +260,49 @@ static void test_ports()
 	}
 }
 
+static void test_decky()
+{
+	const std::string tag = std::to_string(getpid());
+	const std::string home = "/tmp/cefport_decky_" + tag;
+	std::error_code ec;
+	std::filesystem::remove_all(home, ec);
+
+	// No homebrew tree at all -> not present.
+	std::filesystem::create_directories(home, ec);
+	CHECK(!CefPort::deckyPresent(home), "decky: absent when no homebrew tree");
+
+	// homebrew/services exists but no PluginLoader binary -> not present.
+	std::filesystem::create_directories(home + "/homebrew/services", ec);
+	CHECK(!CefPort::deckyPresent(home), "decky: absent when services dir empty");
+
+	// The canonical Decky marker present -> detected.
+	{ std::ofstream(home + "/homebrew/services/PluginLoader") << "x"; }
+	CHECK(CefPort::deckyPresent(home), "decky: present when PluginLoader exists");
+
+	// Empty home string -> never crashes, returns false.
+	CHECK(!CefPort::deckyPresent(std::string("")), "decky: empty home -> false");
+
+	std::filesystem::remove_all(home, ec);
+
+	// removeContract: deletes an existing contract, idempotent on a missing one,
+	// and a no-op (no throw) on an empty path.
+	{
+		const std::string path = "/tmp/cefport_contract_" + tag;
+		{ std::ofstream(path) << "12345\n"; }
+		CHECK(std::ifstream(path).good(), "removeContract: file exists pre-remove");
+		CefPort::removeContract(path);
+		CHECK(!std::ifstream(path).good(), "removeContract: file gone post-remove");
+		CefPort::removeContract(path); // idempotent, no throw
+		CefPort::removeContract("");   // empty path, no throw
+		CHECK(true, "removeContract: idempotent + empty-path safe");
+	}
+}
+
 int main()
 {
 	test_rewrite();
 	test_ports();
+	test_decky();
 
 	if (g_failures == 0) { std::printf("test_cefport: ALL PASS (%d checks)\n", g_checks); return 0; }
 	std::printf("test_cefport: %d/%d CHECK(S) FAILED\n", g_failures, g_checks);

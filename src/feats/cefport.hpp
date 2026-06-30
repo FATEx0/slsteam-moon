@@ -14,7 +14,13 @@
 // This header holds the parts worth unit-testing in isolation:
 //   - rewritePortArg : the string surgery on one argv element
 //   - isBindable / pickFreePort / resolveSessionPort : free-port selection
+//   - deckyPresent / removeContract : Decky-coexistence gate (keep 8080)
 // The actual exec interposition lives in main.cpp.
+//
+// Decky coexistence: when Decky Loader is installed we must NOT move CEF off
+// 8080 (Decky's injector is hard-coded to it). main.cpp::setup() then leaves
+// the port alone and Lumen falls back to 8080 too; both share the endpoint.
+// See .kiro/research/decky-coexistence.md.
 
 #include <cctype>
 #include <cstdint>
@@ -217,5 +223,53 @@ namespace CefPort
 			return "";
 		}
 		return std::string(home) + "/.local/share/Lumen/cef_port";
+	}
+
+	// True when Decky Loader is installed for this user. Decky's injector is
+	// HARD-CODED to http://localhost:8080 (decky_loader/injector.py
+	// BASE_ADDRESS) and runs as a persistent root daemon polling 8080 in BOTH
+	// Desktop and Game Mode, so it cannot follow our ephemeral port. When Decky
+	// is present we must NOT move Steam's CEF endpoint off 8080: instead we
+	// leave it on the default and let Lumen fall back to 8080 too (verified on a
+	// Bazzite box: multiple CDP clients coexist on one CEF target, so Decky and
+	// Lumen share 8080 without either kicking the other).
+	//
+	// Marker: the canonical Decky install drops its loader binary at
+	// $HOME/homebrew/services/PluginLoader (user-readable, no root needed; the
+	// decky-installer uninstall removes it). `home` is taken as a parameter so
+	// the check is unit-testable against a synthetic fixture.
+	inline bool deckyPresent(const std::string& home)
+	{
+		if (home.empty())
+		{
+			return false;
+		}
+		std::error_code ec;
+		return std::filesystem::exists(home + "/homebrew/services/PluginLoader", ec);
+	}
+
+	inline bool deckyPresent()
+	{
+		const char* home = std::getenv("HOME");
+		if (!home || !*home)
+		{
+			return false;
+		}
+		return deckyPresent(std::string(home));
+	}
+
+	// Best-effort removal of the Lumen contract file. Called when we decide to
+	// keep CEF on 8080 (Decky coexistence): a STALE contract left by a previous
+	// ephemeral-port session would otherwise make Lumen connect to a dead port
+	// instead of falling back to 8080. Idempotent; safe under concurrent
+	// instances (both just unlink the same path).
+	inline void removeContract(const std::string& path)
+	{
+		if (path.empty())
+		{
+			return;
+		}
+		std::error_code ec;
+		std::filesystem::remove(path, ec); // best effort
 	}
 }
