@@ -217,6 +217,47 @@ static void test_ports()
 		const uint16_t p = CefPort::resolveSessionPort("");
 		CHECK(p >= 1024 && CefPort::isBindable(p), "empty path -> port without persistence");
 	}
+
+	// NoPersist variant: never writes the contract file (the client publishes it
+	// later, from the exec hook, so a concurrent losing Steam instance at login
+	// can't clobber it). Missing file in -> port out, file still absent.
+	{
+		const std::string path = "/tmp/cefport_nopersist_" + tag;
+		::unlink(path.c_str());
+		const uint16_t p = CefPort::resolveSessionPortNoPersist(path);
+		CHECK(p >= 1024 && CefPort::isBindable(p), "no-persist -> fresh bindable port");
+		CHECK(!std::ifstream(path).good(), "no-persist -> contract file NOT written");
+		::unlink(path.c_str());
+	}
+
+	// NoPersist still reuses a valid free port from the file (session/restart
+	// stability) without rewriting it.
+	{
+		const std::string path = "/tmp/cefport_nopersist_reuse_" + tag;
+		const uint16_t free = CefPort::pickFreePort();
+		{ std::ofstream(path) << free << "\n"; }
+		CHECK(CefPort::resolveSessionPortNoPersist(path) == free, "no-persist reuses valid free port");
+		CHECK(readLine(path) == std::to_string(free), "no-persist leaves file unchanged");
+		::unlink(path.c_str());
+	}
+
+	// NoPersist rotates off an occupied port (picks a different bindable one),
+	// again without persisting the choice.
+	{
+		const std::string path = "/tmp/cefport_nopersist_busy_" + tag;
+		int s = ::socket(AF_INET, SOCK_STREAM, 0);
+		sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
+		::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+		socklen_t len = sizeof(a); ::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len);
+		::listen(s, 1);
+		const uint16_t busy = ntohs(a.sin_port);
+		{ std::ofstream(path) << busy << "\n"; }
+		const uint16_t p = CefPort::resolveSessionPortNoPersist(path);
+		CHECK(p != busy && p >= 1024 && CefPort::isBindable(p), "no-persist rotates off occupied port");
+		CHECK(readLine(path) == std::to_string(busy), "no-persist leaves occupied file unchanged");
+		::close(s);
+		::unlink(path.c_str());
+	}
 }
 
 int main()

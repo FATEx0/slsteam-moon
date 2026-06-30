@@ -164,6 +164,29 @@ namespace CefPort
 		return static_cast<bool>(f);
 	}
 
+	// Decide the port to use this session WITHOUT persisting it: reuse the
+	// file's port if it is a valid, currently-bindable port; otherwise pick a
+	// fresh free port. Returns 0 only if no port could be obtained at all.
+	//
+	// This is the variant the client uses at la_preinit (setup()) to choose the
+	// session port early, WITHOUT touching the contract file. The file is
+	// written later, only when this client tree actually launches the webhelper
+	// (see main.cpp). That matters at login autostart, where two Steam instances
+	// can start concurrently: both run setup(), but only the one that wins the
+	// single-instance race goes on to spawn a webhelper. If setup() itself wrote
+	// the contract, the LOSING instance (which picks a different free port, then
+	// exits before spawning anything) would clobber it with a port nothing ends
+	// up listening on, and the Lumen sidecar would connect to a dead port.
+	inline uint16_t resolveSessionPortNoPersist(const std::string& path)
+	{
+		const uint16_t existing = readPortFile(path);
+		if (existing != 0 && isBindable(existing))
+		{
+			return existing;
+		}
+		return pickFreePort();
+	}
+
 	// Resolve the port to use this session: reuse the file's port if it is a
 	// valid, currently-bindable port; otherwise pick a fresh free port and
 	// persist it. Returns 0 only if no port could be obtained at all (caller

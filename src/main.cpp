@@ -145,19 +145,23 @@ static void setup()
 	}
 
 	// Decide this session's CEF debug port ONCE, as EARLY as possible (this is
-	// la_preinit, before the client can spawn the webhelper) and publish it to
-	// the contract file the Lumen sidecar reads. Picking it here — not in the
-	// ephemeral fork-child that execs the webhelper, nor at the end of load()
-	// after the slow CM provisioning — means g_cefSessionPort is already set
-	// when the exec hook fires, so the live CEF port and the contract file can
-	// never diverge, and the port stays fixed across webhelper restarts.
-	// resolveSessionPort reuses a still-bindable port from a previous session,
-	// else picks a fresh free loopback port.
-	g_cefSessionPort = CefPort::resolveSessionPort(CefPort::contractPath());
+	// la_preinit, before the client can spawn the webhelper) so g_cefSessionPort
+	// is already set when the exec hook fires and stays fixed across webhelper
+	// restarts. We deliberately do NOT write the contract file here: at login
+	// autostart two Steam instances can run setup() concurrently, and only the
+	// one that wins Steam's single-instance race goes on to spawn a webhelper.
+	// Writing the contract here would let the LOSING instance (which picks a
+	// different free port, then exits before launching anything) overwrite it
+	// with a port nothing ends up listening on — the Lumen sidecar would then
+	// connect to a dead port and never inject. So we only resolve the port now
+	// and publish it later, from the exec hook, when THIS tree actually launches
+	// the webhelper (see cefRewriteArgv). resolveSessionPortNoPersist reuses a
+	// still-bindable port from a previous session, else picks a fresh one.
+	g_cefSessionPort = CefPort::resolveSessionPortNoPersist(CefPort::contractPath());
 	if (g_cefSessionPort != 0)
 	{
-		g_pLog->info("CEF: remote-debugging port -> %u (frees 8080), published to %s\n",
-		             g_cefSessionPort, CefPort::contractPath().c_str());
+		g_pLog->info("CEF: remote-debugging port -> %u (frees 8080); published when this client launches the webhelper\n",
+		             g_cefSessionPort);
 	}
 	else
 	{
@@ -565,17 +569,36 @@ namespace
 		static uint16_t port = 0;
 		if (port == 0)
 		{
-			// Prefer the session port decided in load() (stable across webhelper
+			// Prefer the session port decided in setup() (stable across webhelper
 			// restarts). Fall back to a lazy resolve only if a webhelper launch
-			// somehow beats load() (it shouldn't: the UI/webhelper come up well
-			// after steamclient.so maps).
+			// somehow beats setup() (it shouldn't: the UI/webhelper come up well
+			// after steamclient.so maps). Neither path writes the contract here;
+			// publishing happens below, once, when we actually rewrite the arg.
 			port = g_cefSessionPort != 0
 			           ? g_cefSessionPort
-			           : CefPort::resolveSessionPort(CefPort::contractPath());
+			           : CefPort::resolveSessionPortNoPersist(CefPort::contractPath());
 		}
 		if (port == 0)
 		{
 			return nullptr; // no port available: leave Steam on 8080
+		}
+
+		// Publish the contract file the Lumen sidecar reads — NOW, because this
+		// client tree is actually launching the webhelper, so `port` is the live
+		// CEF port. Writing here (not in setup()) is what makes the contract
+		// robust against a concurrent second Steam instance at login: that loser
+		// runs setup() but exits at the single-instance lock before ever reaching
+		// this exec hook, so it never overwrites the contract. Idempotent within
+		// the tree (guarded); contract == live by construction.
+		static bool published = false;
+		if (!published && CefPort::writePortFile(CefPort::contractPath(), port))
+		{
+			published = true;
+			if (g_pLog)
+			{
+				g_pLog->info("CEF: published debug port %u to %s\n",
+				             port, CefPort::contractPath().c_str());
+			}
 		}
 
 		char** out = static_cast<char**>(std::malloc(sizeof(char*) * (n + 1)));
