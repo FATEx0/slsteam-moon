@@ -35,6 +35,40 @@ namespace
 {
 
 std::atomic<bool> g_providersOffline{false};
+
+void setOfflineStatus(bool offline)
+{
+	const char* home = std::getenv("HOME");
+	if (!home) return;
+	std::string path = std::string(home) + "/.config/SLSsteam/offline";
+	if (offline)
+	{
+		std::ofstream f(path);
+		if (f.is_open())
+		{
+			f << "1\n";
+		}
+	}
+	else
+	{
+		std::remove(path.c_str());
+	}
+}
+
+struct OfflineCleaner
+{
+	OfflineCleaner()
+	{
+		const char* home = std::getenv("HOME");
+		if (home)
+		{
+			std::string path = std::string(home) + "/.config/SLSsteam/offline";
+			std::remove(path.c_str());
+		}
+	}
+};
+static OfflineCleaner g_offlineCleaner;
+
 std::atomic<int> g_consecutiveNetworkErrors{0};
 std::mutex g_checkerLock;
 std::chrono::steady_clock::time_point g_lastCheckTime{};
@@ -297,6 +331,7 @@ std::optional<uint64_t> runOnce(uint64_t gid, uint32_t appId, uint32_t depotId)
 				{
 					g_pLog->info("ManifestFetch: manifest providers are back online! Resetting circuit breaker.\n");
 					g_providersOffline.store(false);
+					setOfflineStatus(false);
 					g_consecutiveNetworkErrors.store(0);
 				}
 				else
@@ -381,6 +416,7 @@ std::optional<uint64_t> runOnce(uint64_t gid, uint32_t appId, uint32_t depotId)
 			g_lastCheckTime = std::chrono::steady_clock::now();
 		}
 		g_providersOffline.store(true);
+		setOfflineStatus(true);
 		g_pLog->info("ManifestFetch: circuit breaker triggered, manifest providers marked offline\n");
 	}
 
