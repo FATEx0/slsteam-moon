@@ -350,7 +350,16 @@ namespace
 		}
 
 		// Case 2: the planned gid is unavailable anywhere (the live public
-		// build is newer than anything we hold).  Fall back to a DIFFERENT
+		// build is newer than anything we hold).
+		// ONLY fall back to a different local/archived GID if the manifest
+		// providers are offline (circuit breaker active).  If providers are online,
+		// let Steam request the request-code and download the real manifest.
+		if (!ManifestFetch::areProvidersOffline())
+		{
+			return manifestId;
+		}
+
+		// Fall back to a DIFFERENT
 		// gid for the depot -- newest in depotcache, else newest archived
 		// in the store (restored into depotcache).
 		uint64_t alt = findLocalAltGid(dc, depotId, manifestId);

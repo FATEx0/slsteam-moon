@@ -781,4 +781,9 @@ void discard(uint64_t jobId)
 	g_pending.erase(jobId);
 }
 
+bool areProvidersOffline()
+{
+	return g_providersOffline.load();
+}
+
 } // namespace ManifestFetch

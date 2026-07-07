@@ -56,4 +56,6 @@ namespace ManifestFetch
 	std::optional<uint64_t> resolve(uint64_t jobId);
 
 	void discard(uint64_t jobId);
+
+	bool areProvidersOffline();
 }
