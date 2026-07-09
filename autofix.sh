@@ -19,7 +19,12 @@
 set -u
 
 REPO="swwayps/slsteam-moon"
-ASSET_RE='slsteam-moon-linux-[^"]*-lumen\.zip'
+# Asset name matcher. jq's test() sees the parsed .name (no surrounding quotes),
+# so it uses '.*'; the grep fallback scans raw JSON, so it uses '[^"]*' to avoid
+# crossing a quote. Both use '[.]' for a literal dot (a bare '\.' is not a valid
+# jq string escape and a raw '"' inside a jq "..." string breaks the parse).
+ASSET_RE_JQ='slsteam-moon-linux-.*-lumen[.]zip'
+ASSET_RE_GREP='slsteam-moon-linux-[^"]*-lumen[.]zip'
 SLSDIR="$HOME/.local/share/SLSsteam"
 WRAPPER="$SLSDIR/path/steam"
 
@@ -54,10 +59,10 @@ RELEASES_JSON="$(curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 \
 if command -v jq >/dev/null 2>&1; then
 	URL="$(printf '%s' "$RELEASES_JSON" | jq -r \
 		'[.[] | select(.draft==false) | .assets[]?
-		  | select(.name|test("'"$ASSET_RE"'")) | .browser_download_url] | .[0] // empty')"
+		  | select(.name|test("'"$ASSET_RE_JQ"'")) | .browser_download_url] | .[0] // empty')"
 else
 	URL="$(printf '%s' "$RELEASES_JSON" \
-		| grep -oE '"browser_download_url":[[:space:]]*"[^"]*'"$ASSET_RE"'"' \
+		| grep -oE '"browser_download_url":[[:space:]]*"[^"]*'"$ASSET_RE_GREP"'"' \
 		| sed -E 's/.*"(https[^"]+)"$/\1/' | head -n1)"
 fi
 [ -n "${URL:-}" ] || die "Could not find a slsteam-moon (Lumen) release asset."
