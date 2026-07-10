@@ -21,12 +21,27 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <sys/stat.h>
 
 
 namespace
 {
+	void setGameOfflineStatus(uint32_t appId, bool offline)
+	{
+		if (!appId) return;
+		std::string path = g_config.getDir() + "/offline_" + std::to_string(appId);
+		if (offline)
+		{
+			std::ofstream ofs(path, std::ios::trunc);
+			if (ofs.is_open()) ofs << "1";
+		}
+		else
+		{
+			std::remove(path.c_str());
+		}
+	}
 	// Two cooperating detours in CDepotDownloadMgr (see patterns.cpp
 	// CDepotDownloadMgr for the full RE).  Both share this 7-dword cdecl
 	// signature:
@@ -352,9 +367,11 @@ namespace
 		// Case 2: the planned gid is unavailable anywhere (the live public
 		// build is newer than anything we hold).
 		// ONLY fall back to a different local/archived GID if the manifest
-		// providers are offline (circuit breaker active).  If providers are online,
-		// let Steam request the request-code and download the real manifest.
-		if (!ManifestFetch::areProvidersOffline())
+		// providers are offline (circuit breaker active) OR if this specific GID
+		// was not found on the server (404).  If providers are online and GID is not
+		// known to be missing, let Steam request the request-code and download the
+		// real manifest.
+		if (!ManifestFetch::areProvidersOffline() && !ManifestFetch::isGidNotFound(manifestId))
 		{
 			return manifestId;
 		}
@@ -369,6 +386,8 @@ namespace
 			if (alt) ManifestStore::restoreToDepotcache(depotId, alt);
 		}
 		if (!alt) return manifestId;
+
+		setGameOfflineStatus(appId, true);
 
 		g_pLog->info(
 		    "ManifestBind[%s]: depot=%u public gid=%llu not staged; "
@@ -413,32 +432,53 @@ namespace
 		{
 			const auto p = reinterpret_cast<char*>(depots);
 			char* const base = *reinterpret_cast<char* const*>(p + kVecBaseOff);
-			const int32_t count =
-			    *reinterpret_cast<const int32_t*>(p + kVecCountOff);
+			auto* const countPtr = reinterpret_cast<int32_t*>(p + kVecCountOff);
+			const int32_t count = *countPtr;
 
 			if (base && count > 0 && count <= 4096)
 			{
+				int32_t writeIdx = 0;
 				for (int32_t i = 0; i < count; ++i)
 				{
 					char* e = base + static_cast<size_t>(i) * kDepotEntryStride;
 					const uint32_t depotId =
 					    *reinterpret_cast<const uint32_t*>(e);
-					const uint64_t pin = g_config.getManifestPin(depotId);
-					if (!pin) continue;
+					const uint64_t size =
+					    *reinterpret_cast<const uint64_t*>(e + kDepotEntrySizeOff);
 
-					auto* gidp =
-					    reinterpret_cast<uint64_t*>(e + kDepotEntryGidOff);
-					if (g_pinPlanner && *gidp != pin)
+					if (size == 0 && DepotKey::isManagedDepot(depotId))
 					{
 						g_pLog->info(
-						    "ManifestBind[build]: depot=%u plan gid=%llu -> pinned "
-						    "gid=%llu (DepotEntry patch)\n",
-						    depotId,
-						    static_cast<unsigned long long>(*gidp),
-						    static_cast<unsigned long long>(pin));
-						*gidp = pin;
+						    "ManifestBind[build]: dropping empty depot %u (size 0) from plan\n",
+						    depotId);
+						continue;
 					}
+
+					const uint64_t pin = g_config.getManifestPin(depotId);
+					if (pin)
+					{
+						auto* gidp =
+						    reinterpret_cast<uint64_t*>(e + kDepotEntryGidOff);
+						if (g_pinPlanner && *gidp != pin)
+						{
+							g_pLog->info(
+							    "ManifestBind[build]: depot=%u plan gid=%llu -> pinned "
+							    "gid=%llu (DepotEntry patch)\n",
+							    depotId,
+							    static_cast<unsigned long long>(*gidp),
+							    static_cast<unsigned long long>(pin));
+							*gidp = pin;
+						}
+					}
+
+					if (writeIdx != i)
+					{
+						char* dest = base + static_cast<size_t>(writeIdx) * kDepotEntryStride;
+						std::memcpy(dest, e, kDepotEntryStride);
+					}
+					++writeIdx;
 				}
+				*countPtr = writeIdx;
 			}
 			else
 			{

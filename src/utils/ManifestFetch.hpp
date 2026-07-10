@@ -58,4 +58,6 @@ namespace ManifestFetch
 	void discard(uint64_t jobId);
 
 	bool areProvidersOffline();
+	bool isGidNotFound(uint64_t gid);
+	void markGidNotFound(uint64_t gid);
 }

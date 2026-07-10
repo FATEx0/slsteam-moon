@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <future>
 #include <map>
 #include <mutex>
@@ -25,6 +26,7 @@
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 
@@ -35,6 +37,21 @@ namespace
 {
 
 std::atomic<bool> g_providersOffline{false};
+
+std::mutex g_notFoundLock;
+std::unordered_set<uint64_t> g_notFoundGids;
+
+void markGidNotFoundInternal(uint64_t gid)
+{
+	std::lock_guard<std::mutex> lk(g_notFoundLock);
+	g_notFoundGids.insert(gid);
+}
+
+bool isGidNotFoundInternal(uint64_t gid)
+{
+	std::lock_guard<std::mutex> lk(g_notFoundLock);
+	return g_notFoundGids.count(gid) > 0;
+}
 
 void setOfflineStatus(bool offline)
 {
@@ -64,6 +81,18 @@ struct OfflineCleaner
 		{
 			std::string path = std::string(home) + "/.config/SLSsteam/offline";
 			std::remove(path.c_str());
+			std::string dir = std::string(home) + "/.config/SLSsteam";
+			if (std::filesystem::exists(dir))
+			{
+				std::error_code ec;
+				for (auto& entry : std::filesystem::directory_iterator(dir, ec))
+				{
+					if (entry.is_regular_file() && entry.path().filename().string().rfind("offline_", 0) == 0)
+					{
+						std::filesystem::remove(entry.path(), ec);
+					}
+				}
+			}
 		}
 	}
 };
@@ -363,6 +392,7 @@ std::optional<uint64_t> runOnce(uint64_t gid, uint32_t appId, uint32_t depotId)
 		return std::nullopt;
 	}
 
+	bool hasNetworkOrServerError = false;
 	for (std::size_t i = 0; i < chain.size(); ++i)
 	{
 		const auto& tmpl = chain[i];
@@ -378,6 +408,7 @@ std::optional<uint64_t> runOnce(uint64_t gid, uint32_t appId, uint32_t depotId)
 			g_pLog->info("ManifestFetch: gid=%llu provider %zu net err '%s', trying next\n",
 			             static_cast<unsigned long long>(gid),
 			             i + 1, resp.diagnostic.c_str());
+			hasNetworkOrServerError = true;
 			continue;
 		}
 		if (resp.status != 200)
@@ -385,6 +416,14 @@ std::optional<uint64_t> runOnce(uint64_t gid, uint32_t appId, uint32_t depotId)
 			g_pLog->info("ManifestFetch: gid=%llu provider %zu HTTP=%ld body_bytes=%zu, trying next\n",
 			             static_cast<unsigned long long>(gid),
 			             i + 1, resp.status, resp.body.size());
+			if (resp.status == 404)
+			{
+				markGidNotFoundInternal(gid);
+			}
+			else if (resp.status >= 500)
+			{
+				hasNetworkOrServerError = true;
+			}
 			continue;
 		}
 		uint64_t code = 0;
@@ -408,16 +447,19 @@ std::optional<uint64_t> runOnce(uint64_t gid, uint32_t appId, uint32_t depotId)
 	g_pLog->info("ManifestFetch: gid=%llu all %zu providers exhausted\n",
 	             static_cast<unsigned long long>(gid), chain.size());
 
-	int currentErrors = g_consecutiveNetworkErrors.fetch_add(1) + 1;
-	if (currentErrors >= 2)
+	if (hasNetworkOrServerError)
 	{
+		int currentErrors = g_consecutiveNetworkErrors.fetch_add(1) + 1;
+		if (currentErrors >= 2)
 		{
-			std::lock_guard<std::mutex> lk(g_checkerLock);
-			g_lastCheckTime = std::chrono::steady_clock::now();
+			{
+				std::lock_guard<std::mutex> lk(g_checkerLock);
+				g_lastCheckTime = std::chrono::steady_clock::now();
+			}
+			g_providersOffline.store(true);
+			setOfflineStatus(true);
+			g_pLog->info("ManifestFetch: circuit breaker triggered, manifest providers marked offline\n");
 		}
-		g_providersOffline.store(true);
-		setOfflineStatus(true);
-		g_pLog->info("ManifestFetch: circuit breaker triggered, manifest providers marked offline\n");
 	}
 
 	// No user notification here: when the request-code providers are down the
@@ -784,6 +826,16 @@ void discard(uint64_t jobId)
 bool areProvidersOffline()
 {
 	return g_providersOffline.load();
+}
+
+bool isGidNotFound(uint64_t gid)
+{
+	return isGidNotFoundInternal(gid);
+}
+
+void markGidNotFound(uint64_t gid)
+{
+	markGidNotFoundInternal(gid);
 }
 
 } // namespace ManifestFetch
