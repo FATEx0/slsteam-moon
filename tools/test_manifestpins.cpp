@@ -1,4 +1,4 @@
-// Standalone test for the pure ManifestPins container logic (design §3/§4).
+// Standalone test for the pure ManifestPins container logic.
 // Build (from repo root):
 //   g++ -std=c++20 -I include tools/test_manifestpins.cpp -o /tmp/test_manifestpins && /tmp/test_manifestpins
 #include "../src/feats/manifestpins.hpp"

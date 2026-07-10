@@ -6,10 +6,8 @@
 // dragging in openssl / config / the rest of the logger.  Owns the single
 // definition of LogLevel (log.hpp includes this header for it).
 //
-// HANDOFF 2026-06-05 fix: the old Warn branch emitted
-// `notify-send -u "critical"` with NO `-t`.  freedesktop urgency=critical
-// notifications are "resident" — GNOME/Zorin's daemon ignores the expire
-// timeout for them, so every warn-level popup stayed on screen forever.
+// Note: urgency=critical notifications are "resident" in some desktop environments
+// and ignore the expire timeout, staying on screen forever if no timeout is specified.
 // Here every notifying level gets an explicit timeout AND a non-critical
 // urgency, so they all auto-dismiss.
 

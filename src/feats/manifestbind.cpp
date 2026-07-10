@@ -73,7 +73,7 @@ namespace
 	//   (void* ctx, uint32_t flag, CUtlVector<DepotEntry>* depots, uint32_t a3)
 	using BuildDepFn_t = void*(*)(void*, uint32_t, void*, uint32_t);
 
-	// DepotEntry layout (confirmed §11/§12, OpenSteamTool Structs.h verbatim):
+	// DepotEntry layout (matching OpenSteamTool Structs.h):
 	//   +0x00 u32 DepotId   +0x08 u64 ManifestGid   +0x10 u64 ManifestSize
 	//   +0x18 u32 DlcAppId   +0x1c u8 Lcs   +0x1d u8 bNotNewTarget
 	//   +0x1e u8 SharedInstall ; stride 0x20.
@@ -108,11 +108,11 @@ namespace
 
 	bool g_fallbackEnabled = true;
 	// Patch the depot gid in the install plan so Steam commits the pinned build
-	// for LOCKED apps (§13).  DEFAULT ON: the pin is config-driven (ManifestPins
+	// for LOCKED apps.  DEFAULT ON: the pin is config-driven (ManifestPins
 	// locked apps), no longer env-gated; a non-pinned depot is a no-op because
-	// getManifestPin returns 0.  The appinfo depot-gid pin (appinfopin.hpp) keeps
-	// update-check/plan/commit/reconcile agreeing on the pinned gid so it no
-	// longer loops.  SLSSTEAM_PIN_PLANNER=0 is an explicit opt-out for testing.
+	// getManifestPin returns 0.  The post-commit reconcile applies the pinned
+	// target so update-check/plan/commit/reconcile agree on the pinned gid and
+	// it no longer loops.  SLSSTEAM_PIN_PLANNER=0 is an explicit opt-out for testing.
 	bool g_pinPlanner = true;
 
 	// --- DIAGNOSTIC: install-planner runtime trace (env SLSSTEAM_PLAN_TRACE) -
@@ -132,7 +132,7 @@ namespace
 	// a `call` instruction (0xE8 rel32 at V-5, or 0xFF /2..3 at V-2/V-3) — a
 	// safe, allocation-free, unwinder-free "poor man's backtrace".  Each hit is
 	// logged as a steamclient-relative VA (V - base), directly comparable to
-	// the §11 ELF VAs.  The consumer sub_FDFD00's frame and, crucially, ITS
+	// the ELF VAs.  The consumer sub_FDFD00's frame and, crucially, ITS
 	// caller (the builder/scheduler) appear in the scan window.
 	//
 	// Gated behind the env var so a normal session pays nothing; capped per
@@ -284,8 +284,8 @@ namespace
 	uint64_t redirectGid(const char* site, uint32_t appId, uint32_t depotId,
 	                     uint64_t manifestId)
 	{
-		// Explicit pin (design §4.2): the pin is TARGET-ONLY.  Ensure the
-		// pinned manifest is STAGED on disk (so the FUNC_1141-patched plan and
+		// Explicit pin: the pin is TARGET-ONLY.  Ensure the
+		// pinned manifest is STAGED on disk (so the patched plan and
 		// ReconcilePin's reconcile target can fetch it) but DO NOT redirect the
 		// gid here.
 		//
@@ -295,8 +295,7 @@ namespace
 		// the pinned manifest instead made it diff pinned-vs-pinned -> 0 chunks
 		// -> a 0-file commit -> the real content (e.g. the build-locked exe a
 		// crack validates) was NEVER downloaded, even though Steam recorded the
-		// pinned gid and reported "Fully Installed" (proven live, HANDOFF-v2
-		// §8; predicted by NEXT-STEPS §3.1).  The pin belongs ONLY on the
+		// pinned gid and reported "Fully Installed" (confirmed in testing).  The pin belongs ONLY on the
 		// TARGET (FUNC_1141 plan DepotEntry + feats/reconcilepin.cpp's reconcile
 		// target pass), never on this acquisition/active path.  Leaving the
 		// real gid here lets Steam load the genuine public active manifest,
@@ -420,7 +419,7 @@ namespace
 	// Steam decides the depot gid + build it installs/commits from the
 	// already-built DepotEntry vector this function consumes; redirecting the
 	// gid downstream (ProcessDepotManifest/PrepareDepotDownload) only changes
-	// which .manifest is fetched, NOT the committed gid (proven, §3).  Here we
+	// which .manifest is fetched, NOT the committed gid (confirmed in testing).  Here we
 	// overwrite depots[i].ManifestGid for any pinned depot BEFORE the original
 	// runs, so the planned-gid copy (ctx+0x664) and the commit see the pin.
 	//

@@ -11,8 +11,7 @@
 //
 // The old slsteam patterns hard-code <ROOT>. That id drifts whenever Steam
 // adds/removes a method on the interface, so every such update broke the load
-// and needed a manual re-derivation (see
-// .kiro/research/slsteam-pattern-refresh-2026-06-23.md). Instead we locate
+// and needed a manual re-derivation. Instead we locate
 // EVERY candidate of the generic shape and pick the one whose root is
 // numerically NEAREST a per-interface seed, tolerating the small id drift.
 //
@@ -50,7 +49,7 @@ static int g_checks = 0;
 		if (!(cond)) { std::printf("FAIL: %s\n", msg); ++g_failures; }        \
 	} while (0)
 
-// ----- minimal ELF32 .text extractor (mirrors .kiro/research/scan.py) -----
+// ----- minimal ELF32 .text extractor -----
 struct TextSection { std::vector<uint8_t> bytes; uint32_t va = 0; bool ok = false; };
 
 template <class T> static T rd(const std::vector<uint8_t>& d, size_t off)
@@ -96,8 +95,7 @@ static TextSection loadText(const std::string& path)
 
 struct IfaceCase { const char* name; uint32_t oldRoot; uint32_t newRoot; };
 
-// Roots before and after the 2026-06-23 client update (from
-// .kiro/research/slsteam-pattern-refresh-2026-06-23.md).
+// Roots before and after the 2026-06-23 client update.
 static const IfaceCase kCases[] = {
 	{ "IClientApps",          0xA6889C39, 0xA6889C37 },
 	{ "IClientRemoteStorage", 0x872FE86E, 0x872FE86C },

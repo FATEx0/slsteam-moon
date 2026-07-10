@@ -25,7 +25,7 @@
 // Reconfiguring.
 // appinfo.vdf and the PICS product-info buffer are left untouched, so this
 // never trips the changelist SHA-1 integrity check that makes splicing
-// appinfo.vdf a dead end.
+// appinfo.vdf non-viable.
 //
 // Gated on SLSSTEAM_MANIFEST_FALLBACK (default on; "0" disables).  Conceptual
 // sibling of OpenSteamTool / LumaCore manifest pinning, adapted for Linux

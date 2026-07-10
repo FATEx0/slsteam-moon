@@ -4,7 +4,6 @@
 
 #include "appinfo_provision.hpp"
 
-#include "appinfopin.hpp"
 #include "cmclient.hpp"
 #include "compattool.hpp"
 #include "depotkey.hpp"
@@ -446,41 +445,6 @@ void pruneUnsupportedDepots(YAML::Node& body, uint32_t appId)
 	(void)0;
 }
 
-// SLSSTEAM_PIN_PLANNER gate (shared with the manifestbind planner patch):
-// when set, a LOCKED app's pinned depot gids are emitted into the provisioned
-// appinfo so Steam's reconcile sees installed==appinfo and stops looping.
-// Read fresh each call (cheap; provisioning
-// is a startup-only path) so a filewatcher config reload doesn't need a
-// cached copy.  Default OFF keeps a normal launch on the live public gid.
-bool pinAppinfoEnabled()
-{
-	// Escape hatch: SLSSTEAM_NO_APPINFO_PIN=1 disables the appinfo gid pin even
-	// when the planner is on.  Approach A (provisioning the pinned gid into
-	// appinfo) was found to CONTAMINATE Steam's active-manifest resolution: the
-	// download planner resolves the installed depot manifest via appinfo too,
-	// so pinning appinfo makes active==target==pin -> zero chunk delta -> the
-	// real content is never downloaded (HANDOFF-v2 §8).  The clobber-proof
-	// ReconcilePin (B) supplies the pinned TARGET at the reconcile instead,
-	// leaving appinfo (hence the planner's active) on the real public gid so a
-	// genuine delta is computed.  This gate lets that path be tested in
-	// isolation before Approach A is removed for good.
-	if (const char* off = std::getenv("SLSSTEAM_NO_APPINFO_PIN"))
-	{
-		if (!(off[0] == '0' && off[1] == '\0')) return false;
-	}
-	// Default ON: the pin is config-driven (ManifestPins locked apps), not
-	// env-gated.  Only LOCKED apps reach applyDepotGidPins (caller guards on
-	// isAppLocked), so a normal install is untouched.  SLSSTEAM_NO_APPINFO_PIN
-	// above stays as an opt-out escape hatch.
-	//
-	// Keeping it ON makes appinfo.vdf carry the pinned gid, so on a clean
-	// startup Steam's reconcile reads appinfo==installed==pin and SETTLES (no
-	// loop).  Turning it OFF was tried and REGRESSED the restart case: appinfo
-	// then reads the live gid, mismatching the installed pin on every boot ->
-	// loop without even installing (verified live, app 3525970).
-	return true;
-}
-
 // Forward declaration: defined with the on-disk cache helpers below.
 std::string getCacheDir();
 
@@ -656,40 +620,10 @@ bool renderAppinfoBuffer(const YAML::Node& appNode, uint32_t appId, std::string&
 	// and the launch aborts before the game/Proton ever starts.
 	neutralizeLegacyCdKey(body, appId);
 
-	// Honour an explicit older-build pin for a LOCKED app (a downgrade) by
-	// rewriting the depot's public-branch manifest gid here, so the
-	// in-memory appinfo (loaded from this buffer at startup) matches the
-	// build Steam commits.  Without this, the post-commit reconcile compares
-	// the installed pinned gid against appinfo's public gid and loops
-	// "Update Required" forever.
-	//
-	// This is DISTINCT from the general unowned-install path (see
-	// provisionApp's note): that path deliberately keeps the LIVE public gid
-	// so a first-attempt install grabs the latest build.  Here the user has
-	// explicitly locked the app to an older build, so the pin wins.  Gated
-	// behind SLSSTEAM_PIN_PLANNER (the same flag enabling the planner
-	// DepotEntry patch) so a normal launch is unaffected during validation
-	// and the machine stays safe by default.
-	if (pinAppinfoEnabled() && g_config.isAppLocked(appId))
-	{
-		const int n = AppInfoPin::applyDepotGidPins(
-		    body, g_config.getAppPinnedDepots(appId));
-		if (n > 0)
-		{
-			g_pLog->info("AppInfoProvision: app=%u pinned %d depot gid(s) into "
-			             "appinfo (locked downgrade)\n", appId, n);
-		}
-
-		// Also pin the branch build NUMBER (GetAppBuildId reads this appinfo
-		// field, not the appmanifest).  A build-locked crack checks this
-		// number; the content pin alone leaves it at the live public build.
-		const uint32_t buildId = g_config.getAppPinnedBuildId(appId);
-		if (AppInfoPin::applyBranchBuildId(body, buildId))
-		{
-			g_pLog->info("AppInfoProvision: app=%u pinned public branch "
-			             "buildid=%u into appinfo\n", appId, buildId);
-		}
-	}
+	// A locked app keeps the LIVE public gid in its provisioned appinfo so
+	// Steam computes a genuine content delta; the pinned target is applied at
+	// the post-commit reconcile instead, which avoids contaminating the
+	// active/baseline manifest read.
 
 	// Steam's appinfo wire format wraps the document in "appinfo" { ... }.
 	wireOut.clear();
@@ -1022,7 +956,7 @@ void injectProtonMappings()
 // Native CM provider: parse the wire-text VDF buffer the anonymous CM
 // returns into the same YAML::Node shape extractAppNode produces from
 // steamcmd's JSON, so it flows through the identical prune/render/persist
-// path.  The CM buffer is `"appinfo" { ... }` KV1 text (verified live);
+// path.  The CM buffer is `"appinfo" { ... }` KV1 text;
 // we parse its inner body into a map.
 // ---------------------------------------------------------------------------
 

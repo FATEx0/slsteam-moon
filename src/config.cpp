@@ -433,7 +433,7 @@ bool CConfig::loadSettings()
 			}
 		}
 
-		// Belt-and-suspenders (design §4.4): drop pins for apps no longer in
+		// Belt-and-suspenders: drop pins for apps no longer in
 		// AdditionalApps (plugin remove-game is the primary purge).
 		ManifestPins::purgeOrphans(pinMap, addedAppIds.get());
 
@@ -481,14 +481,6 @@ CConfig::getAppPinnedDepots(uint32_t appId)
 	const auto it = pinMap.find(appId);
 	if (it == pinMap.end()) return {};
 	return it->second.depots;
-}
-
-uint32_t CConfig::getAppPinnedBuildId(uint32_t appId)
-{
-	const auto pinMap = manifestPinsByApp.get();
-	const auto it = pinMap.find(appId);
-	if (it == pinMap.end()) return 0;
-	return it->second.buildId;
 }
 
 void CConfig::purgePinsForApps(const std::unordered_set<uint32_t>& appIds)

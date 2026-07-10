@@ -20,8 +20,7 @@
 // request code with our own — needless work and a stall/crash vector for
 // content Steam fetches itself.  This pins down the corrected decision: a
 // merely-observed key is NOT a trigger; only a *managed* (Lua-injected) key
-// is.  Verified live on the Zorin VM (runtime depot 1391111 leaked into
-// scope before this fix).
+// is.
 //
 // Build (from repo root):
 //   g++ -std=c++20 -I include tools/test_depotkey_scope.cpp -o /tmp/test_depotkey_scope && /tmp/test_depotkey_scope

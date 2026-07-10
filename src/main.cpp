@@ -544,7 +544,7 @@ extern "C" unsigned int la_version(unsigned int)
 // Steam launches the CEF webhelper with a HARD-CODED
 // `--remote-debugging-port=8080` (the .cef-enable-remote-debugging flag's
 // content is ignored, and Steam restores its launcher scripts from bootstrap
-// on every boot, so static edits don't stick — both verified on the VM).
+// on every boot, so static edits do not persist).
 // That squats on TCP 8080. We rewrite the argument in flight to a free
 // loopback port and publish it to ~/.local/share/Lumen/cef_port for the Lumen
 // sidecar to read.

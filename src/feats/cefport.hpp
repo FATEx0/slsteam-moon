@@ -4,7 +4,7 @@
 //
 // Steam's client launches the CEF webhelper with a HARD-CODED
 // `--remote-debugging-port=8080` (the value of the .cef-enable-remote-debugging
-// flag file is ignored; verified on the Zorin VM). That squats on TCP 8080,
+// flag file is ignored). That squats on TCP 8080,
 // which collides with common dev servers. We can't change it by editing Steam's
 // launcher scripts — Steam restores them from bootstrap on every boot — so the
 // shim interposes the exec family inside the client and rewrites the argument
@@ -20,7 +20,6 @@
 // Decky coexistence: when Decky Loader is installed we must NOT move CEF off
 // 8080 (Decky's injector is hard-coded to it). main.cpp::setup() then leaves
 // the port alone and Lumen falls back to 8080 too; both share the endpoint.
-// See .kiro/research/decky-coexistence.md.
 
 #include <cctype>
 #include <cstdint>

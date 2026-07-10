@@ -160,8 +160,7 @@ void Updater::refreshInBackgroundIfStale()
 {
 	// Idempotent: only one refresh per process.  MUST be called from a
 	// real Steam worker thread (e.g. the PICS recv path), never from the
-	// LD_AUDIT load()/setup() path — spawning a thread there crashes Steam
-	// (HANDOFF dead-end #2).
+	// LD_AUDIT load()/setup() path — spawning a thread there crashes Steam.
 	bool expected = false;
 	if (!g_refreshStarted.compare_exchange_strong(expected, true))
 	{

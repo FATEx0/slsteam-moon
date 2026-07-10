@@ -513,8 +513,7 @@ void Apps::sendPICSInfoRequest(CMsgClientPICSProductInfoRequest* msg)
 	// depots + installdir we synthesized into appinfo at startup, dropping
 	// the install dialog to 0 B with "Invalid install path".  By removing
 	// them from the request, Steam never re-fetches them and keeps the
-	// startup splice.  (Removing — unlike ADDING, HANDOFF dead-end — does not
-	// make Steam chase buffers it never asked for.)
+	// startup splice.  (Removing them does not make Steam request buffers it never asked for.)
 	{
 		std::vector<uint32_t> requested;
 		requested.reserve(static_cast<size_t>(msg->apps_size()));

@@ -8,7 +8,7 @@
 // CMsgMulti expansion, and PICS request/response (de)serialisation are
 // PURE byte transforms with no I/O, so they can — and must — be unit
 // tested in isolation.  The impure transport (TLS, websocket handshake,
-// CM server list) lives in feats/cmclient.cpp and is verified live.
+// CM server list) lives in feats/cmclient.cpp.
 //
 // Steam CM packet framing per websocket binary message:
 //   <uint32 emsg (high bit = proto mask 0x80000000)>

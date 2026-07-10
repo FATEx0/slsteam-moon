@@ -258,7 +258,7 @@ void ensureStarted()
 
 	// Detached: lives for the Steam session.  MUST only be reached from a
 	// real Steam worker thread (the PICS recv path) — never the LD_AUDIT
-	// load()/setup() path, which crashed Steam twice (HANDOFF DEAD END #2).
+	// load()/setup() path, as that path must not spawn background threads.
 	std::thread(runLoop).detach();
 }
 

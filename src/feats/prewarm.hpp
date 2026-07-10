@@ -13,7 +13,7 @@
 //   * forcing a Proton compat tool on a native-Linux AddedApp re-plans
 //     to the WINDOWS build, but its manifests were purged after the
 //     native commit -> BYldRequestDepotManifest -> 'Access Denied' ->
-//     one ~30s retry (proven on the Zorin VM 2026-06-05, BoI 250900);
+//     one ~30s retry (confirmed in testing);
 //   * Steam re-validating files hits the same gap.
 //
 // Fix
@@ -25,9 +25,9 @@
 // on-disk re-check makes a re-stage cheap when the file is still there and
 // a real re-fetch when Steam purged it.
 //
-// CRITICAL (HANDOFF DEAD END #2): the background worker must be started
+// CRITICAL: the background worker must be started
 // from a real Steam worker thread (the PICS InitFromPacket recv path),
-// NEVER from the LD_AUDIT load()/setup() path — that crashed Steam twice.
+// NEVER from the LD_AUDIT load()/setup() path.
 //
 // This header holds the PURE, dependency-free decision logic so it can be
 // unit-tested without Steam, libcurl or disk (tools/test_prewarm.cpp).
@@ -378,7 +378,7 @@ inline std::vector<DepotGid> extractWorkshopManifests(const std::string& acf,
 // Start the background pre-warm worker exactly once.  Idempotent and
 // thread-safe: safe to call from every PICS recv.  MUST be called only
 // from a real Steam worker thread (the PICS InitFromPacket recv path),
-// NEVER from load()/setup() (HANDOFF DEAD END #2).  No-op if there are no
+// NEVER from load()/setup().  No-op if there are no
 // AddedApps.  Returns immediately; the actual staging runs on its own
 // detached thread.
 void ensureStarted();

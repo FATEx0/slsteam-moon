@@ -152,7 +152,7 @@ for appid in "${APP_IDS[@]}"; do
         # Skip the helper's own artefacts: <exe>.original.exe is the
         # backup left behind, <exe>.unpacked.exe is a transient
         # output. Reprocessing them recursively corrupts the backup
-        # chain (we hit this once in the wild — see HANDOFF).
+        # chain (we hit this once in the wild).
         case "$(basename "$exe")" in
             *.original.exe|*.unpacked.exe) SKIPPED=$((SKIPPED+1)); continue ;;
         esac

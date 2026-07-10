@@ -322,8 +322,7 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	// Stage every AdditionalApp depot manifest CONCURRENTLY, before this
 	// handler returns.
 	//
-	// Why staging must finish before we return (verified on the VM
-	// 2026-06-04, superseding the HANDOFF "timing race" theory):
+	// Why staging must finish before we return (confirmed in testing):
 	// clicking Install triggers a fresh PICS product-info request, and
 	// Steam cannot begin update *planning* until this response is
 	// processed (it's what tells Steam which depots/manifests exist), so
@@ -399,7 +398,7 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	// pass — e.g. the user forcing a Proton compat tool, which re-plans to
 	// the windows depots without a fresh PICS request — finds the manifests
 	// already present and skips BYldRequestDepotManifest (no ~30s retry).
-	// MUST NOT be started from load()/setup() (HANDOFF DEAD END #2).
+	// MUST NOT be started from load()/setup() to avoid client crashes.
 	Prewarm::ensureStarted();
 
 	// Refresh the safe-mode-hash cache (updates.yaml) off the boot path.

@@ -18,7 +18,7 @@
 
 namespace
 {
-	// EvaluateConfigChanges calling convention (HANDOFF-v2 §6/§7): a global
+	// EvaluateConfigChanges calling convention: a global
 	// anchor/manager pointer arrives in EAX (BOTH the manager object the body
 	// dereferences AND the PIC anchor for its .rodata string leas); the three
 	// real args are on the stack.  regparm(1) models exactly that: arg0 -> EAX,
@@ -127,15 +127,11 @@ namespace
 	// 3525970: [ctx+0x78]=pin (no rewrite) but the local=public -> mismatch ->
 	// perpetual "updated depots" loop while installing.
 	//
-	// That local is filled by a shared appinfo->depot-vector builder (the
-	// function EvaluateConfigChanges calls right after constructing the local).
+	// That local is filled by a shared appinfo->depot-vector builder.
 	// The builder receives &targetVec as an argument and the appId, so a
-	// function-replacement hook can patch the local AFTER it is populated — no
-	// fragile mid-function detour / ebp gymnastics.  But the builder has SIX
-	// callers; patching its output globally would contaminate the chunk-diff
-	// baseline path (the proven 0-file-commit dead end).  So we act ONLY when
-	// the return address is EvaluateConfigChanges' own call site, i.e. the
-	// local being filled is THIS reconcile's TARGET vector.
+	// function-replacement hook can patch the local AFTER it is populated.
+	// We act ONLY when the return address is EvaluateConfigChanges' own call site,
+	// i.e. the local being filled is THIS reconcile's TARGET vector.
 	//
 	// The builder + its call-site return address are derived from the matched
 	// EvaluateConfigChanges pattern (offsets confirmed on build cfe99f0c):

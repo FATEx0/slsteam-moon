@@ -1,10 +1,10 @@
 // Standalone test for the desktop-notification command builder.
 //
-// Bug (HANDOFF 2026-06-05): every SLSsteam notify-send popup EXCEPT the
+// Bug: every SLSsteam notify-send popup EXCEPT the
 // "Loaded successfully" (NotifyShort) one stays on screen forever.  Root
 // cause: the Warn branch emitted `notify-send -u "critical"` with NO `-t`.
 // Per the freedesktop spec, urgency=critical notifications are "resident"
-// and most daemons (GNOME/Zorin) IGNORE the expire timeout for them, so
+// and most daemons (e.g. GNOME) IGNORE the expire timeout for them, so
 // warn-level popups never auto-dismiss.
 //
 // Fix: a pure mapping (Notify::specForLevel) gives every notifying level an
