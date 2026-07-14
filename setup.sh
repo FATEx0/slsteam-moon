@@ -22,6 +22,7 @@ SLSM_TAG="X-SLSteamMoon-Patched=true"
 # the in-repo copy at install time so dc_run / dc_restore_all are available here.
 WRAPPER="$SLSDIR/path/steam"
 DC_TAG="$SLSM_TAG"
+DC_BACKUP_ROOT="$SLSDIR/backup"
 SETUP_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "$SETUP_DIR/tools/desktop-coverage.lib.sh" ]; then
 	# shellcheck source=/dev/null
@@ -579,73 +580,6 @@ EOF
 	return 0
 }
 
-# Patch every Exec= line in $1 (in-place) so it runs through our wrapper. Drops
-# our marker line and writes a backup to $1.slssteam-backup if one isn't there.
-patch_desktop_file() {
-	local f="$1"
-	local backup="$f.slssteam-backup"
-	local wrapper="$SLSDIR/path/steam"
-	local sudo_cmd="${2:-}"
-
-	# Backup once (follows a symlink: stores the resolved content).
-	if [ ! -f "$backup" ]; then
-		$sudo_cmd cp -- "$f" "$backup"
-	fi
-
-	# Rewrite the launcher token of every Exec= line and drop any stale marker.
-	# The launcher token is the first word that is neither `env` nor a `VAR=val`
-	# assignment, so this is launcher-path-agnostic: /usr/bin/steam,
-	# /usr/games/steam, /opt/steam/steam, a bare `steam`, bazzite-steam, … all
-	# work, plus `env VAR=v <launcher>` prefixes. Desktop Action lines (steam://
-	# handlers) are rewritten the same way. awk avoids sed path-escaping pitfalls.
-	local tmp
-	tmp="$(mktemp)"
-	WRAPPER="$wrapper" TAG="$SLSM_TAG" awk '
-		$0 == ENVIRON["TAG"] { next }                 # drop stale marker line
-		/^Exec=/ {
-			rest = substr($0, 6)                       # text after "Exec="
-			n = split(rest, t, " ")
-			swapped = 0
-			out = "Exec="
-			for (i = 1; i <= n; i++) {
-				if (!swapped && t[i] != "env" && index(t[i], "=") == 0) {
-					t[i] = ENVIRON["WRAPPER"]; swapped = 1
-				}
-				out = out t[i] (i < n ? " " : "")
-			}
-			print out
-			next
-		}
-		{ print }
-	' "$f" > "$tmp"
-
-	# Only stamp + commit if an Exec= now runs our wrapper, so we never mark a
-	# file we failed to rewrite (a stamped-but-unpatched file is skipped by
-	# is_patched_desktop on every later run, locking out the fix forever).
-	if ! grep -qF "Exec=$wrapper" "$tmp" 2>/dev/null \
-	   && ! grep -qF " $wrapper" "$tmp" 2>/dev/null; then
-		rm -f "$tmp"
-		return 1
-	fi
-
-	if grep -q '^\[Desktop Entry\]' "$tmp" 2>/dev/null; then
-		sed -i "0,/^\[Desktop Entry\]/ s|^\[Desktop Entry\]\$|[Desktop Entry]\n$SLSM_TAG|" "$tmp"
-	else
-		printf '%s\n' "$SLSM_TAG" >> "$tmp"
-	fi
-
-	# Write back with --remove-destination so a SYMLINK entry is replaced by a
-	# regular file (and we never write THROUGH it into Steam's own copy). This
-	# is the crux: the Debian/Mint /usr/games/steam launcher regenerates the
-	# user entry and re-points it at the vanilla launcher whenever it is a
-	# symlink or missing, but leaves a regular file untouched — so a regular
-	# file is what makes the patch survive Steam restarts/self-updates.
-	$sudo_cmd cp --remove-destination -- "$tmp" "$f"
-	$sudo_cmd chmod +x "$f" 2>/dev/null || true
-	rm -f "$tmp"
-	return 0
-}
-
 # NOTE: the user-level autostart override (mirror the system/Steam autostart entry
 # so the desktop session's auto-launch of Steam runs through our wrapper) now lives
 # in the shared coverage lib as dc_seed_autostart_override, invoked from dc_run —
@@ -657,6 +591,7 @@ patch_desktop_file() {
 setup_path_and_desktop()
 {
 	log_info "Setting up PATH and desktop integration"
+	local system_desktop_changed=0
 
 	# --- Shell PATH integration -------------------------------------------
 	local rc found=0
@@ -702,11 +637,16 @@ setup_path_and_desktop()
 	fi
 
 	# Patch all entry points: user menu, system menu / "Install Steam" stub
-	# (sudo; eligible because Steam is installed — detected above), the ~/Desktop
-	# shortcut (blinded as a symlink so Steam won't restore it), and autostart
+	# (sudo; eligible because Steam is installed — detected above), an existing
+	# ~/Desktop shortcut (kept as a regular trusted file), and autostart
 	# user+system. All logic lives in tools/desktop-coverage.lib.sh.
 	export DC_STEAM_INSTALLED=1
+	mkdir -p "$DC_BACKUP_ROOT" 2>/dev/null || {
+		log_error "Could not create desktop backup directory: $DC_BACKUP_ROOT"
+		return 1
+	}
 	if is_immutable_distro; then
+		dc_migrate_legacy_backups --user
 		dc_run --user
 		log_info "Immutable distro (read-only /usr): patched user-level entries only — they override the system ones via XDG precedence."
 	elif command -v sudo >/dev/null 2>&1; then
@@ -718,9 +658,12 @@ setup_path_and_desktop()
 			log_error "Administrator password not provided; installation cancelled."
 			exit 1
 		fi
+		dc_migrate_legacy_backups --system
 		dc_run --system
+		system_desktop_changed=1
 		log_success "Patched Steam desktop entries (menu, shortcut, autostart, stub)"
 	else
+		dc_migrate_legacy_backups --user
 		dc_run --user
 		log_warn "sudo not available; system .desktop/stub left unpatched (user + menu entries still covered)"
 	fi
@@ -749,7 +692,7 @@ EOF
 	# Refresh XDG caches so menus pick up the change without a logout.
 	if command -v update-desktop-database >/dev/null 2>&1; then
 		update-desktop-database "$USER_APPS" >/dev/null 2>&1 || true
-		command -v sudo >/dev/null 2>&1 && \
+		[ "$system_desktop_changed" = 1 ] && command -v sudo >/dev/null 2>&1 && \
 			sudo update-desktop-database "/usr/share/applications" >/dev/null 2>&1 || true
 	fi
 
@@ -833,21 +776,33 @@ install_all()
 
 restore_or_remove_desktop() {
 	local f="$1"
-	local backup="$f.slssteam-backup"
+	local backup="$DC_BACKUP_ROOT/${f#/}" legacy
 	local sudo_cmd="${2:-}"
 
-	if [ ! -f "$f" ]; then
-		return 0
+	[ -f "$f" ] || return 0
+	if [ ! -f "$backup" ]; then
+		for legacy in "$f.slssteam-backup" "$f.slsteam-bak"; do
+			[ -f "$legacy" ] || continue
+			mkdir -p "$(dirname "$backup")" 2>/dev/null || break
+			if [ -n "$sudo_cmd" ]; then
+				$sudo_cmd cat -- "$legacy" > "$backup" 2>/dev/null || { rm -f "$backup"; break; }
+			else
+				cp -- "$legacy" "$backup" 2>/dev/null || { rm -f "$backup"; break; }
+			fi
+			$sudo_cmd rm -f -- "$legacy" 2>/dev/null || true
+			break
+		done
 	fi
-	if ! is_patched_desktop "$f"; then
+	if ! is_patched_desktop "$f" && [ ! -f "$backup" ]; then
 		return 0
 	fi
 
 	if [ -f "$backup" ]; then
 		log_info "Restoring $f from backup"
-		$sudo_cmd cp -- "$backup" "$f"
-		$sudo_cmd rm -- "$backup"
-		log_success "Restored $f"
+		if $sudo_cmd cp -- "$backup" "$f"; then
+			rm -f -- "$backup"
+			log_success "Restored $f"
+		fi
 	else
 		log_info "Removing $f (no backup found)"
 		$sudo_cmd rm -- "$f"
@@ -893,12 +848,12 @@ uninstall()
 	fi
 	if command -v update-desktop-database >/dev/null 2>&1; then
 		update-desktop-database "$USER_APPS" >/dev/null 2>&1 || true
-		command -v sudo >/dev/null 2>&1 && \
+		! is_immutable_distro && command -v sudo >/dev/null 2>&1 && \
 			sudo update-desktop-database "/usr/share/applications" >/dev/null 2>&1 || true
 	fi
 
 	# Legacy: /usr/games/steam patch from older versions.
-	if [ -f "/usr/games/steam" ] && grep -q "SLSsteam" "/usr/games/steam" 2>/dev/null; then
+	if ! is_immutable_distro && [ -f "/usr/games/steam" ] && grep -q "SLSsteam" "/usr/games/steam" 2>/dev/null; then
 		log_info "Found legacy /usr/games/steam modification"
 		if [ -f "/usr/games/steam.slsteam-backup" ]; then
 			log_info "Restoring original /usr/games/steam (requires sudo)"

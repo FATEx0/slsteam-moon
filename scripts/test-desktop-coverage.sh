@@ -73,15 +73,25 @@ EOF
 dc_rewrite_exec "$TMP/env.desktop"
 check "env-prefixed Exec -> wrapper after env" "Exec=env VAR=1 $WRAPPER %U" "$(grep -m1 '^Exec=' "$TMP/env.desktop")"
 
-# patch_one: backup made, tag added, mode 0644, Exec -> wrapper, shebang stripped
+# patch_one: CENTRAL backup made, no adjacent backup left, tag added, mode 0644,
+# Exec -> wrapper, shebang stripped.
 printf '#!/usr/bin/env xdg-open\n[Desktop Entry]\nName=Steam\nExec=/usr/games/steam %%U\n' > "$TMP/menu.desktop"
 chmod 0711 "$TMP/menu.desktop"
-dc_patch_one "$TMP/menu.desktop"
+DC_BACKUP_ROOT="$TMP/central" dc_patch_one "$TMP/menu.desktop"
 check "patch_one classify after -> patched" "patched" "$(dc_classify "$TMP/menu.desktop")"
 check "patch_one mode 0644" "644" "$(stat -c '%a' "$TMP/menu.desktop")"
-check "patch_one backup exists" "yes" "$([ -f "$TMP/menu.desktop.slssteam-backup" ] && echo yes || echo no)"
+menu_backup="$TMP/central/${TMP#/}/menu.desktop"
+check "patch_one central backup exists" "yes" "$([ -f "$menu_backup" ] && echo yes || echo no)"
+check "patch_one adjacent backup absent" "no" "$([ -f "$TMP/menu.desktop.slssteam-backup" ] && echo yes || echo no)"
+check "patch_one central backup kept vanilla" "Exec=/usr/games/steam %U" "$(grep -m1 '^Exec=' "$menu_backup")"
 check "patch_one first line clean" "[Desktop Entry]" "$(head -1 "$TMP/menu.desktop")"
 check "patch_one Exec wrapped" "Exec=$WRAPPER %U" "$(grep -m1 '^Exec=' "$TMP/menu.desktop")"
+
+# A later idempotent pass must preserve the first original backup byte-for-byte.
+before_sum="$(sha256sum "$menu_backup" | awk '{print $1}')"
+DC_BACKUP_ROOT="$TMP/central" dc_patch_one "$TMP/menu.desktop"
+after_sum="$(sha256sum "$menu_backup" | awk '{print $1}')"
+check "patch_one does not overwrite central original" "$before_sum" "$after_sum"
 
 # desktop shortcut: patch an EXISTING one as a regular trusted file (NOT a
 # symlink — GNOME renders a symlinked .desktop as "steam.desktop" + untrusted),
@@ -104,10 +114,11 @@ SYS="$TMP/sys"; mkdir -p "$SYS"
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/games/steam %%U\n' > "$H/.local/share/applications/steam.desktop"
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/games/steam -silent %%U\n' > "$H/.config/autostart/steam.desktop"
 printf '[Desktop Entry]\nName=Install Steam\nExec=/usr/games/steam %%U\n' > "$SYS/steam.desktop"
-DC_HOME="$H" DC_SYS_APPS="$SYS" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_STEAM_INSTALLED=1 dc_run --user
+DC_HOME="$H" DC_BACKUP_ROOT="$H/.local/share/SLSsteam/backup" DC_SYS_APPS="$SYS" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_STEAM_INSTALLED=1 dc_run --user
 check "user run patches menu" "patched" "$(dc_classify "$H/.local/share/applications/steam.desktop")"
 check "user run patches autostart" "patched" "$(dc_classify "$H/.config/autostart/steam.desktop")"
 check "user run leaves stub alone" "stub" "$(dc_classify "$SYS/steam.desktop")"
+check "user run leaves no adjacent autostart backup" "no" "$([ -e "$H/.config/autostart/steam.desktop.slssteam-backup" ] && echo yes || echo no)"
 
 # MIGRATION: a legacy already-tagged entry left 0711 with a Valve shebang must be
 # normalized to 0644 + clean first line on a re-run (the Cinnamon-bug fix path).
@@ -115,7 +126,7 @@ H5="$TMP/home5"; mkdir -p "$H5/.local/share/applications"
 printf '#!/usr/bin/env xdg-open\n[Desktop Entry]\n%s\nName=Steam\nExec=%s %%U\n' "$DC_TAG" "$WRAPPER" \
   > "$H5/.local/share/applications/steam.desktop"
 chmod 0711 "$H5/.local/share/applications/steam.desktop"
-DC_HOME="$H5" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" dc_run --user
+DC_HOME="$H5" DC_BACKUP_ROOT="$H5/.local/share/SLSsteam/backup" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" dc_run --user
 check "migrate: still patched" "patched" "$(dc_classify "$H5/.local/share/applications/steam.desktop")"
 check "migrate: 0711 -> 0644" "644" "$(stat -c '%a' "$H5/.local/share/applications/steam.desktop")"
 check "migrate: shebang stripped" "[Desktop Entry]" "$(head -1 "$H5/.local/share/applications/steam.desktop")"
@@ -125,17 +136,22 @@ check "migrate: shebang stripped" "[Desktop Entry]" "$(head -1 "$H5/.local/share
 H6="$TMP/home6"; mkdir -p "$H6/.local/share/applications"
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/games/steam %%U\n' > "$H6/.local/share/applications/steam.desktop"
 chmod 000 "$H6/.local/share/applications/steam.desktop"
-DC_HOME="$H6" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" dc_run --user
+DC_HOME="$H6" DC_BACKUP_ROOT="$H6/.local/share/SLSsteam/backup" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" dc_run --user
 check "migrate unreadable: patched" "patched" "$(dc_classify "$H6/.local/share/applications/steam.desktop")"
 check "migrate unreadable: 0644" "644" "$(stat -c '%a' "$H6/.local/share/applications/steam.desktop")"
 
-DC_HOME="$H" DC_SYS_APPS="$SYS" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_STEAM_INSTALLED=1 dc_run --system
+DC_HOME="$H" DC_BACKUP_ROOT="$H/.local/share/SLSsteam/backup" DC_SYS_APPS="$SYS" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_STEAM_INSTALLED=1 dc_run --system
 check "system run patches stub (steam installed)" "patched" "$(dc_classify "$SYS/steam.desktop")"
+sys_backup="$H/.local/share/SLSsteam/backup/${SYS#/}/steam.desktop"
+check "system run keeps central original" "Exec=/usr/games/steam %U" "$(grep -m1 '^Exec=' "$sys_backup")"
+DC_HOME="$H" DC_BACKUP_ROOT="$H/.local/share/SLSsteam/backup" DC_SUDO="" dc_restore_one "$SYS/steam.desktop"
+check "system restore recovers original" "Exec=/usr/games/steam %U" "$(grep -m1 '^Exec=' "$SYS/steam.desktop")"
+check "system restore consumes central backup" "no" "$([ -e "$sys_backup" ] && echo yes || echo no)"
 
 # CLI: --user runs without error against a fake HOME and patches the menu entry
 H2="$TMP/home2"; mkdir -p "$H2/.local/share/applications"
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/games/steam %%U\n' > "$H2/.local/share/applications/steam.desktop"
-HOME="$H2" DC_HOME="$H2" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" WRAPPER="$WRAPPER" \
+HOME="$H2" DC_HOME="$H2" DC_BACKUP_ROOT="$H2/.local/share/SLSsteam/backup" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" WRAPPER="$WRAPPER" \
   bash "$HERE/ensure-desktop-coverage.sh" --user >/dev/null 2>&1
 check "CLI --user patches menu entry" "patched" "$(dc_classify "$H2/.local/share/applications/steam.desktop")"
 
@@ -144,14 +160,37 @@ H4="$TMP/home4"; mkdir -p "$H4/.local/share/applications" "$H4/.config/autostart
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/games/steam %%U\n' > "$H4/.local/share/applications/steam.desktop"
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/games/steam -silent %%U\n' > "$H4/.config/autostart/steam.desktop"
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/games/steam %%U\n' > "$H4/Desktop/steam.desktop"
-DC_HOME="$H4" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" dc_run --user
+DC_HOME="$H4" DC_BACKUP_ROOT="$H4/.local/share/SLSsteam/backup" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" dc_run --user
 check "before restore: menu patched" "patched" "$(dc_classify "$H4/.local/share/applications/steam.desktop")"
 check "before restore: shortcut patched (regular file)" "patched" "$(dc_classify "$H4/Desktop/steam.desktop")"
-DC_HOME="$H4" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" dc_restore_all
+menu4_backup="$H4/.local/share/SLSsteam/backup/${H4#/}/.local/share/applications/steam.desktop"
+check "before restore: central menu backup exists" "yes" "$([ -f "$menu4_backup" ] && echo yes || echo no)"
+DC_HOME="$H4" DC_BACKUP_ROOT="$H4/.local/share/SLSsteam/backup" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" dc_restore_all
 check "restore: menu entry not patched" "0" "$(grep -c "$DC_TAG" "$H4/.local/share/applications/steam.desktop" 2>/dev/null | head -1)"
-check "restore: menu backup consumed" "no" "$([ -f "$H4/.local/share/applications/steam.desktop.slssteam-backup" ] && echo yes || echo no)"
+check "restore: central menu backup consumed" "no" "$([ -f "$menu4_backup" ] && echo yes || echo no)"
 check "restore: autostart not patched" "0" "$(grep -c "$DC_TAG" "$H4/.config/autostart/steam.desktop" 2>/dev/null | head -1)"
 check "restore: shortcut restored to vanilla regular file" "0" "$(grep -c "$DC_TAG" "$H4/Desktop/steam.desktop" 2>/dev/null | head -1)"
+
+# LEGACY MIGRATION: adjacent backups are discovered even when the active
+# autostart file was deleted (Steam autostart disabled), moved to the central
+# mirrored path, and removed from every scanned XDG/shortcut directory.
+H10="$TMP/home10"; mkdir -p "$H10/.local/share/applications" "$H10/.config/autostart" "$H10/Desktop"
+SYS10="$TMP/sys10"; SYSAS10="$TMP/sysas10"; mkdir -p "$SYS10" "$SYSAS10"
+printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam %%U\n' > "$H10/.local/share/applications/steam.desktop.slssteam-backup"
+printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam -silent %%U\n' > "$H10/.config/autostart/steam.desktop.slssteam-backup"
+printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam %%U\n' > "$H10/Desktop/steam.desktop.slsteam-bak"
+printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam %%U\n' > "$SYS10/steam.desktop.slssteam-backup"
+printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam -silent %%U\n' > "$SYSAS10/steam.desktop.slssteam-backup"
+DC_HOME="$H10" DC_BACKUP_ROOT="$H10/.local/share/SLSsteam/backup" DC_SYS_APPS="$SYS10" DC_SYS_AUTOSTART="$SYSAS10" DC_SUDO="" dc_run --system
+legacy_as_central="$H10/.local/share/SLSsteam/backup/${H10#/}/.config/autostart/steam.desktop"
+legacy_sys_central="$H10/.local/share/SLSsteam/backup/${SYS10#/}/steam.desktop"
+check "legacy migration keeps deleted autostart original centrally" "yes" "$([ -f "$legacy_as_central" ] && echo yes || echo no)"
+check "legacy migration mirrors system path" "yes" "$([ -f "$legacy_sys_central" ] && echo yes || echo no)"
+check "legacy migration removes user applications backup" "no" "$([ -e "$H10/.local/share/applications/steam.desktop.slssteam-backup" ] && echo yes || echo no)"
+check "legacy migration removes autostart backup" "no" "$([ -e "$H10/.config/autostart/steam.desktop.slssteam-backup" ] && echo yes || echo no)"
+check "legacy migration removes old .slsteam-bak shortcut backup" "no" "$([ -e "$H10/Desktop/steam.desktop.slsteam-bak" ] && echo yes || echo no)"
+check "legacy migration removes system applications backup" "no" "$([ -e "$SYS10/steam.desktop.slssteam-backup" ] && echo yes || echo no)"
+check "legacy migration removes system autostart backup" "no" "$([ -e "$SYSAS10/steam.desktop.slssteam-backup" ] && echo yes || echo no)"
 
 # SEED autostart override (SteamOS/Bazzite): a SYSTEM autostart exists but the
 # user has no ~/.config/autostart/steam.desktop -> dc_run seeds a patched user
@@ -159,20 +198,21 @@ check "restore: shortcut restored to vanilla regular file" "0" "$(grep -c "$DC_T
 H7="$TMP/home7"; mkdir -p "$H7/.local/share/applications" "$H7/.config/autostart"
 SYSAS7="$TMP/sysas7"; mkdir -p "$SYSAS7"
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam -silent %%U\n' > "$SYSAS7/steam.desktop"
-DC_HOME="$H7" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$SYSAS7" DC_SUDO="" dc_run --user
+DC_HOME="$H7" DC_BACKUP_ROOT="$H7/.local/share/SLSsteam/backup" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$SYSAS7" DC_SUDO="" dc_run --user
 check "seed: user autostart created" "yes" "$([ -f "$H7/.config/autostart/steam.desktop" ] && echo yes || echo no)"
 check "seed: user autostart patched" "patched" "$(dc_classify "$H7/.config/autostart/steam.desktop")"
 check "seed: wrapper Exec + silent arg kept" "Exec=$WRAPPER -silent %U" "$(grep -m1 '^Exec=' "$H7/.config/autostart/steam.desktop")"
-check "seed: no backup left (seeded, not pre-existing)" "no" "$([ -f "$H7/.config/autostart/steam.desktop.slssteam-backup" ] && echo yes || echo no)"
+seed7_backup="$H7/.local/share/SLSsteam/backup/${H7#/}/.config/autostart/steam.desktop"
+check "seed: no central backup (seeded, not pre-existing)" "no" "$([ -f "$seed7_backup" ] && echo yes || echo no)"
 # restore of a SEEDED override deletes it (user never had this file)
-DC_HOME="$H7" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$SYSAS7" DC_SUDO="" dc_restore_all
+DC_HOME="$H7" DC_BACKUP_ROOT="$H7/.local/share/SLSsteam/backup" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$SYSAS7" DC_SUDO="" dc_restore_all
 check "seed restore: override removed" "no" "$([ -e "$H7/.config/autostart/steam.desktop" ] && echo yes || echo no)"
 
 # NO-SEED on a normal desktop: no system autostart, no user autostart -> we must
 # NOT create an autostart entry where the user had none.
 H8="$TMP/home8"; mkdir -p "$H8/.local/share/applications" "$H8/.config/autostart"
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/games/steam %%U\n' > "$H8/.local/share/applications/steam.desktop"
-DC_HOME="$H8" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" dc_run --user
+DC_HOME="$H8" DC_BACKUP_ROOT="$H8/.local/share/SLSsteam/backup" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" dc_run --user
 check "no-seed: autostart NOT created on normal desktop" "no" "$([ -e "$H8/.config/autostart/steam.desktop" ] && echo yes || echo no)"
 
 # SEED is a no-op when the user ALREADY has an autostart entry (the normal glob
@@ -181,9 +221,10 @@ H9="$TMP/home9"; mkdir -p "$H9/.local/share/applications" "$H9/.config/autostart
 SYSAS9="$TMP/sysas9"; mkdir -p "$SYSAS9"
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam -silent %%U\n' > "$SYSAS9/steam.desktop"
 printf '[Desktop Entry]\nName=Steam\nExec=/usr/games/steam -silent %%U\n' > "$H9/.config/autostart/steam.desktop"
-DC_HOME="$H9" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$SYSAS9" DC_SUDO="" dc_run --user
+DC_HOME="$H9" DC_BACKUP_ROOT="$H9/.local/share/SLSsteam/backup" DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$SYSAS9" DC_SUDO="" dc_run --user
 check "seed no-op: existing user autostart patched in place" "patched" "$(dc_classify "$H9/.config/autostart/steam.desktop")"
-check "seed no-op: backup kept for pre-existing entry" "yes" "$([ -f "$H9/.config/autostart/steam.desktop.slssteam-backup" ] && echo yes || echo no)"
+seed9_backup="$H9/.local/share/SLSsteam/backup/${H9#/}/.config/autostart/steam.desktop"
+check "seed no-op: central backup kept for pre-existing entry" "yes" "$([ -f "$seed9_backup" ] && echo yes || echo no)"
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES"
 exit "$fail"

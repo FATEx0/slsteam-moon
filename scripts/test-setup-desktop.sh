@@ -17,6 +17,14 @@ ck "wrapper body re-asserts coverage each launch (--user)" \
    "$(grep -q 'ensure-desktop-coverage.sh" --user' "$HERE/setup.sh" && echo yes || echo no)"
 ck "immutable distros run --user only (no system patch attempt)" \
    "$(grep -q 'is_immutable_distro' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup creates the central desktop-backup directory" \
+   "$(grep -q 'SLSsteam/backup\|SLSDIR/backup' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup invokes legacy-backup migration before desktop repatch" \
+   "$(grep -q 'dc_migrate_legacy_backups' "$HERE/setup.sh" && echo yes || echo no)"
+ck "desktop helper no longer assigns adjacent backups" \
+   "$(! grep -q 'bak="\$f.slssteam-backup"' "$HERE/tools/desktop-coverage.lib.sh" && echo yes || echo no)"
+ck "immutable setup skips the system desktop database refresh" \
+   "$(grep -q '\[ "\$system_desktop_changed" = 1 \].*command -v sudo' "$HERE/setup.sh" && echo yes || echo no)"
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES"
 exit "$fail"

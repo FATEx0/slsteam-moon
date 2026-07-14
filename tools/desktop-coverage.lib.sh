@@ -9,6 +9,82 @@
 # because the user never had them.
 : "${DC_SEED_TAG:=X-SLSteamMoon-Seeded=true}"
 : "${WRAPPER:=$HOME/.local/share/SLSsteam/path/steam}"
+: "${DC_HOME:=$HOME}"
+# Empty means "$DC_HOME/.local/share/SLSsteam/backup". Tests may override this
+# without changing HOME. The mirrored absolute source path below avoids name
+# collisions between (for example) user and system steam.desktop files.
+: "${DC_BACKUP_ROOT:=}"
+
+dc_backup_root() {
+	printf '%s\n' "${DC_BACKUP_ROOT:-$DC_HOME/.local/share/SLSsteam/backup}"
+}
+
+# dc_backup_path <original> — central backup path, mirroring the absolute
+# original underneath SLSsteam/backup.
+dc_backup_path() {
+	local f="$1" rel
+	case "$f" in /*) rel="${f#/}" ;; *) rel="$f" ;; esac
+	printf '%s/%s\n' "$(dc_backup_root)" "$rel"
+}
+
+# Copy an original/legacy backup into the central store without ever replacing
+# a backup already captured by an earlier run. $3 is "sudo" for a source that
+# needs root to read; redirection remains user-owned.
+dc_store_backup() {
+	local src="$1" original="$2" S="${3:-}" bak
+	bak="$(dc_backup_path "$original")"
+	[ -f "$bak" ] && return 0
+	mkdir -p "$(dirname "$bak")" 2>/dev/null || return 1
+	if [ -n "$S" ]; then
+		$S cat -- "$src" > "$bak" 2>/dev/null || { rm -f "$bak"; return 1; }
+	else
+		cp -- "$src" "$bak" 2>/dev/null || { rm -f "$bak"; return 1; }
+	fi
+	chmod 0644 "$bak" 2>/dev/null || true
+}
+
+# dc_migrate_legacy_file <legacy-backup> [sudo] — move one adjacent backup to
+# the central mirror. The adjacent file is removed only after its contents are
+# safely present centrally.
+dc_migrate_legacy_file() {
+	local legacy="$1" S="${2:-}" original
+	[ -f "$legacy" ] || return 0
+	case "$legacy" in
+		*.slssteam-backup) original="${legacy%.slssteam-backup}" ;;
+		*.slsteam-bak)    original="${legacy%.slsteam-bak}" ;;
+		*) return 0 ;;
+	esac
+	dc_store_backup "$legacy" "$original" "$S" || return 1
+	$S rm -f -- "$legacy" 2>/dev/null || return 1
+}
+
+dc_migrate_legacy_dir() {
+	local dir="$1" S="${2:-}" legacy
+	[ -d "$dir" ] || return 0
+	for legacy in \
+		"$dir"/*steam*.desktop.slssteam-backup \
+		"$dir"/*steam*.desktop.slsteam-bak; do
+		[ -f "$legacy" ] || continue
+		dc_migrate_legacy_file "$legacy" "$S" || true
+	done
+}
+
+# dc_migrate_legacy_backups [--user|--system] — runs BEFORE repatching. It also
+# catches the critical case where steam.desktop was deleted when autostart was
+# disabled but steam.desktop.slssteam-backup was left behind and executable by
+# KDE/systemd's XDG autostart generator.
+dc_migrate_legacy_backups() {
+	local mode="${1:---user}" desktop
+	mkdir -p "$(dc_backup_root)" 2>/dev/null || return 1
+	desktop="$(dc_desktop_dir)"
+	dc_migrate_legacy_dir "$DC_HOME/.local/share/applications"
+	dc_migrate_legacy_dir "$DC_HOME/.config/autostart"
+	dc_migrate_legacy_dir "$desktop"
+	if [ "$mode" = "--system" ]; then
+		dc_migrate_legacy_dir "$DC_SYS_APPS" "$DC_SUDO"
+		dc_migrate_legacy_dir "$DC_SYS_AUTOSTART" "$DC_SUDO"
+	fi
+}
 
 # dc_classify <file> -> echoes one of: launcher | stub | patched | unrelated
 # launcher  = a real Steam launcher entry we should patch
@@ -73,13 +149,16 @@ dc_rewrite_exec() {
 # files. Returns 0 on patch, 1 on no-op/failure.
 dc_patch_one() {
 	local f="$1" S="${2:-}" bak tmp
-	bak="$f.slssteam-backup"
+	bak="$(dc_backup_path "$f")"
 	[ -f "$f" ] || return 1
 	# A seeded override (we created it; the user had no such file) must never get
 	# a backup, so a re-patch on a later run doesn't turn it into a "restore to
 	# vanilla" on uninstall. dc_restore_one deletes seeded files outright.
-	if ! grep -qxF "$DC_SEED_TAG" "$f" 2>/dev/null; then
-		[ -f "$bak" ] || $S cp -- "$f" "$bak" 2>/dev/null
+	# Likewise, if an old installation already left the active entry patched but
+	# lost its original, never record that patched file as the "original".
+	if ! grep -qxF "$DC_SEED_TAG" "$f" 2>/dev/null \
+	   && ! grep -qxF "$DC_TAG" "$f" 2>/dev/null; then
+		dc_store_backup "$f" "$f" "$S" || return 1
 	fi
 	tmp="$(mktemp)" || return 1
 	cat "$f" > "$tmp" 2>/dev/null
@@ -104,10 +183,11 @@ dc_patch_one() {
 # restore a vanilla copy on a re-bootstrap; the per-launch/Lumen re-assert
 # re-patches it then.
 dc_patch_shortcut() {
-	local sc="$1"
+	local sc="$1" bak
 	[ -e "$sc" ] || return 0          # never create a shortcut the user lacked
 	if [ -L "$sc" ]; then              # migrate a legacy symlink we may have made
-		[ -f "$sc.slssteam-backup" ] && { rm -f "$sc"; cp -- "$sc.slssteam-backup" "$sc" 2>/dev/null; } || rm -f "$sc"
+		bak="$(dc_backup_path "$sc")"
+		[ -f "$bak" ] && { rm -f "$sc"; cp -- "$bak" "$sc" 2>/dev/null; } || rm -f "$sc"
 		[ -e "$sc" ] || return 0
 	fi
 	case "$(dc_classify "$sc")" in
@@ -120,7 +200,6 @@ dc_patch_shortcut() {
 }
 
 # Overridable roots (tests inject fakes; real callers leave them at defaults).
-: "${DC_HOME:=$HOME}"
 : "${DC_SYS_APPS:=/usr/share/applications}"
 : "${DC_SYS_AUTOSTART:=/etc/xdg/autostart}"
 # Command used to write system-owned files. Default "sudo"; tests set it empty.
@@ -184,9 +263,8 @@ dc_seed_autostart_override() {
 	grep -qiE '^Exec=.*steam' "$sys_as" 2>/dev/null || return 0
 	mkdir -p "$(dirname "$user_as")" 2>/dev/null || return 0
 	cp -- "$sys_as" "$user_as" 2>/dev/null || return 0
-	dc_patch_one "$user_as"
-	rm -f "$user_as.slssteam-backup"   # seeded, not pre-existing -> restore deletes
-	# Mark it seeded so re-patches never create a backup and uninstall deletes it.
+	# Mark it seeded BEFORE patching so dc_patch_one never captures this
+	# just-created file as an original.
 	if ! grep -qxF "$DC_SEED_TAG" "$user_as" 2>/dev/null; then
 		local tmp; tmp="$(mktemp)" || return 0
 		awk -v s="$DC_SEED_TAG" '
@@ -194,15 +272,21 @@ dc_seed_autostart_override() {
 		' "$user_as" > "$tmp" 2>/dev/null && cat "$tmp" > "$user_as"
 		rm -f "$tmp"
 	fi
+	dc_patch_one "$user_as"
+	# Defensive cleanup for an interrupted older seeding implementation.
+	rm -f "$user_as.slssteam-backup" "$user_as.slsteam-bak" "$(dc_backup_path "$user_as")"
 }
 
 # dc_run [--user|--system] — patch all known *steam*.desktop locations. --user
 # (default) does user-owned dirs only (no sudo). --system additionally patches
-# the system menu dir + stub (caller must provide sudo rights). Always blinds the
-# desktop shortcut via symlink to the user menu entry.
+# the system menu dir + stub (caller must provide sudo rights). An existing
+# desktop shortcut is patched in place; one is never created implicitly.
 dc_run() {
 	local mode="${1:---user}" menu
 	menu="$DC_HOME/.local/share/applications/steam.desktop"
+	# Migration must precede every repatch: adjacent .desktop backups are active
+	# launch candidates on KDE's systemd XDG-autostart implementation.
+	dc_migrate_legacy_backups "$mode"
 	dc_patch_glob "" "$DC_HOME/.local/share/applications"
 	# Seed a user autostart override from the system entry (SteamOS/Bazzite) BEFORE
 	# the autostart glob, so a freshly seeded file is (idempotently) re-patched too.
@@ -216,29 +300,37 @@ dc_run() {
 	return 0
 }
 
-# dc_restore_one <file> [sudo] — restore from <file>.slssteam-backup if present
-# (authoritative even for a legacy unreadable 0711 entry), 0644; else if it
-# carries our tag, remove it. A symlink we made is removed and, if a backup
-# exists, that backup is restored as the original regular file.
+# dc_restore_one <file> [sudo] — migrate any adjacent legacy backup, then
+# restore from the central mirrored backup when present (0644); otherwise remove
+# entries carrying our tag. A symlink we made is replaced by its central
+# original when available.
 dc_restore_one() {
 	local f="$1" S="${2:-}" bak
-	bak="$f.slssteam-backup"
+	# Accept and immediately centralize both historical adjacent suffixes.
+	dc_migrate_legacy_file "$f.slssteam-backup" "$S" || true
+	dc_migrate_legacy_file "$f.slsteam-bak" "$S" || true
+	bak="$(dc_backup_path "$f")"
 	# A seeded override was created by us — the user never had it — so remove it
 	# (and any stray backup) rather than restoring a vanilla copy.
 	if [ -f "$f" ] && grep -qxF "$DC_SEED_TAG" "$f" 2>/dev/null; then
-		$S rm -f -- "$f" "$bak" 2>/dev/null
+		$S rm -f -- "$f" 2>/dev/null
+		rm -f -- "$bak" "$f.slssteam-backup" "$f.slsteam-bak" 2>/dev/null
 		return 0
 	fi
 	if [ -L "$f" ]; then
 		$S rm -f -- "$f" 2>/dev/null
-		if [ -f "$bak" ]; then $S cp -- "$bak" "$f" 2>/dev/null; $S rm -f -- "$bak" 2>/dev/null; fi
+		if [ -f "$bak" ] && $S cp -- "$bak" "$f" 2>/dev/null; then
+			rm -f -- "$bak" 2>/dev/null
+		fi
 		return 0
 	fi
 	if [ -f "$bak" ]; then
-		$S cp --remove-destination -- "$bak" "$f" 2>/dev/null
-		$S chmod 0644 "$f" 2>/dev/null || true
-		$S rm -f -- "$bak" 2>/dev/null
-		return 0
+		if $S cp --remove-destination -- "$bak" "$f" 2>/dev/null; then
+			$S chmod 0644 "$f" 2>/dev/null || true
+			rm -f -- "$bak" 2>/dev/null
+			return 0
+		fi
+		return 1
 	fi
 	[ -f "$f" ] && grep -q "$DC_TAG" "$f" 2>/dev/null && $S rm -f -- "$f" 2>/dev/null
 	return 0
@@ -248,6 +340,7 @@ dc_restore_one() {
 # sudo, system dirs with $DC_SUDO).
 dc_restore_all() {
 	local d f
+	dc_migrate_legacy_backups --system
 	for d in "$DC_HOME/.local/share/applications" "$DC_HOME/.config/autostart"; do
 		[ -d "$d" ] || continue
 		for f in "$d"/*steam*.desktop; do [ -e "$f" ] || [ -L "$f" ] || continue; dc_restore_one "$f"; done
