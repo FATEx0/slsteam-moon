@@ -26,6 +26,7 @@
 #include "feats/misc.hpp"
 #include "feats/fakeappid.hpp"
 #include "feats/packagepatch.hpp"
+#include "feats/parental.hpp"
 #include "feats/pics.hpp"
 #include "feats/reconcilepin.hpp"
 #include "feats/steamstub.hpp"
@@ -1057,6 +1058,7 @@ bool Hooks::setup()
 	PackagePatch::setup();
 	ManifestBind::setup();
 	ReconcilePin::setup();
+	Parental::setup();
 
 	return succeeded;
 }
@@ -1167,6 +1169,7 @@ void Hooks::remove()
 	PackagePatch::remove();
 	ManifestBind::remove();
 	ReconcilePin::remove();
+	Parental::remove();
 
 	if (hkNakedGetSteamId != LM_ADDRESS_BAD)
 	{

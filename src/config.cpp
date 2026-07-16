@@ -215,6 +215,7 @@ bool CConfig::loadSettings()
 	__loadErrors = ELoadError::None;
 	
 	disableFamilyLock = getSetting<bool>(node, "DisableFamilyShareLock", true);
+	disableParentalRestrictions = getSetting<bool>(node, "DisableParentalRestrictions", false);
 	useWhiteList = getSetting<bool>(node, "UseWhitelist", false);
 	automaticFilter = getSetting<bool>(node, "AutoFilterList", true);
 	playNotOwnedGames = getSetting<bool>(node, "PlayNotOwnedGames", false);
@@ -242,6 +243,7 @@ bool CConfig::loadSettings()
 
 	//TODO: Create smart logging function to log them automatically via getSetting
 	g_pLog->info("DisableFamilyShareLock: %i\n", disableFamilyLock.get());
+	g_pLog->info("DisableParentalRestrictions: %i\n", disableParentalRestrictions.get());
 	g_pLog->info("UseWhitelist: %i\n", useWhiteList.get());
 	g_pLog->info("AutoFilterList: %i\n", automaticFilter.get());
 	g_pLog->info("PlayNotOwnedGames: %i\n", playNotOwnedGames.get());

@@ -105,6 +105,7 @@ static void autoResolveIpcFrameRoots()
 	}
 }
 
+
 bool Patterns::init()
 {
 	bool found = true;
@@ -126,6 +127,8 @@ bool Patterns::init()
 	CDepotDownloadMgr::PrepareDepotDownload.optional = true;
 	CDepotDownloadMgr::BuildDepotDependency.optional = true;
 	CDepotDownloadMgr::EvaluateConfigChanges.optional = true;
+	ParentalSignatureCheck.optional = true;
+	ParentalSettingsReceived.optional = true;
 	for(auto& pattern : patterns())
 	{
 		if (!pattern->find())
@@ -172,6 +175,18 @@ namespace Patterns
 		"8B 40 ? 83 EC 0C 89 F3 8B 95",
 		SigFollowMode::PrologueUpwards,
 		std::vector<uint8_t> { 0x56, 0x57, 0xe5, 0x89, 0x55 }
+	};
+	Pattern_t ParentalSignatureCheck
+	{
+		"ParentalSignatureCheck",
+		"84 C0 75 27 8B 85 ? ? ? ? 8D 9D ? ? ? ? 83 EC 04 FF B0 82 01 00 00 8D 86 ? ? ? ? 50 53 E8 ? ? ? ?",
+		SigFollowMode::None
+	};
+	Pattern_t ParentalSettingsReceived
+	{
+		"ParentalSettingsReceived",
+		"55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 00 02 00 00 8B 45 08 8B 55 1C 8B 7D 0C",
+		SigFollowMode::None
 	};
 
 	Pattern_t TraceIPC
@@ -628,4 +643,3 @@ namespace Patterns
 		return instance;
 	}
 }
-

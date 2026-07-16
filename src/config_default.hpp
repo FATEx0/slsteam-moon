@@ -24,6 +24,9 @@ static const char* defaultConfig = R"(#Example AppIds Config for those not famil
 #Disables Family Share license locking for self and others
 DisableFamilyShareLock: yes
 
+#Locally unlocks Steam areas restricted by parental controls. Requires restart.
+DisableParentalRestrictions: no
+
 #Switches to whitelist instead of the default blacklist
 UseWhitelist: no
 

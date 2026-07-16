@@ -63,6 +63,7 @@ public:
 	MTVariable<std::unordered_map<uint32_t, std::unordered_set<uint32_t>>> denuvoGames;
 
 	MTVariable<bool> disableFamilyLock;
+	MTVariable<bool> disableParentalRestrictions;
 	MTVariable<bool> useWhiteList;
 	MTVariable<bool> automaticFilter;
 	MTVariable<bool> playNotOwnedGames;
