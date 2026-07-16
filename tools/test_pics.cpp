@@ -8,18 +8,16 @@
 // disk before Steam plans the install (else Steam calls
 // BYldRequestDepotManifest -> "Access Denied" -> the ~30s retry).
 //
-// The original handler did this SEQUENTIALLY (awaitManifestBlob in a
-// loop), so a big title (DL2, 36 depots) blocked the Steam worker thread
-// for 15s+ and froze the Install-dialog buttons.  The fix is to keep the
-// guarantee (all on disk before return) but kick off every fetch first
-// and only then await them all, so the wall time is the slowest fetch,
-// not the sum.
+// The handler once created one std::async thread per target, even when the
+// exact manifest was already in depotcache.  A title with hundreds of depots
+// exhausted the 32-bit Steam process.  The current policy filters ready
+// targets to zero jobs and sends only misses to a fixed worker pool.
 //
 // buildSyncStagePlan is the PURE step that decides WHICH (appId, depotId,
 // gid) manifests to stage — deduplicated, key-gated — separated from the
-// concurrent I/O so the decision is unit-testable without Steam, libcurl
-// or disk.  Parallelizing must NOT change which depots are staged; these
-// tests pin that down.
+// I/O so the decision is unit-testable without Steam, libcurl or disk.
+// buildPendingStagePlan then removes exact manifests already on disk.  These
+// tests pin both decisions down without imposing a target-count limit.
 //
 // Build (from repo root):
 //   g++ -std=c++20 -I include tools/test_pics.cpp -o /tmp/test_pics && /tmp/test_pics
@@ -118,6 +116,50 @@ int main()
 		std::vector<PICS::AppDepots> emptyDepots{ { 42, {} } };
 		CHECK(PICS::buildSyncStagePlan(emptyDepots, allKeys).empty(),
 		      "plan: app with no depots -> empty");
+	}
+
+	// 7) Manifests already present in depotcache must not be submitted or
+	// awaited again.  Only genuinely-missing targets remain in the I/O plan.
+	{
+		const std::vector<PICS::StageTarget> plan{
+			{ 1, 10, 100 },
+			{ 1, 11, 101 },
+			{ 2, 20, 200 },
+		};
+		int checks = 0;
+		const auto pending = PICS::buildPendingStagePlan(
+		    plan,
+		    [&](const PICS::StageTarget& target)
+		    {
+		        ++checks;
+		        return target.depotId != 11;
+		    });
+		CHECK(checks == 3, "pending plan: checks every target exactly once");
+		CHECK(pending.size() == 1 && hasTarget(pending, 1, 11, 101),
+		      "pending plan: keeps only manifests absent from depotcache");
+	}
+
+	// 8) Volume is not a policy limit.  A title may expose thousands of
+	// manifests; if they are already staged, all are checked and none creates
+	// background work.
+	{
+		std::vector<PICS::StageTarget> plan;
+		for (uint32_t i = 0; i < 2000; ++i)
+		{
+			plan.push_back({ 311210, 400000 + i, 9000000 + i });
+		}
+		std::size_t checks = 0;
+		const auto pending = PICS::buildPendingStagePlan(
+		    plan,
+		    [&](const PICS::StageTarget&)
+		    {
+		        ++checks;
+		        return true;
+		    });
+		CHECK(checks == plan.size(),
+		      "pending plan: checks every manifest without a count cap");
+		CHECK(pending.empty(),
+		      "pending plan: thousands of ready manifests create zero jobs");
 	}
 
 	if (g_failures == 0) { std::printf("\nALL PASS\n"); return 0; }

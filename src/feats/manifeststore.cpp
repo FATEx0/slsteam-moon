@@ -105,6 +105,19 @@ namespace ManifestStore
 		for (uint32_t d : depotIds) archiveDepot(d);
 	}
 
+	bool isInDepotcache(uint32_t depotId, uint64_t gid)
+	{
+		if (!gid) return false;
+		const std::string root = steamRoot();
+		if (root.empty()) return false;
+
+		const std::string name = std::to_string(depotId) + "_"
+		                         + std::to_string(gid) + ".manifest";
+		const fs::path path = fs::path(root) / "depotcache" / name;
+		std::error_code ec;
+		return fs::exists(path, ec) && fs::file_size(path, ec) > 0 && !ec;
+	}
+
 	bool restoreToDepotcache(uint32_t depotId, uint64_t gid)
 	{
 		if (!gid) return false;

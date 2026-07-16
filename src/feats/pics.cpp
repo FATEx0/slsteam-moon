@@ -202,8 +202,8 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	// AdditionalApps whose live product-info buffer is empty: we must
 	// stage their depot manifests ourselves, SYNCHRONOUSLY before this
 	// handler returns (so they're on disk before Steam plans the install).
-	// We collect them here and stage them CONCURRENTLY after the per-app
-	// loop instead of blocking on each in turn — see the staging pass below.
+	// We collect them here, filter manifests already on disk, then queue only
+	// misses to the bounded executor — see the staging pass below.
 	std::vector<AppDepots> toStage;
 
 	const auto added = g_config.addedAppIds.get();
@@ -319,8 +319,8 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 		toStage.push_back({app->appid(), std::move(depots)});
 	}
 
-	// Stage every AdditionalApp depot manifest CONCURRENTLY, before this
-	// handler returns.
+	// Ensure every AdditionalApp depot manifest is staged before this handler
+	// returns.  Ready targets do no work; misses use bounded concurrency.
 	//
 	// Why staging must finish before we return (confirmed in testing):
 	// clicking Install triggers a fresh PICS product-info request, and
@@ -337,15 +337,17 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	// So the blobs must be on disk before we return.  This runs on a
 	// genuine Steam worker thread (the InitFromPacket detour).
 	//
-	// We used to await each depot SEQUENTIALLY (awaitManifestBlob in the
-	// loop above), which on a cold cache cost ~0.4-0.5s per depot and, on a
-	// big title (DL2, 36 depots), blocked this thread — the one that also
-	// answers the Install dialog's button IPCs — for 15s+, freezing every
-	// button.  We now keep the guarantee but kick off ALL fetches first,
-	// then await them, so the wall time is the slowest fetch (~1-2s) rather
-	// than the sum.  ManifestFetch dedups by (gid, depotId) and the await
-	// just joins the in-flight fetch, so this stages exactly the same set,
-	// only concurrently.
+	// We used to create one std::async thread for EVERY target, including
+	// manifests restoreToDepotcache had already made ready.  Large depot
+	// graphs (311210 exposes 800+) exhausted the 32-bit Steam process during
+	// this callback.  The corrected flow:
+	//   1. performs only a cheap exact on-disk check here;
+	//   2. gives already-staged targets no task and no await at all;
+	//   3. sends only missing targets to ManifestFetch's fixed worker pool,
+	//      where restore-from-store and network I/O happen off this thread.
+	// There is no manifest-count cap.  We still await genuinely-missing
+	// targets because returning before they reach disk makes Steam plan BYld
+	// and fail the first install attempt.
 	const auto plan = buildSyncStagePlan(
 	    toStage,
 	    [](uint32_t depotId)
@@ -353,24 +355,37 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	        return !DepotKey::getCachedKey(depotId).key.empty();
 	    });
 
-	// Pass 1: kick off every fetch (async, deduped at the fetch layer).
-	for (const auto& t : plan)
+	std::size_t alreadyStaged = 0;
+	const auto pending = buildPendingStagePlan(
+	    plan,
+	    [&](const StageTarget& target)
+	    {
+	        if (!ManifestStore::isInDepotcache(target.depotId, target.gid))
+	        {
+	            return false;
+	        }
+	        ++alreadyStaged;
+	        return true;
+	    });
+
+	if (!plan.empty())
 	{
-		if (ManifestStore::restoreToDepotcache(t.depotId, t.gid))
-		{
-			g_pLog->info("PICS: manifest for app=%u depot=%u gid=%llu restored from ManifestStore\n",
-			             t.appId, t.depotId, static_cast<unsigned long long>(t.gid));
-		}
-		else
-		{
-			g_pLog->info("PICS: staging manifest for app=%u depot=%u gid=%llu (concurrent)\n",
-			             t.appId, t.depotId, static_cast<unsigned long long>(t.gid));
-		}
+		g_pLog->info(
+		    "PICS: manifest plan targets=%zu already_on_disk=%zu pending=%zu\n",
+		    plan.size(), alreadyStaged, pending.size());
+	}
+
+	// Pass 1: queue only manifests not already present.  The fixed executor
+	// restores from ManifestStore first and reaches the CDN only on a miss.
+	for (const auto& t : pending)
+	{
+		g_pLog->info("PICS: staging manifest for app=%u depot=%u gid=%llu (bounded worker)\n",
+		             t.appId, t.depotId, static_cast<unsigned long long>(t.gid));
 		ManifestFetch::submitManifestBlob(t.gid, t.appId, t.depotId);
 	}
 
-	// Pass 2: block until each lands on disk (joins the in-flight fetch).
-	for (const auto& t : plan)
+	// Pass 2: block only for the missing subset (joins the queued work).
+	for (const auto& t : pending)
 	{
 		const bool staged = ManifestFetch::awaitManifestBlob(
 		    t.gid, t.depotId, ManifestFetch::getTimeoutSec());

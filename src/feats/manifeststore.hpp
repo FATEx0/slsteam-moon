@@ -39,6 +39,10 @@ namespace ManifestStore
 	void archiveDepot(uint32_t depotId);
 	void archiveDepots(const std::vector<uint32_t>& depotIds);
 
+	// Cheap exact check used by the PICS recv path.  Performs no copy and no
+	// network work, so an already-staged manifest creates no background job.
+	bool isInDepotcache(uint32_t depotId, uint64_t gid);
+
 	// If store/<depotId>_<gid>.manifest exists and depotcache lacks it,
 	// copy it into depotcache so Steam's on-disk check finds it.  Returns
 	// true if the manifest is present in depotcache afterwards.

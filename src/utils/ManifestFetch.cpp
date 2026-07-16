@@ -2,8 +2,10 @@
 #include "ManifestFetch.hpp"
 
 #include "../config.hpp"
+#include "../feats/manifeststore.hpp"
 #include "../log.hpp"
 #include "../cainfo.hpp"
+#include "boundedexecutor.hpp"
 
 #include <curl/curl.h>
 
@@ -679,6 +681,15 @@ struct BlobKeyEq
 std::mutex g_blobLock;
 std::unordered_map<BlobKey, std::shared_future<bool>, BlobKeyHash, BlobKeyEq> g_blobInflight;
 
+// Fixed concurrency, unlimited queue length.  The executor is intentionally
+// process-lifetime: SLSsteam is session-long and destroying joinable workers
+// during Steam teardown is riskier than letting the OS reclaim them at exit.
+BoundedExecutor& blobExecutor()
+{
+	static auto* executor = new BoundedExecutor(8);
+	return *executor;
+}
+
 std::shared_future<bool> launchOrJoinBlob(uint64_t gid, uint32_t depotId,
                                           const std::string& depotcacheDir)
 {
@@ -720,12 +731,37 @@ std::shared_future<bool> launchOrJoinBlob(uint64_t gid, uint32_t depotId,
 			return it->second;
 		}
 	}
-	auto fut = std::async(std::launch::async,
-	    [gid, depotId, depotcacheDir]() -> bool
-	    {
-	        return fetchManifestBlob(gid, depotId, depotcacheDir);
-	    }).share();
+
+	auto completion = std::make_shared<std::promise<bool>>();
+	auto fut = completion->get_future().share();
 	g_blobInflight.emplace(key, fut);
+
+	const bool accepted = blobExecutor().submit(
+	    [gid, depotId, depotcacheDir, completion]
+	    {
+	        bool ok = false;
+	        try
+	        {
+	            // Do filesystem restoration and any network fetch on our
+	            // executor, never on Steam's PICS/IPC worker.
+	            ok = ManifestStore::restoreToDepotcache(depotId, gid)
+	                 || fetchManifestBlob(gid, depotId, depotcacheDir);
+	        }
+	        catch (...)
+	        {
+	            g_pLog->info(
+	                "ManifestFetch: blob depot=%u gid=%llu worker failed unexpectedly\n",
+	                depotId, static_cast<unsigned long long>(gid));
+	        }
+	        try { completion->set_value(ok); } catch (...) {}
+	    });
+	if (!accepted)
+	{
+		g_pLog->info(
+		    "ManifestFetch: blob depot=%u gid=%llu executor unavailable\n",
+		    depotId, static_cast<unsigned long long>(gid));
+		try { completion->set_value(false); } catch (...) {}
+	}
 	return fut;
 }
 } // namespace

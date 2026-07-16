@@ -65,9 +65,8 @@ namespace PICS
 	// (staging a blob we can't decrypt is a wasted CDN round-trip).  The
 	// SAME (depotId, gid) seen across multiple apps is staged once — the
 	// fetch layer dedups by (gid, depotId) too, but deduping the plan saves
-	// a redundant await.  This is the decision the (formerly sequential,
-	// now concurrent) staging pass in recvProductInfoResponse executes; it
-	// MUST NOT change which depots are staged, only the order/concurrency.
+	// a redundant readiness check.  This decides the complete target set;
+	// buildPendingStagePlan later removes exact manifests already on disk.
 	inline std::vector<StageTarget> buildSyncStagePlan(
 	    const std::vector<AppDepots>& apps,
 	    const std::function<bool(uint32_t depotId)>& hasKey)
@@ -89,5 +88,27 @@ namespace PICS
 			}
 		}
 		return out;
+	}
+
+	// Remove targets whose exact depot+gid manifest is already ready for
+	// Steam.  The predicate is intentionally injected so the policy stays
+	// unit-testable without touching the real depotcache.
+	//
+	// This is a filter, not a cap: every target is checked exactly once and
+	// any number of missing targets may be returned.
+	inline std::vector<StageTarget> buildPendingStagePlan(
+	    const std::vector<StageTarget>& plan,
+	    const std::function<bool(const StageTarget&)>& isReady)
+	{
+		std::vector<StageTarget> pending;
+		pending.reserve(plan.size());
+		for (const auto& target : plan)
+		{
+			if (!isReady || !isReady(target))
+			{
+				pending.push_back(target);
+			}
+		}
+		return pending;
 	}
 }
