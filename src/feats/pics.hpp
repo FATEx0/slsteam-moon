@@ -30,11 +30,13 @@
 
 class CProtoBufMsgBase;
 class CMsgClientPICSProductInfoResponse;
+class CMsgClientPICSChangesSinceResponse;
 
 namespace PICS
 {
 	void recvMsg(CProtoBufMsgBase* msg);
 	void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp);
+	void recvChangesSinceResponse(CMsgClientPICSChangesSinceResponse* resp);
 
 	// Rollback gate for the old architecture that staged every depot from the
 	// product-info buffer and started the periodic prewarm worker. The

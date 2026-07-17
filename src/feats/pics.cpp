@@ -1,6 +1,7 @@
 
 #include "pics.hpp"
 
+#include "appinfo_provision.hpp"
 #include "depotkey.hpp"
 #include "manifeststore.hpp"
 #include "prewarm.hpp"
@@ -441,6 +442,28 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	Updater::refreshInBackgroundIfStale();
 }
 
+void recvChangesSinceResponse(CMsgClientPICSChangesSinceResponse* resp)
+{
+	if (!resp) return;
+
+	int stripped = 0;
+	for (int i = resp->app_changes_size() - 1; i >= 0; --i)
+	{
+		if (AppInfoProvision::isSynthesizedApp(resp->app_changes(i).appid()))
+		{
+			g_pLog->debug("PICS: stripping synthetic app %u from changelist\n",
+			              resp->app_changes(i).appid());
+			resp->mutable_app_changes()->DeleteSubrange(i, 1);
+			++stripped;
+		}
+	}
+	if (stripped > 0)
+	{
+		g_pLog->info("PICS: filtered %d synthetic app(s) from changelist (%d remaining)\n",
+		             stripped, resp->app_changes_size());
+	}
+}
+
 void recvMsg(CProtoBufMsgBase* msg)
 {
 	if (!msg) return;
@@ -448,6 +471,9 @@ void recvMsg(CProtoBufMsgBase* msg)
 	{
 		case EMSG_PICS_PRODUCTINFO_RESPONSE:
 			recvProductInfoResponse(msg->getBody<CMsgClientPICSProductInfoResponse>());
+			break;
+		case EMSG_PICS_CHANGES_RESPONSE:
+			recvChangesSinceResponse(msg->getBody<CMsgClientPICSChangesSinceResponse>());
 			break;
 		default:
 			break;
