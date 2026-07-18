@@ -144,10 +144,23 @@ inline std::optional<std::vector<uint8_t>>
 rewriteSettings(const uint8_t* data, std::size_t len)
 {
 	std::vector<uint8_t> out;
+	bool parentalEnabled = false;
 	const bool valid = Wire::walk(data, len, [&](const Wire::Field& field) {
 		switch (field.number)
 		{
-		case 9:  // is_enabled
+		case 9: // is_enabled
+		{
+			if (field.wireType == 0)
+			{
+				std::size_t pos = field.valueOff;
+				uint64_t value = 0;
+				if (Wire::readVarint(data, len, pos, value))
+				{
+					parentalEnabled = value != 0;
+				}
+			}
+			return;
+		}
 		case 10: // enabled_features
 		case 13: // temporary_enabled_features
 		case 15: // playtime_restrictions
@@ -159,10 +172,15 @@ rewriteSettings(const uint8_t* data, std::size_t len)
 		}
 	});
 	if (!valid) return std::nullopt;
+	if (!parentalEnabled) return std::vector<uint8_t>(data, data + len);
 
-	Wire::putVarintField(out, 9, 0);
-	Wire::putVarintField(out, 10, 0xffffffffULL);
-	Wire::putVarintField(out, 13, 0xffffffffULL);
+	// Keep parental mode active while allowing every locally unlockable feature.
+	// Disabling parental mode makes Steam normalize these masks to all bits,
+	// including an unnamed feature value that produces startup assertions.
+	constexpr uint64_t unlockableFeatures = 0x7fffULL;
+	Wire::putVarintField(out, 9, 1);
+	Wire::putVarintField(out, 10, unlockableFeatures);
+	Wire::putVarintField(out, 13, unlockableFeatures);
 	return out;
 }
 

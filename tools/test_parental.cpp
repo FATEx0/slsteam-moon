@@ -101,15 +101,26 @@ int main()
 		CHECK(rewritten.has_value(), "valid parental settings are rewritten");
 		if (rewritten)
 		{
-			CHECK(varintField(*rewritten, 9) == 0, "is_enabled is cleared");
-			CHECK(varintField(*rewritten, 10) == 0xffffffffULL,
-			      "enabled_features allows every local feature");
-			CHECK(varintField(*rewritten, 13) == 0xffffffffULL,
-			      "temporary_enabled_features allows every local feature");
+			CHECK(varintField(*rewritten, 9) == 1, "is_enabled remains active");
+			CHECK(varintField(*rewritten, 10) == 0x7fffULL,
+			      "enabled_features allows every locally unlockable feature");
+			CHECK(varintField(*rewritten, 13) == 0x7fffULL,
+			      "temporary_enabled_features allows every locally unlockable feature");
 			CHECK(!hasField(*rewritten, 15), "playtime restrictions are removed");
 			CHECK(!hasField(*rewritten, 16), "temporary playtime restrictions are removed");
 			CHECK(varintField(*rewritten, 20) == 7, "unrelated settings are preserved");
 		}
+	}
+
+	{
+		std::vector<uint8_t> settings;
+		putVarintField(settings, 1, 76561198000000000ULL);
+		putVarintField(settings, 9, 0);
+		putVarintField(settings, 10, 0x1234);
+
+		auto rewritten = Parental::rewriteSettings(settings.data(), settings.size());
+		CHECK(rewritten == settings,
+		      "already-disabled parental settings are left unchanged");
 	}
 
 	{
