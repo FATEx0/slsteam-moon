@@ -40,6 +40,7 @@ inline bool readVarint(const uint8_t* data, std::size_t len,
 	while (pos < len && shift <= 63)
 	{
 		const uint8_t byte = data[pos++];
+		if (shift == 63 && (byte & 0xfe) != 0) return false;
 		value |= static_cast<uint64_t>(byte & 0x7f) << shift;
 		if (!(byte & 0x80))
 		{
@@ -71,9 +72,10 @@ inline bool walk(const uint8_t* data, std::size_t len, Fn&& fn)
 		uint64_t tag = 0;
 		if (!readVarint(data, len, pos, tag)) return false;
 
-		const uint32_t number = static_cast<uint32_t>(tag >> 3);
+		const uint64_t number64 = tag >> 3;
+		if (number64 == 0 || number64 > 0x1fffffffULL) return false;
+		const uint32_t number = static_cast<uint32_t>(number64);
 		const uint8_t wireType = static_cast<uint8_t>(tag & 7);
-		if (number == 0) return false;
 
 		std::size_t valueOff = pos;
 		std::size_t valueLen = 0;
@@ -89,7 +91,7 @@ inline bool walk(const uint8_t* data, std::size_t len, Fn&& fn)
 			break;
 		}
 		case 1:
-			if (pos + 8 > len) return false;
+			if (len - pos < 8) return false;
 			valueOff = pos;
 			valueLen = 8;
 			pos += 8;
@@ -105,7 +107,7 @@ inline bool walk(const uint8_t* data, std::size_t len, Fn&& fn)
 			break;
 		}
 		case 5:
-			if (pos + 4 > len) return false;
+			if (len - pos < 4) return false;
 			valueOff = pos;
 			valueLen = 4;
 			pos += 4;

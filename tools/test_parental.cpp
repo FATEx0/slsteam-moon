@@ -116,6 +116,17 @@ int main()
 		const uint8_t malformed[] = { 0x0a, 0x7f };
 		CHECK(!Parental::rewriteSettings(malformed, sizeof(malformed)).has_value(),
 		      "malformed parental settings are rejected");
+		const uint8_t overflowingVarint[] = {
+			0x48, 0x80, 0x80, 0x80, 0x80, 0x80,
+			0x80, 0x80, 0x80, 0x80, 0x02,
+		};
+		CHECK(!Parental::rewriteSettings(overflowingVarint,
+		      sizeof(overflowingVarint)).has_value(),
+		      "overflowing protobuf varints are rejected");
+		const uint8_t oversizedField[] = { 0x80, 0x80, 0x80, 0x80, 0x10, 0x00 };
+		CHECK(!Parental::rewriteSettings(oversizedField,
+		      sizeof(oversizedField)).has_value(),
+		      "protobuf field numbers above the valid range are rejected");
 	}
 
 	if (g_failures == 0)
