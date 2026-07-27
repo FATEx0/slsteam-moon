@@ -20,6 +20,7 @@
 #include "feats/achievements.hpp"
 #include "feats/apps.hpp"
 #include "feats/depotkey.hpp"
+#include "feats/depotquarantine.hpp"
 #include "feats/dlc.hpp"
 #include "feats/manifestcode.hpp"
 #include "feats/manifestbind.hpp"
@@ -1057,6 +1058,7 @@ bool Hooks::setup()
 
 	PackagePatch::setup();
 	ManifestBind::setup();
+	DepotQuarantine::setup();
 	ReconcilePin::setup();
 	Parental::setup();
 
@@ -1168,6 +1170,7 @@ void Hooks::remove()
 	
 	PackagePatch::remove();
 	ManifestBind::remove();
+	DepotQuarantine::remove();
 	ReconcilePin::remove();
 	Parental::remove();
 
