@@ -46,11 +46,11 @@ ifeq ($(shell type mold &> /dev/null && echo "found"),found)
 	LDFLAGS += -fuse-ld=mold
 endif
 
-.PHONY: all build rebuild clean install release test-cmwire test-pattern-catalog
+.PHONY: all build rebuild clean install release test-cmwire test-pattern-catalog test-pattern-refresh
 .NOTPARALLEL: clean rebuild
 
 all: build
-build: bin/SLSsteam.so bin/library-inject.so
+build: bin/SLSsteam.so bin/library-inject.so bin/pattern-refresh
 rebuild: clean build
 
 bin/SLSsteam.so: $(objs) $(libs)
@@ -62,6 +62,24 @@ bin/SLSsteam.so: $(objs) $(libs)
 bin/library-inject.so: tools/library-inject/main.cpp
 	@mkdir -p bin
 	$(CXX) -O3 -m32 -fPIC -shared -std=c++20 $< -o $@
+
+PATTERN_PUBLIC_KEY_HEX = $(shell tr -d '[:space:]' < res/pattern-public-key.hex 2>/dev/null)
+
+# Pre-launch metadata refresher. This is a native host executable, not a
+# Steam-loaded i386 object: HTTPS, Ed25519, and cache I/O finish before Steam
+# starts and never run in LD_AUDIT preinit.
+bin/pattern-refresh: tools/pattern-refresh/main.cpp \
+                     tools/pattern-refresh/catalog.cpp \
+                     tools/pattern-refresh/catalog.hpp \
+                     src/pattern_catalog.cpp src/pattern_catalog.hpp \
+                     res/pattern-public-key.hex
+	@test -n "$(PATTERN_PUBLIC_KEY_HEX)" || { echo "missing pattern public key" >&2; exit 1; }
+	@mkdir -p bin
+	$(CXX) -O2 -std=c++20 -Wall -Wextra -Wpedantic \
+		-I src -I tools/pattern-refresh \
+		-DPATTERN_PUBLIC_KEY_HEX='"$(PATTERN_PUBLIC_KEY_HEX)"' \
+		tools/pattern-refresh/main.cpp tools/pattern-refresh/catalog.cpp \
+		src/pattern_catalog.cpp -lcurl -lcrypto -lpthread -o $@
 
 -include $(deps)
 obj/update.o: src/update.cpp res/version.txt
@@ -109,6 +127,13 @@ test-pattern-catalog:
 		tools/test_pattern_catalog.cpp src/pattern_catalog.cpp \
 		-o /tmp/test_pattern_catalog
 	/tmp/test_pattern_catalog
+
+test-pattern-refresh:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I tools -I src \
+		tools/test_pattern_refresh.cpp tools/pattern-refresh/catalog.cpp \
+		src/pattern_catalog.cpp -lcurl -lcrypto -lpthread \
+		-o /tmp/test_pattern_refresh
+	/tmp/test_pattern_refresh
 
 # Live integration harness for the native CM product-info client (talks
 # to real Valve CMs — NOT a unit test).  Links cmclient + its deps.

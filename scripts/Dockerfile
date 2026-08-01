@@ -13,10 +13,14 @@ FROM ubuntu:22.04
 # (-m32 builds; SLSsteam.so must match Steam's 32-bit ubuntu12_32 client.)
 RUN dpkg --add-architecture i386 && \
     apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Dpkg::Options::="--force-overwrite" \
+        install -y --no-install-recommends \
         ca-certificates \
         g++-multilib \
+        libcurl4-openssl-dev:amd64 \
         libcurl4-openssl-dev:i386 \
+        libssl-dev:amd64 \
         libssl-dev:i386 \
         make \
         pkg-config && \
