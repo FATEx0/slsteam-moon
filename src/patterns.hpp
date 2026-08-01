@@ -12,6 +12,10 @@ struct Pattern_t
 {
 public:
 	const std::string name;
+	// Stable C++ registry identity used by signed locator catalogs.  Runtime
+	// display names are not sufficient because a few legacy entries deliberately
+	// use the name of the Steam function they locate instead of their C++ symbol.
+	const std::string symbol;
 	// Not const: the structural RunIPCFrame resolver (autoResolveIpcFrameRoots
 	// in patterns.cpp) rewrites the trailing root byte of the IClient*
 	// dispatch patterns in place before find() runs, to absorb Steam-update
@@ -28,10 +32,14 @@ public:
 	bool optional = false;
 
 	lm_address_t address;
-	lm_module_t* module;
+	lm_module_t* const module;
 
-	Pattern_t(const char* name, const char* pattern, MemHlp::SigFollowMode followMode, lm_module_t* module = nullptr);
-	Pattern_t(const char* name, const char* pattern, MemHlp::SigFollowMode followMode, std::vector<uint8_t> prologue, lm_module_t* module = nullptr);
+	Pattern_t(const char* name, const char* pattern,
+	          MemHlp::SigFollowMode followMode, lm_module_t* module = nullptr,
+	          const char* symbol = nullptr);
+	Pattern_t(const char* name, const char* pattern,
+	          MemHlp::SigFollowMode followMode, std::vector<uint8_t> prologue,
+	          lm_module_t* module = nullptr, const char* symbol = nullptr);
 
 	bool find();
 };

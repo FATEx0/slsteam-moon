@@ -46,7 +46,7 @@ ifeq ($(shell type mold &> /dev/null && echo "found"),found)
 	LDFLAGS += -fuse-ld=mold
 endif
 
-.PHONY: all build rebuild clean install release test-cmwire
+.PHONY: all build rebuild clean install release test-cmwire test-pattern-catalog
 .NOTPARALLEL: clean rebuild
 
 all: build
@@ -103,6 +103,12 @@ test-cmwire: obj/sdk/protobufs/steammessages_base.pb.o \
 		-I include tools/test_cmwire.cpp $^ lib/libprotobuf-lite.a \
 		-lpthread -o /tmp/test_cmwire
 	/tmp/test_cmwire
+
+test-pattern-catalog:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_pattern_catalog.cpp src/pattern_catalog.cpp \
+		-o /tmp/test_pattern_catalog
+	/tmp/test_pattern_catalog
 
 # Live integration harness for the native CM product-info client (talks
 # to real Valve CMs — NOT a unit test).  Links cmclient + its deps.

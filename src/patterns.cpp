@@ -3,24 +3,206 @@
 #include "globals.hpp"
 #include "memhlp.hpp"
 #include "feats/ipcframe.hpp"
+#include "pattern_catalog.hpp"
 #include "runtime_attestation.hpp"
+#include "utils.hpp"
 
 #include "libmem/libmem.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
+#include <system_error>
 
 
-Pattern_t::Pattern_t(const char* name, const char* pattern, MemHlp::SigFollowMode followMode, lm_module_t* module)
+namespace
+{
+	std::optional<PatternCatalog::Catalog> g_steamClientCatalog;
+	std::optional<PatternCatalog::Catalog> g_steamUiCatalog;
+
+	const PatternCatalog::Catalog* catalogFor(const Pattern_t& pattern)
+	{
+		const auto& selected = pattern.module == &g_modSteamUI
+			? g_steamUiCatalog
+			: g_steamClientCatalog;
+		return selected ? &*selected : nullptr;
+	}
+
+	std::optional<lm_address_t> catalogAddress(const Pattern_t& pattern, bool logInvalid)
+	{
+		const PatternCatalog::Catalog* catalog = catalogFor(pattern);
+		if (catalog == nullptr)
+			return std::nullopt;
+		const PatternCatalog::Locator* entry = catalog->entry(pattern.symbol);
+		if (entry == nullptr)
+			return std::nullopt;
+		if (entry->required != !pattern.optional)
+		{
+			if (logInvalid)
+				g_pLog->warn("Pattern catalog policy mismatch for '%s'; using embedded resolver\n",
+				             pattern.name.c_str());
+			return std::nullopt;
+		}
+
+		const lm_module_t& module = pattern.module ? *pattern.module : g_modSteamClient;
+		const lm_address_t rva = static_cast<lm_address_t>(entry->targetRva);
+		if (rva >= module.size || module.base > LM_ADDRESS_BAD - rva)
+			return std::nullopt;
+		const lm_address_t candidate = module.base + rva;
+		const bool inside = candidate >= module.base && candidate < module.end;
+		lm_segment_t segment {};
+		const bool executable = inside && LM_FindSegment(candidate, &segment)
+		                     && (segment.prot & LM_PROT_XR) == LM_PROT_XR;
+		if (!inside || !executable)
+		{
+			if (logInvalid)
+				g_pLog->warn("Pattern catalog RVA for '%s' is not executable; using embedded resolver\n",
+				             pattern.name.c_str());
+			return std::nullopt;
+		}
+		return candidate;
+	}
+
+	std::optional<std::filesystem::path> patternRoot()
+	{
+		if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg != nullptr && xdg[0] != '\0')
+		{
+			std::filesystem::path root(xdg);
+			if (root.is_absolute())
+				return root / "SLSsteam" / "patterns";
+			return std::nullopt;
+		}
+		if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0')
+		{
+			std::filesystem::path root(home);
+			if (root.is_absolute())
+				return root / ".config" / "SLSsteam" / "patterns";
+		}
+		return std::nullopt;
+	}
+
+	std::optional<PatternCatalog::Catalog> loadCatalog(
+		const char* component,
+		const char* moduleName,
+		const lm_module_t& module
+	)
+	{
+		const auto root = patternRoot();
+		if (!root)
+			return std::nullopt;
+		const std::filesystem::path componentRoot = *root / component;
+		std::error_code error;
+		if (!std::filesystem::is_directory(componentRoot, error) || error)
+			return std::nullopt;
+
+		try
+		{
+			const std::string sha256 = Utils::getFileSHA256(module.path);
+			const std::string buildId = Utils::getBuildId(module.path);
+			if (sha256.size() != 64 || buildId.empty())
+				return std::nullopt;
+			const auto moduleSize = std::filesystem::file_size(module.path, error);
+			if (error || moduleSize == 0)
+				return std::nullopt;
+			const std::filesystem::path path = componentRoot / (sha256 + ".toml");
+			const auto status = std::filesystem::symlink_status(path, error);
+			if (error || status.type() != std::filesystem::file_type::regular)
+				return std::nullopt;
+			const auto bodySize = std::filesystem::file_size(path, error);
+			if (error || bodySize == 0 || bodySize > PatternCatalog::kMaximumBodySize)
+				return std::nullopt;
+			std::ifstream stream(path, std::ios::binary);
+			if (!stream)
+				return std::nullopt;
+			std::string body(static_cast<std::size_t>(bodySize), '\0');
+			stream.read(body.data(), static_cast<std::streamsize>(body.size()));
+			if (!stream || stream.gcount() != static_cast<std::streamsize>(body.size()))
+				return std::nullopt;
+
+			std::string parseError;
+			auto catalog = PatternCatalog::parseCanonical(
+				body,
+				{
+					component,
+					moduleName,
+					sha256,
+					moduleSize,
+					buildId,
+				},
+				&parseError
+			);
+			if (!catalog)
+			{
+				g_pLog->warn("Pattern catalog for %s rejected: %s\n",
+				             component, parseError.c_str());
+				return std::nullopt;
+			}
+			return catalog;
+		}
+		catch (const std::exception&)
+		{
+			g_pLog->warn("Pattern catalog for %s could not be read; using embedded resolvers\n",
+			             component);
+			return std::nullopt;
+		}
+	}
+
+	std::vector<PatternCatalog::CompiledLocator> compiledPolicy(bool steamUi)
+	{
+		std::vector<PatternCatalog::CompiledLocator> result;
+		for (const Pattern_t* pattern : Patterns::patterns())
+		{
+			if ((pattern->module == &g_modSteamUI) != steamUi)
+				continue;
+			result.push_back({pattern->symbol, !pattern->optional});
+		}
+		return result;
+	}
+
+	void loadActiveCatalogs()
+	{
+		g_steamClientCatalog = loadCatalog("steamclient", "steamclient.so", g_modSteamClient);
+		g_steamUiCatalog = loadCatalog("steamui", "steamui.so", g_modSteamUI);
+
+		const auto clientPolicy = compiledPolicy(false);
+		if (g_steamClientCatalog && !g_steamClientCatalog->validatePolicy(clientPolicy))
+		{
+			g_pLog->warn("Pattern catalog for steamclient changed compiled locator policy; ignoring it\n");
+			g_steamClientCatalog.reset();
+		}
+		const auto uiPolicy = compiledPolicy(true);
+		if (g_steamUiCatalog && !g_steamUiCatalog->validatePolicy(uiPolicy))
+		{
+			g_pLog->warn("Pattern catalog for steamui changed compiled locator policy; ignoring it\n");
+			g_steamUiCatalog.reset();
+		}
+		if (g_steamClientCatalog)
+			g_pLog->info("Pattern catalog: loaded steamclient revision %llu\n",
+			             static_cast<unsigned long long>(g_steamClientCatalog->revision()));
+		if (g_steamUiCatalog)
+			g_pLog->info("Pattern catalog: loaded steamui revision %llu\n",
+			             static_cast<unsigned long long>(g_steamUiCatalog->revision()));
+	}
+}
+
+
+Pattern_t::Pattern_t(const char* name, const char* pattern,
+	MemHlp::SigFollowMode followMode, lm_module_t* module, const char* symbol)
 	:
-	Pattern_t(name, pattern, followMode, std::vector<uint8_t>(), module)
+	Pattern_t(name, pattern, followMode, std::vector<uint8_t>(), module, symbol)
 {
 }
 
-Pattern_t::Pattern_t(const char* name, const char* pattern, MemHlp::SigFollowMode followMode, std::vector<uint8_t> prologue, lm_module_t* module)
+Pattern_t::Pattern_t(const char* name, const char* pattern,
+	MemHlp::SigFollowMode followMode, std::vector<uint8_t> prologue,
+	lm_module_t* module, const char* symbol)
 	:
 	name(name),
+	symbol(symbol != nullptr ? symbol : std::string("Patterns::") + name),
 	pattern(pattern),
 	followMode(followMode),
 	prologue(prologue),
@@ -32,11 +214,18 @@ Pattern_t::Pattern_t(const char* name, const char* pattern, MemHlp::SigFollowMod
 bool Pattern_t::find()
 {
 	lm_module_t& targetModule = module ? *module : g_modSteamClient;
-	address = MemHlp::searchSignature
-	(
-		name.c_str(), pattern.c_str(), targetModule, followMode,
-		prologue.empty() ? nullptr : prologue.data(), prologue.size()
-	);
+	if (const auto trusted = catalogAddress(*this, true))
+	{
+		address = *trusted;
+	}
+	else
+	{
+		address = MemHlp::searchSignature
+		(
+			name.c_str(), pattern.c_str(), targetModule, followMode,
+			prologue.empty() ? nullptr : prologue.data(), prologue.size()
+		);
+	}
 	const bool resolved = address != LM_ADDRESS_BAD;
 
 	if (RuntimeAttestation::enabled())
@@ -135,6 +324,11 @@ static void autoResolveIpcFrameRoots()
 
 	for (Pattern_t* p : targets)
 	{
+		// A validated exact-SHA catalog is authoritative for this locator.  Do
+		// not mutate or scan the embedded fallback unless the catalog entry is
+		// absent or fails executable-range validation.
+		if (catalogAddress(*p, false))
+			continue;
 		const uint32_t seed = IpcFrame::parseTrailingRoot(p->pattern);
 		size_t idx = IpcFrame::resolveConfident(ctx.cands, seed, IpcFrame::kMaxRootDrift);
 
@@ -189,18 +383,9 @@ bool Patterns::init()
 {
 	bool found = true;
 
-	// Self-heal the IClient*::RunIPCFrame signatures before scanning.  Their
-	// only volatile byte is the dispatch-tree root message id, which drifts
-	// when Steam adds/removes interface methods (the 2026-06-23 update broke
-	// all four this way).  Re-derive each root structurally so a constant-only
-	// drift no longer needs a code change; on any failure the embedded root is
-	// kept verbatim (no regression).
-	autoResolveIpcFrameRoots();
-
-	// Mark patterns whose absence must NOT abort the load.  Their
-	// dependent features null-guard on the resolved address and become
-	// a safe no-op when unresolved (no regression on builds where the
-	// signature drifts).
+	// Establish immutable compiled policy before reading any remote-derived
+	// metadata.  A catalog whose required flags or symbols disagree with this
+	// registry is rejected in full.
 	CUser::NotifyLicensesUpdated.optional = true;
 	CDepotDownloadMgr::ProcessDepotManifest.optional = true;
 	CDepotDownloadMgr::PrepareDepotDownload.optional = true;
@@ -210,6 +395,16 @@ bool Patterns::init()
 	CDepotDownloadMgr::OnChunkUnpackedReg.optional = true;
 	ParentalSignatureCheck.optional = true;
 	ParentalSettingsReceived.optional = true;
+
+	loadActiveCatalogs();
+
+	// Self-heal the IClient*::RunIPCFrame signatures before scanning.  Their
+	// only volatile byte is the dispatch-tree root message id, which drifts
+	// when Steam adds/removes interface methods (the 2026-06-23 update broke
+	// all four this way).  Re-derive each root structurally so a constant-only
+	// drift no longer needs a code change; on any failure the embedded root is
+	// kept verbatim (no regression).
+	autoResolveIpcFrameRoots();
 	for(auto& pattern : patterns())
 	{
 		if (!pattern->find())
@@ -321,7 +516,9 @@ namespace Patterns
 		{
 			"CSteamEngine::m_pUser",
 			"8B 80 ? ? ? ? FF 75 ? 8D 34",
-			SigFollowMode::None
+			SigFollowMode::None,
+			nullptr,
+			"Patterns::CSteamEngine::Offset_User"
 		};
 	}
 
@@ -361,13 +558,17 @@ namespace Patterns
 		{
 			"CSteamEngine::PostCallback",
 			"E8 ? ? ? ? 8D 86 ? ? ? ? 83 C4 18 68 F6 01 00 00",
-			SigFollowMode::Relative
+			SigFollowMode::Relative,
+			nullptr,
+			"Patterns::CUser::PostCallback"
 		};
 		Pattern_t UpdateAppOwnershipTicket
 		{
 			"IClientUser::UpdateAppOwnershipTicket",
 			"E8 ? ? ? ? E9 ? ? ? ? ? ? ? ? ? ? 8D 45 ? 89 45 ? EB",
-			SigFollowMode::Relative
+			SigFollowMode::Relative,
+			nullptr,
+			"Patterns::CUser::UpdateAppOwnershipTicket"
 		};
 		// CUser::<broadcast LicensesUpdated_t>(CUser* this)
 		//
@@ -481,7 +682,9 @@ namespace Patterns
 		{
 			"IClientUser::GetSteamID",
 			"E8 ? ? ? ? 89 D8 83 C4 0C 83 C4 08 5B C2 04 00 ? 83 EC 08 50 53 FF D2 89 D8 83 C4 0C 83 C4 08 5B C2 04 00",
-			SigFollowMode::Relative
+			SigFollowMode::Relative,
+			nullptr,
+			"Patterns::IClientUser::GetSteamId"
 		};
 		Pattern_t IsUserSubscribedAppInTicket
 		{
@@ -620,14 +823,18 @@ namespace Patterns
 		{
 			"CDepotDownloadMgr::OnChunkUnpacked[cdecl]",
 			"55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 7C 04 00 00 8B 45 0C 8B 7D 08 89 85 90 FB FF FF 8B 45 10 89 85 8C FB FF FF",
-			SigFollowMode::None
+			SigFollowMode::None,
+			nullptr,
+			"Patterns::CDepotDownloadMgr::OnChunkUnpackedStack"
 		};
 
 		Pattern_t OnChunkUnpackedReg
 		{
 			"CDepotDownloadMgr::OnChunkUnpacked[regparm3]",
 			"55 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 89 C6 53 81 EC 7C 04 00 00 8B 45 0C 89 95 90 FB FF FF 89 8D 8C FB FF FF 89 85 94 FB FF FF",
-			SigFollowMode::None
+			SigFollowMode::None,
+			nullptr,
+			"Patterns::CDepotDownloadMgr::OnChunkUnpackedReg"
 		};
 
 		// (4) EvaluateConfigChanges (the post-commit reconcile, located via
@@ -669,6 +876,8 @@ namespace Patterns
 			"IClientUtils::m_PipeIndex",
 			"8B 91 ? ? ? ? 83 F8 FF 74 ? 8B 89 ? ? ? ? EB ? ? ? ? 8B 00 83 F8 FF 74 ? 8D 04 ? 8D 04 ? 3B 50",
 			SigFollowMode::None,
+			nullptr,
+			"Patterns::IClientUtils::Offset_GetPipeIndex"
 		};
 	}
 
@@ -730,7 +939,7 @@ namespace Patterns
 		Pattern_t BYldRequestDepotManifest
 		{
 			"CDepotDownloadMgr::BYldRequestDepotManifest",
-			"55 b9 fd ff ff ff 89 e5 57 e8 ? ? ? ? 81 c7 ? ? ? ? 56 53 83 ec 7c 8b 45 14 8b 55 18",
+			"55 B9 FD FF FF FF 89 E5 57 E8 ? ? ? ? 81 C7 ? ? ? ? 56 53 83 EC 7C 8B 45 14 8B 55 18",
 			SigFollowMode::None
 		};
 	}
