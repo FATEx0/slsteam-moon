@@ -69,6 +69,7 @@ steam jupiter|steam-jupiter -silent %U|yes|$WRAPPER -silent %U
 bazzite steam absolute|/usr/bin/bazzite-steam -silent %U|yes|$WRAPPER -silent %U
 env assignment|env MANGOHUD=1 /usr/bin/steam %U|yes|env MANGOHUD=1 $WRAPPER %U
 env quoted assignment and launcher|env "MANGOHUD=1" "/usr/bin/steam" %U|yes|env "MANGOHUD=1" $WRAPPER %U
+legacy SLS audit assignment|env MANGOHUD=1 LD_AUDIT="/tmp/SLSsteam/library-inject.so:/tmp/SLSsteam/SLSsteam.so" /usr/bin/steam %U|yes|env MANGOHUD=1 $WRAPPER %U
 shell wrapper|sh -c 'steam "\$@"' sh %U|no|sh -c 'steam "\$@"' sh %U
 bash wrapper|bash -lc steam|no|bash -lc steam
 dash wrapper|dash -c steam|no|dash -c steam
@@ -146,6 +147,13 @@ check "patch_one accepts env-prefixed rewritten Exec" "patched" "$(dc_classify "
 check "env-prefixed patch keeps prefix" "Exec=env MANGOHUD=1 $WRAPPER %U" "$(grep -m1 '^Exec=' "$TMP/env-patch.desktop")"
 if dc_file_has_wrapper_exec "$TMP/env-patch.desktop"; then wrapper_valid=yes; else wrapper_valid=no; fi
 check "env-prefixed patch validates exact wrapper token" "yes" "$wrapper_valid"
+
+# A stale desktop entry may already carry the old LD_AUDIT assignment.  The
+# managed assignment must be removed while unrelated env settings survive.
+printf '[Desktop Entry]\nName=Steam\nExec=env MANGOHUD=1 LD_AUDIT="/tmp/SLSsteam/library-inject.so:/tmp/SLSsteam/SLSsteam.so" /usr/bin/steam %%U\n' > "$TMP/legacy-audit.desktop"
+DC_BACKUP_ROOT="$TMP/central-legacy-audit" dc_patch_one "$TMP/legacy-audit.desktop"
+check "legacy audit entry is repaired" "Exec=env MANGOHUD=1 $WRAPPER %U" \
+  "$(grep -m1 '^Exec=' "$TMP/legacy-audit.desktop")"
 
 # Wrapper transport into awk must be byte-exact, and special path bytes must
 # be Desktop Entry-escaped so validation resolves to the exact wrapper.

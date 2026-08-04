@@ -10,6 +10,7 @@
 #include "runtime_attestation.hpp"
 #include "update.hpp"
 #include "utils.hpp"
+#include "utils/process_lock.hpp"
 
 #include "feats/appinfo_provision.hpp"
 #include "feats/appinfo_vdf.hpp"
@@ -99,6 +100,11 @@ static void unload()
 
 //TODO: Remove when unload() works properly since it should not be needed anymore after that
 static bool setupSuccess = false;
+// setup() is called from each audited link-map namespace.  Keep the lock alive
+// for the whole client lifetime so duplicate auditor instances cannot repeat
+// config watchers, provisioning, or appinfo writes before load() gets a chance
+// to claim its own hook-placement guard.
+static std::unique_ptr<ProcessLock::FileLock> g_setupLock;
 
 // CEF debug port chosen ONCE for this Steam-client session (see la_symbind32
 // block below). Picked in load() so it's decided in the long-lived client and
@@ -143,6 +149,16 @@ static void setup()
 	g_pLog = std::unique_ptr<CLog>(CLog::createDefaultLog());
 	if (!g_pLog)
 	{
+		unload();
+		return;
+	}
+
+	g_setupLock = std::make_unique<ProcessLock::FileLock>(
+		ProcessLock::perProcessPath(".slssteam.setup"));
+	if (!g_setupLock->acquired())
+	{
+		g_pLog->info("setup: another auditor namespace already initialized this process -> skipping\n");
+		g_setupLock.reset();
 		unload();
 		return;
 	}

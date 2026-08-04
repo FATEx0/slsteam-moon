@@ -24,6 +24,7 @@
 #include "../cainfo.hpp"
 
 #include "../utils/ManifestFetch.hpp"
+#include "../utils/atomic_file.hpp"
 
 #include "base64/base64.hpp"
 #include "yaml-cpp/yaml.h"
@@ -786,10 +787,12 @@ bool persistBuffer(uint32_t appId, uint32_t changeNumber,
 	const auto bufPath  = getBufferPath(appId);
 	const auto metaPath = getMetaPath(appId);
 
+	std::string writeError;
+	if (!AtomicFile::write(bufPath, wire, writeError))
 	{
-		std::ofstream ofs(bufPath, std::ios::binary | std::ios::trunc);
-		if (!ofs.is_open()) return false;
-		ofs.write(wire.data(), static_cast<std::streamsize>(wire.size()));
+		g_pLog->debug("AppInfoProvision: cannot atomically write %s: %s\n",
+		              bufPath.c_str(), writeError.c_str());
+		return false;
 	}
 	{
 		YAML::Emitter em;
@@ -799,9 +802,13 @@ bool persistBuffer(uint32_t appId, uint32_t changeNumber,
 		em << YAML::Key << "wire_size"     << YAML::Value << wire.size();
 		em << YAML::Key << "sha_b64"       << YAML::Value << base64::to_base64(sha20);
 		em << YAML::EndMap;
-		std::ofstream ofs(metaPath, std::ios::trunc);
-		if (!ofs.is_open()) return false;
-		ofs.write(em.c_str(), em.size());
+		const std::string metadata(em.c_str(), em.size());
+		if (!AtomicFile::write(metaPath, metadata, writeError))
+		{
+			g_pLog->debug("AppInfoProvision: cannot atomically write %s: %s\n",
+			              metaPath.c_str(), writeError.c_str());
+			return false;
+		}
 	}
 	return true;
 }

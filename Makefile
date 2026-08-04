@@ -46,7 +46,7 @@ ifeq ($(shell type mold &> /dev/null && echo "found"),found)
 	LDFLAGS += -fuse-ld=mold
 endif
 
-.PHONY: all build rebuild clean install release test-cmwire test-pattern-catalog test-pattern-refresh
+.PHONY: all build rebuild clean install release test-cmwire test-pattern-catalog test-pattern-refresh test-process-lock test-atomic-file test-appinfo-transaction
 .NOTPARALLEL: clean rebuild
 
 all: build
@@ -134,6 +134,39 @@ test-pattern-refresh:
 		src/pattern_catalog.cpp -lcurl -lcrypto -lpthread \
 		-o /tmp/test_pattern_refresh
 	/tmp/test_pattern_refresh
+
+test-process-lock:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_process_lock.cpp -o /tmp/test_process_lock
+	/tmp/test_process_lock
+
+test-atomic-file:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_atomic_file.cpp -o /tmp/test_atomic_file
+	/tmp/test_atomic_file
+
+# Non-LTO 32-bit object so the host linker can link the transaction test
+# without choking on LTO bytecode from a different toolchain version.
+obj/feats/appinfo_vdf_test.o: src/feats/appinfo_vdf.cpp $(deps_early)
+	@mkdir -p obj/feats
+	$(CXX) -O2 -fno-lto -fPIC -m32 -std=c++20 -fno-reorder-blocks-and-partition \
+		-Wall -Wextra -Wpedantic -Wno-error=format-security \
+		-D_GLIBCXX_USE_CXX11_ABI=0 \
+		-I include -isysteminclude -MMD -MP \
+		-c src/feats/appinfo_vdf.cpp -o obj/feats/appinfo_vdf_test.o
+
+test-appinfo-transaction: obj/feats/appinfo_vdf_test.o obj/log.o obj/config.o \
+		obj/globals.o obj/filewatcher.o obj/update.o obj/api.o \
+		obj/feats/depotkey.o obj/feats/manifestid.o \
+		obj/ownerwork.o obj/sdk/protobufs/steammessages_clientserver_appinfo.pb.o \
+		obj/sdk/protobufs/steammessages_base.pb.o
+	$(CXX) -m32 -std=c++20 -D_GLIBCXX_USE_CXX11_ABI=0 \
+		-I include -isysteminclude tools/test_appinfo_transaction.cpp \
+		obj/feats/appinfo_vdf_test.o \
+		$(filter-out obj/feats/appinfo_vdf_test.o,$(filter obj/%.o,$^)) \
+		lib/libyaml-cpp.a lib/libprotobuf-lite.a -lcrypto -lpthread -ldl \
+		-o /tmp/test_appinfo_transaction
+	/tmp/test_appinfo_transaction
 
 # Live integration harness for the native CM product-info client (talks
 # to real Valve CMs — NOT a unit test).  Links cmclient + its deps.

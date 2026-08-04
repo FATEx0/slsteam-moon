@@ -308,6 +308,33 @@ create_steam_wrapper()
 # (see its block below).
 SLSDIR="$HOME/.local/share/SLSsteam"
 
+# Desktop entries from older installs may invoke this wrapper with our audit
+# DSOs already present in LD_AUDIT.  Remove only our known objects immediately,
+# before helper commands (readlink, stat, awk, …) are spawned.  An inherited
+# third-party auditor is preserved and is reattached after the guard has made
+# its decision.
+slsm_strip_own_auditors() {
+	_slsm_old_ifs="$IFS"
+	IFS=:
+	_slsm_clean=""
+	for _slsm_audit in ${LD_AUDIT:-}; do
+		case "$_slsm_audit" in
+			''|*SLSsteam.so|*library-inject.so|*libSLSsteam.so|*libSLS-library-inject.so)
+				continue ;;
+			*)
+				_slsm_clean="${_slsm_clean:+$_slsm_clean:}$_slsm_audit" ;;
+		esac
+	done
+	IFS="$_slsm_old_ifs"
+	printf '%s' "$_slsm_clean"
+}
+SLSM_INHERITED_AUDIT="$(slsm_strip_own_auditors)"
+if [ -n "$SLSM_INHERITED_AUDIT" ]; then
+	export LD_AUDIT="$SLSM_INHERITED_AUDIT"
+else
+	unset LD_AUDIT
+fi
+
 # Resolve the real Steam binary, skipping our own wrapper.
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 STEAM_BIN=""
@@ -342,6 +369,13 @@ if [ -z "$STEAM_BIN" ]; then
 	echo "slsteam-moon: could not find the real Steam binary" >&2
 	exit 127
 fi
+
+slsm_exec_vanilla() {
+	# Safe mode must not depend on what a desktop entry or parent shell put in
+	# the loader environment.  Unset the complete loader surface, not only our
+	# own names, so a broken third-party preload cannot keep the recovery loop.
+	exec env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH "$STEAM_BIN" "$@"
+}
 
 # ---------------------------------------------------------------------------
 # Crash-loop fail-safe (Game Mode boot protection).
@@ -456,7 +490,7 @@ guard_startup_crash() {
 if [ -f "$GUARD_SAFE" ]; then
 	if [ "$(cat "$GUARD_FP" 2>/dev/null)" = "$GUARD_CUR_FP" ]; then
 		guard_log "safe mode active -> launching Steam without injection"
-		exec "$STEAM_BIN" "$@"
+		slsm_exec_vanilla "$@"
 	fi
 	guard_log "payload changed since latch -> clearing safe mode, retrying injection"
 	rm -f "$GUARD_SAFE" "$GUARD_FP" "$GUARD_COUNT" "$GUARD_LAST" 2>/dev/null || true
@@ -509,7 +543,7 @@ if [ "$GUARD_FAILS" -ge "$SLSM_GUARD_MAX_FAILS" ] || { [ "$guard_client_changed"
 	done
 	guard_notify "slsteam-moon is paused because Steam failed to start after a recent update. Steam is running normally - update the plugin from the LuaTools menu to re-enable it."
 	guard_log "recovery mode latched; Steam will launch unhooked until the payload is updated"
-	exec "$STEAM_BIN" "$@"
+	slsm_exec_vanilla "$@"
 fi
 
 # Mark the start of THIS boot for the next invocation's health check, and record
@@ -569,6 +603,30 @@ fi
 
 AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so"
 
+# ld.so prints the harmless 32-bit-auditor/64-bit-bootstrap warning before
+# Steam's final i386 client is reached.  Filter only that exact diagnostic via
+# a FIFO; all other Steam stderr remains live and untouched.  Set
+# SLSM_SHOW_LOADER_WARNINGS=1 when the raw loader diagnostics are needed.
+SLSM_FILTER_FIFO=""
+if [ "${SLSM_SHOW_LOADER_WARNINGS:-0}" != 1 ] &&
+	command -v mktemp >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
+	SLSM_FILTER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/slssteam-ldso.XXXXXX" 2>/dev/null || true)"
+	if [ -n "$SLSM_FILTER_DIR" ] && mkfifo "$SLSM_FILTER_DIR/stderr" 2>/dev/null; then
+		SLSM_FILTER_FIFO="$SLSM_FILTER_DIR/stderr"
+		(
+			# This worker is a 64-bit utility; never let the final 32-bit audit
+			# list recurse into it.
+			unset LD_AUDIT LD_PRELOAD LD_LIBRARY_PATH
+			awk 'index($0, "from LD_AUDIT cannot be preloaded (wrong ELF class: ELFCLASS32); ignored.") == 0 { print; fflush() }' \
+				"$SLSM_FILTER_FIFO" >&2
+			rm -rf "$SLSM_FILTER_DIR"
+		) &
+	else
+		rm -rf "${SLSM_FILTER_DIR:-}" 2>/dev/null || true
+		SLSM_FILTER_DIR=""
+	fi
+fi
+
 # Re-assert desktop-entry coverage without putting reconciliation on the launch
 # critical path. Prefer the serialized guardian; retain the legacy CLI fallback
 # during upgrades or on desktops without a working user manager.
@@ -585,7 +643,16 @@ elif [ -x "$SLSDIR/ensure-desktop-coverage.sh" ]; then
 	fi
 fi
 
-LD_AUDIT="$AUDIT${LD_AUDIT:+:$LD_AUDIT}" exec "$STEAM_BIN" "$@"
+if [ -n "$SLSM_INHERITED_AUDIT" ]; then
+	export LD_AUDIT="$AUDIT:$SLSM_INHERITED_AUDIT"
+else
+	export LD_AUDIT="$AUDIT"
+fi
+if [ -n "$SLSM_FILTER_FIFO" ]; then
+	exec "$STEAM_BIN" "$@" 2>"$SLSM_FILTER_FIFO"
+else
+	exec "$STEAM_BIN" "$@"
+fi
 EOF
 
 	chmod +x "$SLSDIR/path/steam"

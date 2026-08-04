@@ -13,6 +13,7 @@
 #include "../update.hpp"
 
 #include "../utils/ManifestFetch.hpp"
+#include "../utils/atomic_file.hpp"
 
 #include "base64/base64.hpp"
 #include "yaml-cpp/emitter.h"
@@ -74,29 +75,16 @@ bool persistAppBuffer(uint32_t appId, uint32_t changeNumber,
 	const auto bufPath = getBufferPath(appId);
 	const auto metaPath = getMetaPath(appId);
 
-	if (std::filesystem::exists(metaPath) && std::filesystem::exists(bufPath))
+	// Do not trust a matching change number/size alone: a torn or externally
+	// modified buffer can have both and would otherwise keep poisoning the next
+	// appinfo splice.  AtomicFile publishes the blob before its metadata, so a
+	// reader either sees the previous complete pair or rejects the new pair.
+	std::string writeError;
+	if (!AtomicFile::write(bufPath, buffer, writeError))
 	{
-		try
-		{
-			auto node = YAML::LoadFile(metaPath);
-			const auto cachedChange = node["change_number"].as<uint32_t>();
-			const auto cachedSize = node["wire_size"].as<size_t>();
-			if (cachedChange == changeNumber && cachedSize == buffer.size())
-			{
-				return true;
-			}
-		}
-		catch (...) { /* fall through to rewrite */ }
-	}
-
-	{
-		std::ofstream ofs(bufPath, std::ios::binary | std::ios::trunc);
-		if (!ofs.is_open())
-		{
-			g_pLog->debug("PICS: cannot write %s\n", bufPath.c_str());
-			return false;
-		}
-		ofs.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+		g_pLog->debug("PICS: cannot atomically write %s: %s\n",
+		              bufPath.c_str(), writeError.c_str());
+		return false;
 	}
 
 	{
@@ -108,13 +96,13 @@ bool persistAppBuffer(uint32_t appId, uint32_t changeNumber,
 		em << YAML::Key << "sha_b64"        << YAML::Value << base64::to_base64(sha);
 		em << YAML::EndMap;
 
-		std::ofstream ofs(metaPath, std::ios::trunc);
-		if (!ofs.is_open())
+		const std::string metadata(em.c_str(), em.size());
+		if (!AtomicFile::write(metaPath, metadata, writeError))
 		{
-			g_pLog->debug("PICS: cannot write %s\n", metaPath.c_str());
+			g_pLog->debug("PICS: cannot atomically write %s: %s\n",
+			              metaPath.c_str(), writeError.c_str());
 			return false;
 		}
-		ofs.write(em.c_str(), em.size());
 	}
 
 	g_pLog->debug("PICS: cached app=%u change=%u buffer=%zu bytes -> %s\n",

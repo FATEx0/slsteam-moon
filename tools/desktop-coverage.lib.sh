@@ -247,9 +247,36 @@ _dc_exec_scan() {
 
 			prefix = substr(text, 1, start[launcher] - 1)
 			suffix = substr(text, finish[launcher] + 1)
-			if (mode == "supported") exit 0
-			if (mode == "wrapper") exit(decoded[launcher] == wrapper ? 0 : 1)
-			if (mode == "rewrite") { print prefix encode_token(wrapper) suffix; exit 0 }
+		if (mode == "supported") exit 0
+		if (mode == "wrapper") exit(decoded[launcher] == wrapper ? 0 : 1)
+		if (mode == "rewrite") {
+			# Older installs sometimes left our own LD_AUDIT assignment in
+			# the desktop entry.  Keep arbitrary user env assignments, but
+			# remove only the managed auditors so the wrapper is the single
+			# owner of the canonical list.  Rebuild the `env` prefix only when
+			# something was removed; otherwise preserve the original bytes.
+			if (decoded[1] == "env") {
+				removed = 0; kept = 0; rebuilt = ""
+				for (i = 2; i < launcher; i++) {
+					if (decoded[i] ~ /^LD_AUDIT=/ &&
+						decoded[i] ~ /(SLSsteam|library-inject|libSLS)/) {
+						removed = 1
+						continue
+					}
+					kept++
+					rebuilt = rebuilt (kept > 1 ? " " : "") encode_token(decoded[i])
+				}
+				if (removed) {
+					if (kept > 0)
+						print "env " rebuilt " " encode_token(wrapper) suffix
+					else
+						print encode_token(wrapper) suffix
+					exit 0
+				}
+			}
+			print prefix encode_token(wrapper) suffix
+			exit 0
+		}
 			if (mode == "parts") {
 				print prefix; print decoded[launcher]; print suffix; exit 0
 			}
@@ -1036,7 +1063,7 @@ dc_state_home() {
 #     full pass even on an unchanged desktop.
 # Callers that must never take the fast path (the installer, an explicit repair)
 # set DC_FORCE=1 / pass --force to the CLI.
-DC_FINGERPRINT_VERSION=1
+DC_FINGERPRINT_VERSION=2
 
 # Where the last successful pass' digest lives. One file per scope: the guardian
 # (mandatory, user-only), the legacy best-effort --user pass and the optional

@@ -7,6 +7,8 @@
 #include "../config.hpp"
 #include "../globals.hpp"
 #include "../log.hpp"
+#include "../utils/atomic_file.hpp"
+#include "../utils/process_lock.hpp"
 
 #include "base64/base64.hpp"
 #include "prewarm.hpp"
@@ -24,6 +26,8 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <ctime>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -442,6 +446,87 @@ bool translateWireToIndexed(const std::string& wire,
 	return true;
 }
 
+// Validate the exact subset emitted by translateWireToIndexed before it is
+// allowed into appinfo.vdf.  This is intentionally strict for synthetic
+// entries (ChildObject/String/End only) and deliberately does not reinterpret
+// Valve's existing entries, whose binary KV payloads may use additional scalar
+// types.  A bad synthetic blob is rejected before it can poison Steam's cache.
+bool validateGeneratedObject(const std::vector<uint8_t>& data,
+	                         const AppInfoFile& f,
+	                         size_t& pos,
+	                         unsigned int depth,
+	                         std::string& err)
+{
+	if (depth > 128)
+	{
+		err = "generated KV nesting is too deep";
+		return false;
+	}
+
+	while (pos < data.size())
+	{
+		const uint8_t type = data[pos++];
+		if (type == KV::End) return true;
+		if (type != KV::ChildObject && type != KV::String)
+		{
+			err = "generated KV contains an unexpected node type";
+			return false;
+		}
+		if (data.size() - pos < sizeof(uint32_t))
+		{
+			err = "generated KV key index is truncated";
+			return false;
+		}
+		const uint32_t keyIndex = readLE<uint32_t>(data.data() + pos);
+		pos += sizeof(uint32_t);
+		if (keyIndex >= f.strings.size())
+		{
+			err = "generated KV key index is outside the string table";
+			return false;
+		}
+
+		if (type == KV::ChildObject)
+		{
+			if (!validateGeneratedObject(data, f, pos, depth + 1, err))
+				return false;
+			continue;
+		}
+
+		const auto* begin = data.data() + pos;
+		const auto* end = data.data() + data.size();
+		const auto* nul = static_cast<const uint8_t*>(
+			std::memchr(begin, 0, static_cast<size_t>(end - begin)));
+		if (!nul)
+		{
+			err = "generated KV string is not NUL-terminated";
+			return false;
+		}
+		pos += static_cast<size_t>(nul - begin) + 1;
+	}
+
+	err = "generated KV object is missing its end marker";
+	return false;
+}
+
+bool validateGeneratedVdf(const std::vector<uint8_t>& data,
+	                      const AppInfoFile& f,
+	                      std::string& err)
+{
+	if (data.empty())
+	{
+		err = "generated KV is empty";
+		return false;
+	}
+	size_t pos = 0;
+	if (!validateGeneratedObject(data, f, pos, 0, err)) return false;
+	if (pos != data.size())
+	{
+		err = "generated KV has trailing bytes";
+		return false;
+	}
+	return true;
+}
+
 // ---------------------------------------------------------------------------
 // Compute SHA-1 (binary_hash field)
 // ---------------------------------------------------------------------------
@@ -518,46 +603,26 @@ bool writeV41(const std::string& path, const AppInfoFile& f, std::string& err)
 		out.push_back(0);
 	}
 
-	// Write to a temporary file, then rename for atomicity.
-	const std::string tmpPath = path + ".tmp";
-	{
-		std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
-		if (!ofs.is_open())
-		{
-			err = "cannot open tmp file for write";
-			return false;
-		}
-		ofs.write(reinterpret_cast<const char*>(out.data()),
-		          static_cast<std::streamsize>(out.size()));
-		if (!ofs.good())
-		{
-			err = "write failed";
-			return false;
-		}
-	}
-
-	std::error_code ec;
-	std::filesystem::rename(tmpPath, path, ec);
-	if (ec)
-	{
-		err = "rename failed: " + ec.message();
-		std::filesystem::remove(tmpPath, ec);
-		return false;
-	}
-	return true;
+	// Write to a unique temporary inode, fsync it, and publish with rename.
+	// This also prevents two setup namespaces from sharing the old fixed
+	// `appinfo.vdf.tmp` pathname.
+	return AtomicFile::write(path,
+		reinterpret_cast<const char*>(out.data()), out.size(), err);
 }
 
 // ---------------------------------------------------------------------------
 // High-level inject
 // ---------------------------------------------------------------------------
 
-bool injectAppImpl(const std::string& path,
-                   uint32_t appid,
-                   uint32_t changeNumber,
-                   const std::string& sha,
-                   const std::string& wireBuffer,
-                   std::string& err)
+bool mergeAppImpl(AppInfoFile& f,
+                  uint32_t appid,
+                  uint32_t changeNumber,
+                  const std::string& sha,
+                  const std::string& wireBuffer,
+                  bool& changed,
+                  std::string& err)
 {
+	changed = false;
 	if (sha.size() != 20)
 	{
 		err = "sha must be 20 bytes";
@@ -568,9 +633,6 @@ bool injectAppImpl(const std::string& path,
 		err = "wire buffer empty";
 		return false;
 	}
-
-	AppInfoFile f;
-	if (!readV41(path, f, err)) return false;
 
 	// Idempotency: same appid + same change_number + same sha -> noop.
 	for (const auto& e : f.apps)
@@ -592,11 +654,15 @@ bool injectAppImpl(const std::string& path,
 		             appid, err.c_str());
 		return false;
 	}
+	if (!validateGeneratedVdf(indexed, f, err))
+	{
+		g_pLog->warn("AppInfoVdf: generated app=%u failed KV validation: %s\n",
+		             appid, err.c_str());
+		return false;
+	}
 
-	// Diagnostic: dump the first bytes of the indexed blob so we can
-	// verify what idx the writer assigned to "appinfo" and the appid
-	// child object.  Keep this until we're sure the v41 layout is
-	// correct end-to-end.
+	// Diagnostic: retain enough detail to correlate a rejected cache without
+	// making normal startup logs look like an error stream.
 	{
 		std::string hex;
 		for (size_t i = 0; i < std::min<size_t>(indexed.size(), 24u); ++i)
@@ -606,7 +672,7 @@ bool injectAppImpl(const std::string& path,
 		}
 		const uint32_t idxAppinfo = !indexed.empty() && indexed.size() >= 5
 		    ? *reinterpret_cast<const uint32_t*>(indexed.data() + 1) : 0u;
-		g_pLog->info("AppInfoVdf: indexed blob app=%u: %s "
+		g_pLog->debug("AppInfoVdf: indexed blob app=%u: %s "
 		             "(appinfo idx=%u, table size=%zu, wire %zu->indexed %zu)\n",
 		             appid, hex.c_str(), idxAppinfo, f.strings.size(),
 		             wireBuffer.size(), indexed.size());
@@ -638,8 +704,7 @@ bool injectAppImpl(const std::string& path,
 	{
 		f.apps.push_back(std::move(ne));
 	}
-
-	if (!writeV41(path, f, err)) return false;
+	changed = true;
 
 	g_pLog->debug("AppInfoVdf: injected app=%u change=%u (%s)\n",
 	              appid, changeNumber, replaced ? "replaced" : "appended");
@@ -721,6 +786,125 @@ bool loadCachedBuffer(const std::string& metaPath, uint32_t expectedAppId,
 	}
 }
 
+std::string appInfoLockPath(const std::string& path)
+{
+	return path + ".slssteam.lock";
+}
+
+std::string rollbackPath(const std::string& path)
+{
+	return path + ".slssteam-previous";
+}
+
+bool hasV41Magic(const std::string& path)
+{
+	std::ifstream ifs(path, std::ios::binary);
+	if (!ifs.is_open()) return false;
+	uint8_t bytes[sizeof(uint32_t)]{};
+	if (!ifs.read(reinterpret_cast<char*>(bytes), sizeof(bytes))) return false;
+	return readLE<uint32_t>(bytes) == MAGIC_V41;
+}
+
+std::string recoveryPath(const std::string& path)
+{
+	return path + ".slssteam-corrupt." +
+		std::to_string(static_cast<long long>(std::time(nullptr))) + "." +
+		std::to_string(static_cast<long long>(::getpid()));
+}
+
+bool quarantineCurrent(const std::string& path)
+{
+	if (!std::filesystem::exists(path)) return false;
+	std::error_code ec;
+	const auto target = recoveryPath(path);
+	std::filesystem::rename(path, target, ec);
+	if (ec)
+	{
+		g_pLog->warn("AppInfoVdf: cannot quarantine %s: %s\n",
+		             path.c_str(), ec.message().c_str());
+		return false;
+	}
+	g_pLog->warn("AppInfoVdf: quarantined invalid v41 cache %s -> %s\n",
+	             path.c_str(), target.c_str());
+	return true;
+}
+
+// Read the file without ever overwriting a structurally invalid cache.  If a
+// previous known-good snapshot exists, restore it first; otherwise move the
+// invalid v41 file aside so Steam can rebuild it instead of getting stuck in
+// its "Loading user data" recovery loop.
+bool readWithRecovery(const std::string& path, AppInfoFile& out,
+	                  std::string& err)
+{
+	if (readV41(path, out, err)) return true;
+	const std::string originalError = err;
+	if (!hasV41Magic(path)) return false;
+
+	const auto previousPath = rollbackPath(path);
+	AppInfoFile previous;
+	std::string previousError;
+	if (readV41(previousPath, previous, previousError))
+	{
+		std::error_code ec;
+		const auto corruptPath = recoveryPath(path);
+		std::filesystem::rename(path, corruptPath, ec);
+		if (!ec)
+		{
+			std::filesystem::rename(previousPath, path, ec);
+			if (!ec)
+			{
+				out = std::move(previous);
+				g_pLog->warn("AppInfoVdf: restored previous valid cache after parse failure (%s)\n",
+				             originalError.c_str());
+				return true;
+			}
+			// Do not leave the main path absent if the restore failed.
+			std::error_code restoreEc;
+			std::filesystem::rename(corruptPath, path, restoreEc);
+		}
+	}
+
+	(void)quarantineCurrent(path);
+	err = originalError;
+	return false;
+}
+
+bool snapshotBeforeWrite(const std::string& path, std::string& err)
+{
+	if (!std::filesystem::exists(path)) return true;
+	std::error_code ec;
+	std::filesystem::copy_file(path, rollbackPath(path),
+		std::filesystem::copy_options::overwrite_existing, ec);
+	if (ec)
+	{
+		err = "cannot create rollback snapshot: " + ec.message();
+		return false;
+	}
+	return true;
+}
+
+bool publishChecked(const std::string& path, const AppInfoFile& file,
+	               std::string& err)
+{
+	if (!snapshotBeforeWrite(path, err)) return false;
+	if (!writeV41(path, file, err)) return false;
+
+	AppInfoFile verify;
+	std::string verifyError;
+	if (readV41(path, verify, verifyError)) return true;
+
+	// AtomicFile already guarantees that the visible file is complete.  This
+	// second check catches a serializer regression before Steam sees it and
+	// restores the last-good snapshot while keeping the failed output for
+	// diagnosis.
+	(void)quarantineCurrent(path);
+	std::error_code ec;
+	std::filesystem::rename(rollbackPath(path), path, ec);
+	err = "post-write validation failed: " + verifyError;
+	if (ec) err += "; rollback failed: " + ec.message();
+	return false;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -733,11 +917,35 @@ bool injectApp(const std::string& path,
                const std::string& sha,
                const std::string& wireBuffer)
 {
+	ProcessLock::FileLock lock(appInfoLockPath(path));
+	if (!lock.acquired())
+	{
+		g_pLog->debug("AppInfoVdf: another writer owns %s; skipping app=%u\n",
+		              appInfoLockPath(path).c_str(), appid);
+		return false;
+	}
+
 	std::string err;
-	if (!injectAppImpl(path, appid, changeNumber, sha, wireBuffer, err))
+	AppInfoFile file;
+	if (!readWithRecovery(path, file, err))
+	{
+		g_pLog->warn("AppInfoVdf: cannot read %s for app=%u: %s\n",
+		             path.c_str(), appid, err.c_str());
+		return false;
+	}
+
+	bool changed = false;
+	if (!mergeAppImpl(file, appid, changeNumber, sha, wireBuffer,
+	                  changed, err))
 	{
 		g_pLog->warn("AppInfoVdf: injectApp(%u) failed: %s\n",
 		              appid, err.c_str());
+		return false;
+	}
+	if (changed && !publishChecked(path, file, err))
+	{
+		g_pLog->warn("AppInfoVdf: publish app=%u failed: %s\n",
+		             appid, err.c_str());
 		return false;
 	}
 	g_pLog->info("AppInfoVdf: injected app=%u change=%u into %s\n",
@@ -750,12 +958,41 @@ int injectAllCached(const std::string& path)
 	const auto cacheDir = g_config.getDir() + "/cache";
 	if (!std::filesystem::exists(cacheDir)) return 0;
 
-	const std::regex metaRe("picsbuffer_(\\d+)\\.yaml");
-	int injected = 0;
-	for (const auto& entry : std::filesystem::directory_iterator(cacheDir))
+	ProcessLock::FileLock lock(appInfoLockPath(path));
+	if (!lock.acquired())
 	{
-		if (!entry.is_regular_file()) continue;
-		const auto fname = entry.path().filename().string();
+		g_pLog->debug("AppInfoVdf: another writer owns %s; skipping cache splice\n",
+		              appInfoLockPath(path).c_str());
+		return 0;
+	}
+
+	AppInfoFile file;
+	std::string readError;
+	if (!readWithRecovery(path, file, readError))
+	{
+		g_pLog->warn("AppInfoVdf: refusing to modify %s: %s\n",
+		             path.c_str(), readError.c_str());
+		return 0;
+	}
+
+	const std::regex metaRe("picsbuffer_(\\d+)\\.yaml");
+	std::vector<std::filesystem::path> metadata;
+	std::error_code iterError;
+	for (std::filesystem::directory_iterator it(cacheDir, iterError), end;
+	     it != end && !iterError; it.increment(iterError))
+	{
+		if (!it->is_regular_file()) continue;
+		const auto fname = it->path().filename().string();
+		std::smatch m;
+		if (std::regex_match(fname, m, metaRe)) metadata.push_back(it->path());
+	}
+	std::sort(metadata.begin(), metadata.end());
+
+	int injected = 0;
+	bool changed = false;
+	for (const auto& metaPath : metadata)
+	{
+		const auto fname = metaPath.filename().string();
 		std::smatch m;
 		if (!std::regex_match(fname, m, metaRe)) continue;
 
@@ -764,15 +1001,33 @@ int injectAllCached(const std::string& path)
 		uint32_t expectedAppId = 0;
 		try { expectedAppId = static_cast<uint32_t>(std::stoul(m[1].str())); }
 		catch (...) {}
-		if (!loadCachedBuffer(entry.path().string(), expectedAppId, cb, err))
+		if (!loadCachedBuffer(metaPath.string(), expectedAppId, cb, err))
 		{
 			g_pLog->debug("AppInfoVdf: skip %s: %s\n",
 			              fname.c_str(), err.c_str());
 			continue;
 		}
-		if (injectApp(path, cb.appid, cb.change_number, cb.sha, cb.buffer))
+		bool entryChanged = false;
+		if (mergeAppImpl(file, cb.appid, cb.change_number, cb.sha, cb.buffer,
+		                 entryChanged, err))
 		{
 			++injected;
+			changed = changed || entryChanged;
+		}
+		else
+		{
+			g_pLog->debug("AppInfoVdf: skip %s during merge: %s\n",
+			              fname.c_str(), err.c_str());
+		}
+	}
+	if (changed)
+	{
+		std::string writeError;
+		if (!publishChecked(path, file, writeError))
+		{
+			g_pLog->warn("AppInfoVdf: transaction aborted after %d entries: %s\n",
+			             injected, writeError.c_str());
+			return 0;
 		}
 	}
 	if (injected > 0)
