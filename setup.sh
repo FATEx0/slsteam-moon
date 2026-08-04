@@ -369,6 +369,19 @@ if [ -z "$STEAM_BIN" ]; then
 	done
 	unset IFS
 fi
+# All system launchers are our shims or absent.  Fall back to the
+# steam.sh script inside the Steam data directory (it is what the
+# system launcher would exec anyway once the bootstrap is set up).
+if [ -z "$STEAM_BIN" ]; then
+	for c in "${HOME}/.local/share/Steam/steam.sh" \
+	         "${HOME}/.steam/steam/steam.sh" \
+	         "${HOME}/.steam/debian-installation/steam.sh"; do
+		if [ -x "$c" ]; then
+			STEAM_BIN="$c"
+			break
+		fi
+	done
+fi
 if [ -z "$STEAM_BIN" ]; then
 	echo "slsteam-moon: could not find the real Steam binary" >&2
 	exit 127
@@ -697,7 +710,7 @@ setup_system_launcher() {
 		if is_our_launcher_shim "$launcher"; then
 			local backup="$SLSDIR/system-launcher-backup/$(basename "$launcher").orig"
 			if [ ! -f "$backup" ]; then
-				log_warn "System launcher shim at $launcher has no backup, but still delegates correctly"
+				log_warn "System launcher at $launcher already wrapped (backup missing from previous cleanup); shim still works"
 			else
 				log_success "System launcher already wrapped: $launcher"
 			fi
