@@ -347,7 +347,9 @@ if [ -n "${SLSM_STEAM_BIN:-}" ] && [ -x "${SLSM_STEAM_BIN:-}" ] && \
 fi
 if [ -z "$STEAM_BIN" ]; then
 	for c in /usr/games/steam /usr/bin/steam /usr/local/bin/steam; do
-		if [ -x "$c" ] && [ "$(readlink -f "$c" 2>/dev/null || echo "$c")" != "$SELF" ]; then
+		if [ -x "$c" ] \
+			&& [ "$(readlink -f "$c" 2>/dev/null || echo "$c")" != "$SELF" ] \
+			&& ! head -3 "$c" 2>/dev/null | grep -q "slsteam-moon system launcher shim"; then
 			STEAM_BIN="$c"
 			break
 		fi
@@ -358,7 +360,9 @@ if [ -z "$STEAM_BIN" ]; then
 	IFS=:
 	for d in $PATH; do
 		c="$d/steam"
-		if [ -x "$c" ] && [ "$(readlink -f "$c" 2>/dev/null || echo "$c")" != "$SELF" ]; then
+		if [ -x "$c" ] \
+			&& [ "$(readlink -f "$c" 2>/dev/null || echo "$c")" != "$SELF" ] \
+			&& ! head -3 "$c" 2>/dev/null | grep -q "slsteam-moon system launcher shim"; then
 			STEAM_BIN="$c"
 			break
 		fi
@@ -617,7 +621,7 @@ if [ "${SLSM_SHOW_LOADER_WARNINGS:-0}" != 1 ] &&
 			# This worker is a 64-bit utility; never let the final 32-bit audit
 			# list recurse into it.
 			unset LD_AUDIT LD_PRELOAD LD_LIBRARY_PATH
-			awk 'index($0, "from LD_AUDIT cannot be preloaded (wrong ELF class: ELFCLASS32); ignored.") == 0 { print; fflush() }' \
+			awk 'index($0, "wrong ELF class: ELFCLASS32") > 0 && (index($0, "cannot be loaded as audit interface") > 0 || index($0, "cannot be preloaded") > 0) { next } { print; fflush() }' \
 				"$SLSM_FILTER_FIFO" >&2
 			rm -rf "$SLSM_FILTER_DIR"
 		) &
@@ -670,6 +674,169 @@ EOF
 # not just at install time. The old setup_autostart_override/is_autostart_steam_desktop/
 # rewrite_primary_exec_to_wrapper helpers were removed as dead code.
 
+# ---------------------------------------------------------------------------
+# System launcher interception
+# ---------------------------------------------------------------------------
+# Every launch path (.desktop entries, terminal invocations, XDG autostart,
+# third-party programs calling the steam binary) converges on the system
+# launcher script.  On Arch/Fedora this is /usr/bin/steam; on Debian/Ubuntu/
+# Mint it is /usr/games/steam.  These scripts are package-manager-owned and
+# have NO integrity check (unlike steam.sh which is SHA-verified), so wrapping
+# them is safe and survives Steam self-updates.
+#
+# We move the original to a backup inside SLSsteam, install a thin shim that
+# delegates to our full wrapper at ~/.local/share/SLSsteam/path/steam when it
+# exists (which contains the crash guard, LD_AUDIT injection, Lumen sidecar,
+# CloudRedirect preload, and all other logic), or executes the backup
+# untouched if our wrapper is absent (partial uninstall, broken install).
+# The desktop guardian re-applies this if the package manager reinstalls.
+
+SLSM_LAUNCHER_TAG="# slsteam-moon system launcher shim"
+
+detect_system_launchers() {
+	local l
+	for l in /usr/bin/steam /usr/games/steam /usr/local/bin/steam; do
+		[ -f "$l" ] && echo "$l"
+	done
+}
+
+is_our_launcher_shim() {
+	[ -f "$1" ] && head -3 "$1" | grep -q "$SLSM_LAUNCHER_TAG" 2>/dev/null
+}
+
+setup_system_launcher() {
+	if is_immutable_distro; then
+		log_info "Immutable distro: skipping system launcher interception"
+		return 0
+	fi
+
+	local slsm_sudo=""
+	if [ -n "${SUDO_ASKPASS:-}" ] && [ -x "${SUDO_ASKPASS:-}" ]; then
+		slsm_sudo="sudo -A"
+	elif command -v sudo >/dev/null 2>&1; then
+		slsm_sudo="sudo"
+	fi
+
+	local launcher
+	for launcher in $(detect_system_launchers); do
+		[ -f "$launcher" ] || continue
+
+		# Already our shim? Verify the backup is intact.
+		if is_our_launcher_shim "$launcher"; then
+			local backup="$SLSDIR/system-launcher-backup/$(basename "$launcher").orig"
+			if [ ! -f "$backup" ]; then
+				log_warn "System launcher shim at $launcher has no backup, but still delegates correctly"
+			else
+				log_success "System launcher already wrapped: $launcher"
+			fi
+			continue
+		fi
+
+		# Skip if we can't write to it (permissions).
+		if [ ! -w "$launcher" ] && ! command -v sudo >/dev/null 2>&1; then
+			log_warn "Cannot wrap $launcher (no write access, no sudo); terminal launches via PATH still covered"
+			continue
+		fi
+
+		if [ ! -w "$launcher" ]; then
+			if [ -n "$slsm_sudo" ]; then
+				if [ "$slsm_sudo" = "sudo -A" ]; then
+					: # askpass handles it non-interactively
+				elif ! sudo -v 2>/dev/null; then
+					log_warn "Cannot wrap $launcher (sudo denied); terminal launches via PATH still covered"
+					continue
+				fi
+			else
+				log_warn "Cannot wrap $launcher (no sudo); terminal launches via PATH still covered"
+				continue
+			fi
+		fi
+
+		# Back up the original inside our directory.
+		local backup_dir="$SLSDIR/system-launcher-backup"
+		mkdir -p "$backup_dir"
+		local backup="$backup_dir/$(basename "$launcher").orig"
+		if [ ! -f "$backup" ]; then
+			$slsm_sudo cp "$launcher" "$backup"
+			$slsm_sudo chmod 0755 "$backup"
+			log_info "Backed up $launcher -> $backup"
+		else
+			# Refresh the backup if the system one changed (package update).
+			if ! $slsm_sudo cmp -s "$launcher" "$backup" 2>/dev/null; then
+				$slsm_sudo cp "$launcher" "$backup"
+				log_info "Refreshed backup of $launcher"
+			fi
+		fi
+
+		# Install the shim.
+		local tmp_shim
+		tmp_shim="$(mktemp 2>/dev/null)"
+		if [ -z "$tmp_shim" ]; then
+			log_warn "Could not create temp file for launcher shim"
+			continue
+		fi
+		{
+			echo '#!/bin/sh'
+			echo "$SLSM_LAUNCHER_TAG"
+			echo '# Delegates to the full SLSsteam wrapper when present, or runs'
+			echo '# the original system launcher untouched if the wrapper is gone.'
+			echo 'SLSM_WRAPPER="${HOME}/.local/share/SLSsteam/path/steam"'
+			echo 'if [ -x "$SLSM_WRAPPER" ]; then'
+			echo '	for _s in "${HOME}/.local/share/Steam/steam.sh" "${HOME}/.steam/steam/steam.sh" "${HOME}/.steam/debian-installation/steam.sh"; do'
+			echo '		[ -x "$_s" ] && export SLSM_STEAM_BIN="$_s" && break'
+			echo '	done'
+			echo '	exec "$SLSM_WRAPPER" "$@"'
+			echo 'fi'
+			echo "exec \"$backup\" \"\$@\""
+		} > "$tmp_shim"
+		$slsm_sudo install -m 0755 "$tmp_shim" "$launcher"
+		rm -f "$tmp_shim"
+		log_success "Wrapped system launcher: $launcher"
+	done
+}
+
+restore_system_launchers() {
+	if is_immutable_distro; then
+		return 0
+	fi
+
+	local backup_dir="$SLSDIR/system-launcher-backup"
+	[ -d "$backup_dir" ] || return 0
+
+	local sudo_cmd=""
+	command -v sudo >/dev/null 2>&1 && sudo_cmd="sudo"
+	if [ -n "${SUDO_ASKPASS:-}" ] && [ -x "${SUDO_ASKPASS:-}" ]; then
+		sudo_cmd="sudo -A"
+	fi
+
+	local backup
+	for backup in "$backup_dir"/*.orig; do
+		[ -f "$backup" ] || continue
+		local base
+		base="$(basename "$backup" .orig)"
+		# Find where this launcher should live.
+		local orig_path=""
+		for p in /usr/bin/$base /usr/games/$base /usr/local/bin/$base; do
+			[ -f "$p" ] && { orig_path="$p"; break; }
+		done
+		[ -n "$orig_path" ] || continue
+
+		if is_our_launcher_shim "$orig_path"; then
+			if [ -n "$sudo_cmd" ]; then
+				$slsm_sudo cp "$backup" "$orig_path"
+				$slsm_sudo chmod 0755 "$orig_path"
+				log_success "Restored original launcher: $orig_path"
+			elif [ -w "$orig_path" ]; then
+				cp "$backup" "$orig_path"
+				chmod 0755 "$orig_path"
+				log_success "Restored original launcher: $orig_path"
+			else
+				log_warn "Cannot restore $orig_path (no sudo); manual restore needed from $backup"
+			fi
+		fi
+	done
+}
+
 setup_path_and_desktop()
 {
 	log_info "Setting up PATH and desktop integration"
@@ -696,6 +863,9 @@ setup_path_and_desktop()
 		echo 'export PATH="$HOME/.local/share/SLSsteam/path:$PATH"' > "$HOME/.bashrc"
 		log_success "Created ~/.bashrc with wrapper PATH"
 	fi
+
+	# --- System launcher interception ---
+	setup_system_launcher
 
 	# --- Detect Steam binary ----------------------------------------------
 	local steam_bin
@@ -902,7 +1072,7 @@ restore_or_remove_desktop() {
 
 	if [ -f "$backup" ]; then
 		log_info "Restoring $f from backup"
-		if $sudo_cmd cp -- "$backup" "$f"; then
+		if $slsm_sudo cp -- "$backup" "$f"; then
 			rm -f -- "$backup"
 			log_success "Restored $f"
 		fi
@@ -981,6 +1151,9 @@ uninstall()
 			log_warn "Legacy modification found but no backup exists"
 		fi
 	fi
+
+	# Restore any wrapped system launchers before removing the dir.
+	restore_system_launchers
 
 	if [ -d "$SLSDIR" ] && [ "$desktop_restore_complete" = 1 ]; then
 		log_info "Removing $SLSDIR"
