@@ -468,10 +468,20 @@ void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
 			continue;
 		}
 
+		const uint64_t gameId = game.game_id();
+
+		// Native non-Steam shortcut IDs use 0x02000000 in their low 32 bits.
+		// Keep Steam's shortcut title and full 64-bit ID untouched.
+		if ((gameId & 0xffffffffULL) == 0x02000000ULL)
+		{
+			g_pLog->debug("Preserving non-Steam shortcut %llu\n", gameId);
+			continue;
+		}
+
 		if(!owned)
 		{
 			CUser* user = getLocalUser();
-			if (user != nullptr && user->isSubscribed(game.game_id()))
+			if (user != nullptr && user->isSubscribed(gameId))
 			{
 				owned = true;
 			}
@@ -482,16 +492,16 @@ void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
 			game.set_owner_id(1);
 		}
 
-		if (titles.contains(game.game_id()))
+		if (titles.contains(gameId))
 		{
-			game.set_game_extra_info(titles[game.game_id()]);
+			game.set_game_extra_info(titles[gameId]);
 		}
-		else if (!owned || FakeAppIds::getFakeAppId(game.game_id()))
+		else if (!owned || FakeAppIds::getFakeAppId(gameId))
 		{
 			char name[256] {}; //No clue how long titles can get
 			if (g_pClientApps)
 			{
-				g_pClientApps->getAppData(game.game_id(), "common/name", name, sizeof(name));
+				g_pClientApps->getAppData(gameId, "common/name", name, sizeof(name));
 				g_pLog->debug("AppName %s\n", name);
 				game.set_game_extra_info(name);
 			}
@@ -499,7 +509,7 @@ void Apps::sendGamesPlayed(CMsgClientGamesPlayed* msg)
 
 		msg->mutable_games_played(i)->ParseFromString(game.SerializeAsString());
 
-		g_pLog->debug("Playing game %llu with flags %u & pid %u\n", game.game_id(), game.game_flags(), game.process_id());
+		g_pLog->debug("Playing game %llu with flags %u & pid %u\n", gameId, game.game_flags(), game.process_id());
 	}
 
 	if (owned || msg->games_played_size() > 0)

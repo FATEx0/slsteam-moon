@@ -181,13 +181,21 @@ void FakeAppIds::sendMsg(CProtoBufMsgBase* msg)
 	for(int i = 0; i < body->games_played_size(); i++)
 	{
 		const auto game = body->mutable_games_played(i);
-		const uint32_t fakeAppId = FakeAppIds::getFakeAppId(game->game_id());
+		const uint64_t gameId = game->game_id();
+
+		// Preserve native non-Steam shortcut IDs instead of applying a fake AppID.
+		if ((gameId & 0xffffffffULL) == 0x02000000ULL)
+		{
+			continue;
+		}
+
+		const uint32_t fakeAppId = FakeAppIds::getFakeAppId(gameId);
 		if (!fakeAppId)
 		{
 			continue;
 		}
 
-		g_pLog->debug("Setting %llu to %u\n", game->game_id(), fakeAppId);
+		g_pLog->debug("Setting %llu to %u\n", gameId, fakeAppId);
 		game->set_game_id(fakeAppId);
 	}
 }
