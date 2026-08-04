@@ -70,7 +70,6 @@ if [ -n "${LD_AUDIT:-}" ]; then echo "injected" >> "$INVOCATIONS"; else echo "va
   printf 'LD_LIBRARY_PATH=%s\n' "${LD_LIBRARY_PATH:-}"
 } > "$ENV_CAPTURE"
 if [ -n "${SLSM_TEST_EMIT_STDERR:-}" ]; then
-  echo "ERROR: ld.so: object '/tmp/SLSsteam.so' from LD_AUDIT cannot be preloaded (wrong ELF class: ELFCLASS32); ignored." >&2
   echo "steam-real-error: keep this diagnostic" >&2
 fi
 exit 0
@@ -134,8 +133,7 @@ run_wrapper
 [ "$(sed -n 's/^LD_LIBRARY_PATH=//p' "$ENV_CAPTURE")" = "" ] \
   && ok "safe mode removes LD_LIBRARY_PATH" || bad "safe mode inherited LD_LIBRARY_PATH"
 
-# The default diagnostic path suppresses only the known wrong-ELF-class loader
-# line and still forwards unrelated Steam errors.
+# Steam stderr is forwarded directly (no FIFO filter).
 rm -f "$GUARD_DIR/safe_mode" "$GUARD_DIR/safe_mode_fingerprint"
 : > "$STDERR_CAPTURE"
 unset LD_AUDIT LD_PRELOAD LD_LIBRARY_PATH
@@ -145,12 +143,9 @@ for _wait in 1 2 3 4 5 6 7 8 9 10; do
 	grep -qF 'steam-real-error: keep this diagnostic' "$STDERR_CAPTURE" && break
 	sleep 0.1
 done
-grep -qF 'wrong ELF class: ELFCLASS32' "$STDERR_CAPTURE" \
-  && bad "wrong ELF class warning was not filtered" \
-  || ok "wrong ELF class warning is filtered"
 grep -qF 'steam-real-error: keep this diagnostic' "$STDERR_CAPTURE" \
-  && ok "unrelated Steam stderr is preserved" \
-  || bad "unrelated Steam stderr was filtered"
+  && ok "Steam stderr is forwarded" \
+  || bad "Steam stderr was lost"
 unset SLSM_TEST_EMIT_STDERR LD_AUDIT LD_PRELOAD LD_LIBRARY_PATH
 
 # --- REGRESSION: short but CLEAN boots must NOT latch (no crash dumps) --------

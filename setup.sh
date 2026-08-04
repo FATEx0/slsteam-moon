@@ -607,30 +607,6 @@ fi
 
 AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so"
 
-# ld.so prints the harmless 32-bit-auditor/64-bit-bootstrap warning before
-# Steam's final i386 client is reached.  Filter only that exact diagnostic via
-# a FIFO; all other Steam stderr remains live and untouched.  Set
-# SLSM_SHOW_LOADER_WARNINGS=1 when the raw loader diagnostics are needed.
-SLSM_FILTER_FIFO=""
-if [ "${SLSM_SHOW_LOADER_WARNINGS:-0}" != 1 ] &&
-	command -v mktemp >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
-	SLSM_FILTER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/slssteam-ldso.XXXXXX" 2>/dev/null || true)"
-	if [ -n "$SLSM_FILTER_DIR" ] && mkfifo "$SLSM_FILTER_DIR/stderr" 2>/dev/null; then
-		SLSM_FILTER_FIFO="$SLSM_FILTER_DIR/stderr"
-		(
-			# This worker is a 64-bit utility; never let the final 32-bit audit
-			# list recurse into it.
-			unset LD_AUDIT LD_PRELOAD LD_LIBRARY_PATH
-			awk 'index($0, "wrong ELF class: ELFCLASS32") > 0 && (index($0, "cannot be loaded as audit interface") > 0 || index($0, "cannot be preloaded") > 0) { next } { print; fflush() }' \
-				"$SLSM_FILTER_FIFO" >&2
-			rm -rf "$SLSM_FILTER_DIR"
-		) &
-	else
-		rm -rf "${SLSM_FILTER_DIR:-}" 2>/dev/null || true
-		SLSM_FILTER_DIR=""
-	fi
-fi
-
 # Re-assert desktop-entry coverage without putting reconciliation on the launch
 # critical path. Prefer the serialized guardian; retain the legacy CLI fallback
 # during upgrades or on desktops without a working user manager.
@@ -652,11 +628,7 @@ if [ -n "$SLSM_INHERITED_AUDIT" ]; then
 else
 	export LD_AUDIT="$AUDIT"
 fi
-if [ -n "$SLSM_FILTER_FIFO" ]; then
-	exec "$STEAM_BIN" "$@" 2>"$SLSM_FILTER_FIFO"
-else
-	exec "$STEAM_BIN" "$@"
-fi
+exec "$STEAM_BIN" "$@"
 EOF
 
 	chmod +x "$SLSDIR/path/steam"
