@@ -31,6 +31,10 @@ int main()
 	      "missing concrete depot data remains fallback-eligible");
 	CHECK(classifyContentResult(true, false) == SourceResult::NoUsableContent,
 	      "concrete depots removed during pruning are terminal");
+	CHECK(classifyContentResult(false, false, true) == SourceResult::VirtualDlc,
+	      "virtual DLC without content is not treated as an incomplete game");
+	CHECK(classifyContentResult(true, false, true) == SourceResult::NoUsableContent,
+	      "DLC with concrete content removed remains terminal");
 
 	CHECK(!shouldTryProviderFallback(SourceResult::Success),
 	      "success does not fall back");
@@ -40,6 +44,8 @@ int main()
 	      "valid CM response missing depot data can fall back");
 	CHECK(!shouldTryProviderFallback(SourceResult::NoUsableContent),
 	      "concrete depots removed as unusable are terminal");
+	CHECK(!shouldTryProviderFallback(SourceResult::VirtualDlc),
+	      "virtual DLC is terminal without a provider retry");
 	CHECK(!shouldTryProviderFallback(SourceResult::LocalFailure),
 	      "local persistence failure is terminal");
 
@@ -57,6 +63,10 @@ int main()
 	CHECK(noticeForOutcome(ProvisionOutcome::IncompleteContent) ==
 	          ProvisionNotice::ReviewGameData,
 	      "unusable depot data asks the user to review the game data");
+	CHECK(noticeForOutcome(ProvisionOutcome::NotApplicable) == ProvisionNotice::None,
+	      "virtual DLC without content is silent");
+	CHECK(!isProvisioned(ProvisionOutcome::NotApplicable),
+	      "virtual DLC is not counted as a provisioned game");
 	CHECK(noticeForOutcome(ProvisionOutcome::LocalFailure) ==
 	          ProvisionNotice::LocalStorage,
 	      "cache write failure gets a local-storage notice");

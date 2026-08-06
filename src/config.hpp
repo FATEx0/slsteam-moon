@@ -57,9 +57,10 @@ public:
 	MTVariable<std::unordered_map<uint32_t, std::string>> gameTitles;
 	MTVariable<std::unordered_map<uint32_t, uint32_t>> subscriptionTimestamps;
 
-	// Manifest pinning.  manifestPins is the flattened
-	// depot->gid redirect index; lockedApps drives shouldDisableUpdates;
-	// manifestPinsByApp is the structured source kept for purge.
+	// Manifest pinning.  manifestPins is the flattened, unambiguous
+	// depot->gid redirect index used only by legacy hooks without app context;
+	// lockedApps drives shouldDisableUpdates; manifestPinsByApp is the
+	// structured source kept for app-scoped lookup and purge.
 	MTVariable<std::unordered_map<uint32_t, uint64_t>> manifestPins;
 	MTVariable<std::unordered_set<uint32_t>> lockedApps;
 	MTVariable<ManifestPins::PinMap> manifestPinsByApp;
@@ -209,7 +210,14 @@ public:
 	bool isAddedAppId(uint32_t appId);
 	bool addAdditionalAppId(uint32_t appId);
 
+	// Legacy fallback for hooks that do not know the owning app.  Conflicting
+	// depot ownership is omitted from this index and returns zero.
 	uint64_t getManifestPin(uint32_t depotId);
+	// Authoritative lookup for consumers that have the owning app context.
+	uint64_t getManifestPin(uint32_t appId, uint32_t depotId);
+	// Planner lookup: use DepotEntry's app context, with a fallback only when
+	// the structured map proves that exactly one app owns the depot.
+	uint64_t getManifestPinForPlanner(uint32_t appId, uint32_t depotId);
 	bool isAppLocked(uint32_t appId);
 	// The depot->gid pins for one app (empty if none).  Used to check whether
 	// an app's installed depots already match its pins (pin-aware update

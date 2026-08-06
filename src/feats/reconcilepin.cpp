@@ -37,7 +37,7 @@ namespace
 	lm_address_t g_tramp = LM_ADDRESS_BAD;
 	lm_size_t    g_size = 0;
 
-	bool g_pinActive = false;   // SLSSTEAM_PIN_PLANNER: perform the gid rewrite
+	bool g_pinActive = false;   // SLSSTEAM_RECONCILE_PIN: perform the gid rewrite
 	bool g_trace = false;       // SLSSTEAM_RECONCILE_TRACE: per-call logging
 	std::atomic<int> g_traceBudget{400};
 
@@ -80,7 +80,7 @@ namespace
 				    static_cast<unsigned long long>(
 				        *reinterpret_cast<const uint64_t*>(e + kDepotEntryGidOff)),
 				    static_cast<unsigned long long>(
-				        g_config.getManifestPin(
+				        g_config.getManifestPin(appId,
 				            *reinterpret_cast<const uint32_t*>(e))));
 			}
 		}
@@ -118,13 +118,13 @@ namespace
 		count = filterEmptyManaged(base, count, appId, "target-ctx");
 		*countPtr = count;
 
-		if (!g_pinActive || !g_config.isAppLocked(appId)) return;
+		if (!g_pinActive) return;
 
 		auto* e = base;
 		for (int32_t i = 0; i < count; ++i, e += kDepotEntryStride)
 		{
 			const uint32_t depotId = *reinterpret_cast<const uint32_t*>(e);
-			const uint64_t pin = g_config.getManifestPin(depotId);
+			const uint64_t pin = g_config.getManifestPin(appId, depotId);
 			if (!pin) continue;
 			auto* gidp = reinterpret_cast<uint64_t*>(e + kDepotEntryGidOff);
 			if (*gidp != pin)
@@ -191,13 +191,13 @@ namespace
 		count = filterEmptyManaged(base, count, appId, "target-local");
 		*countPtr = count;
 
-		if (!g_pinActive || !g_config.isAppLocked(appId)) return;
+		if (!g_pinActive) return;
 
 		auto* e = base;
 		for (int32_t i = 0; i < count; ++i, e += kDepotEntryStride)
 		{
 			const uint32_t depotId = *reinterpret_cast<const uint32_t*>(e);
-			const uint64_t pin = g_config.getManifestPin(depotId);
+			const uint64_t pin = g_config.getManifestPin(appId, depotId);
 			if (!pin) continue;
 			auto* gidp = reinterpret_cast<uint64_t*>(e + kDepotEntryGidOff);
 			if (*gidp != pin)
@@ -296,10 +296,9 @@ namespace ReconcilePin
 {
 	bool setup()
 	{
-		// The gid rewrite (the loop fix) is DEFAULT ON now: the pin is
-		// config-driven (ManifestPins locked apps), so it acts for any locked
-		// app without an env var.  SLSSTEAM_RECONCILE_PIN=0 is an explicit
-		// opt-out for isolating/debugging.
+		// The gid rewrite (the loop fix) is DEFAULT ON now: it is driven by any
+		// configured ManifestPins entry, while lockedApps remains exclusively the
+		// update-suppression policy in Apps::shouldDisableUpdates.
 		g_pinActive = true;
 		if (const char* e = std::getenv("SLSSTEAM_RECONCILE_PIN"))
 		{

@@ -36,6 +36,7 @@
 #include <dlfcn.h>
 
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -649,8 +650,21 @@ void neutralizeLegacyCdKey(YAML::Node& body, uint32_t appId)
 	             appId, cur.c_str());
 }
 
-// Render the SteamCMD-style JSON object for one app into the wire-text
+// Render the SteamCMD-style JSON response for one app into the wire-text
 // VDF format that AppInfoVdf::translateWireToIndexed accepts.
+bool isDlcApp(const YAML::Node& body)
+{
+	if (!body || !body.IsMap()) return false;
+	const YAML::Node common = body["common"];
+	if (!common || !common.IsMap()) return false;
+	const YAML::Node type = common["type"];
+	if (!type || !type.IsScalar()) return false;
+	std::string value = type.as<std::string>("");
+	for (char& ch : value)
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	return value == "dlc";
+}
+
 SourceResult renderAppinfoBuffer(const YAML::Node& appNode, uint32_t appId,
                                  std::string& wireOut)
 {
@@ -695,7 +709,7 @@ SourceResult renderAppinfoBuffer(const YAML::Node& appNode, uint32_t appId,
 	// "the user only owns the windows depot".
 	pruneUnsupportedDepots(body, appId);
 	const SourceResult contentResult = classifyContentResult(
-	    hadConcreteContent, hasUsableContentDepot(body));
+	    hadConcreteContent, hasUsableContentDepot(body), isDlcApp(body));
 	if (contentResult != SourceResult::Success)
 	{
 		g_pLog->info("AppInfoProvision: app=%u has no usable content depots "
@@ -1268,6 +1282,8 @@ SourceResult renderAndPersist(uint32_t appId, const YAML::Node& appNode,
 			reason = "response contains no concrete depot data";
 		else if (renderResult == SourceResult::NoUsableContent)
 			reason = "concrete depots are not usable";
+		else if (renderResult == SourceResult::VirtualDlc)
+			reason = "DLC has no usable content depots";
 		g_pLog->info("AppInfoProvision: app=%u render stopped (%s)\n", appId, reason);
 		return renderResult;
 	}
@@ -1378,7 +1394,11 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 				    "provider fallback suppressed\n", appId,
 				    cmResult == SourceResult::NoUsableContent
 				        ? "concrete depots are not usable"
-				        : "local cache write failed");
+				        : cmResult == SourceResult::VirtualDlc
+				            ? "DLC has no usable content depots"
+				            : "local cache write failed");
+				if (cmResult == SourceResult::VirtualDlc)
+					return ProvisionOutcome::NotApplicable;
 				return cmResult == SourceResult::LocalFailure
 				    ? ProvisionOutcome::LocalFailure
 				    : ProvisionOutcome::IncompleteContent;
@@ -1477,7 +1497,11 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 			reason = "response contains no concrete depot data";
 		else if (renderResult == SourceResult::NoUsableContent)
 			reason = "concrete depots are not usable";
+		else if (renderResult == SourceResult::VirtualDlc)
+			reason = "DLC has no usable content depots";
 		g_pLog->info("AppInfoProvision: app=%u render stopped (%s)\n", appId, reason);
+		if (renderResult == SourceResult::VirtualDlc)
+			return ProvisionOutcome::NotApplicable;
 		return renderResult == SourceResult::LocalFailure
 		    ? ProvisionOutcome::LocalFailure
 		    : ProvisionOutcome::IncompleteContent;
@@ -1493,8 +1517,8 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 		return ProvisionOutcome::IncompleteContent;
 	}
 
-	// Manifest-GID pins for a GENERAL (non-locked) AddedApp are DELIBERATELY
-	// NOT applied here.
+	// Manifest-GID pins are DELIBERATELY NOT applied to the provisioned wire
+	// buffer.
 	//
 	// We used to rewrite every provisioned buffer's public gid to the
 	// pinned gid.  That is structurally defeated by Steam: when the user
@@ -1514,13 +1538,11 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 	// gid we pre-stage in PICS recv == the gid Steam requests == BYld is
 	// skipped == first-attempt install succeeds.
 	//
-	// EXCEPTION: a LOCKED app
-	// is an explicit user downgrade to an older build, and renderAppinfoBuffer
-	// (above, gated on SLSSTEAM_PIN_PLANNER) DOES rewrite that app's depot
-	// gid to the pin — so installed==appinfo and the post-commit reconcile
-	// doesn't loop.  The RequestAppInfoUpdate clobber risk noted here is the
-	// open question being validated for that path; if it re-fires for a
-	// locked downgrade we must re-apply the pin on refresh (see the doc).
+	// ManifestPins are applied later, after Steam has built the plan:
+	// BuildDepotDependency rewrites each DepotEntry using its AppId, and
+	// ReconcilePin patches the in-memory TARGET vectors.  This applies to
+	// every configured app-scoped pin.  lockedApps remains separate and only
+	// controls update suppression in Apps::shouldDisableUpdates.
 
 	// Compute sha[20] over the FINAL wire buffer (after prune).
 	//

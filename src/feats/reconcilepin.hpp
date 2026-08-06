@@ -11,8 +11,8 @@
 // matching content_log "active: ... target: ...").
 //
 // The fix has TWO cooperating parts on the TARGET side. Managed size-zero
-// depots are removed wherever they appear; gid rewriting remains restricted
-// to LOCKED apps:
+// depots are removed wherever they appear; configured pins are applied to
+// every app that owns the depot, independently of the update-lock policy:
 //
 //  (1) ctx-vector patch: on the TARGET call (flags & 0x8), remove managed
 //      size-zero depots and rewrite remaining ManifestGids to configured pins
@@ -47,9 +47,10 @@
 // no fixPICThunkCall is needed.
 //
 // Gating: the empty-depot filter is always active and only recognizes depots
-// imported as managed. The gid rewrite acts only for locked apps and honours
-// SLSSTEAM_RECONCILE_PIN. Optional per-call diagnostic logging is gated on
-// SLSSTEAM_RECONCILE_TRACE.
+// imported as managed. The gid rewrite acts for any configured app-scoped pin
+// and honours SLSSTEAM_RECONCILE_PIN. The separate locked-app policy in
+// shouldDisableUpdates controls update suppression, not this rewrite. Optional
+// per-call diagnostic logging is gated on SLSSTEAM_RECONCILE_TRACE.
 
 #pragma once
 

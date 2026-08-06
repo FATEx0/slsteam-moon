@@ -565,7 +565,7 @@ bool hkCDepotDownloadMgr_BYldRequestDepotManifest(void* pthis, uint32_t appId, u
 			if (ok)
 			{
 				ManifestStore::archiveManifest(depotId, manifestId);
-				if (g_config.getManifestPin(depotId) != manifestId)
+				if (g_config.getManifestPin(appId, depotId) != manifestId)
 				{
 					ManifestStore::markPreferredGid(depotId, manifestId);
 				}

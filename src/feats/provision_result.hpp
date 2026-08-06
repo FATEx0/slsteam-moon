@@ -9,6 +9,7 @@ enum class SourceResult
 	InvalidResponse,
 	IncompleteContent,
 	NoUsableContent,
+	VirtualDlc,
 	LocalFailure,
 };
 
@@ -19,6 +20,7 @@ enum class ProvisionOutcome
 	FallbackCache,
 	NetworkUnavailable,
 	IncompleteContent,
+	NotApplicable,
 	LocalFailure,
 };
 
@@ -44,6 +46,7 @@ inline ProvisionNotice noticeForOutcome(ProvisionOutcome outcome)
 		case ProvisionOutcome::Updated:
 		case ProvisionOutcome::FreshCache:
 		case ProvisionOutcome::FallbackCache:
+		case ProvisionOutcome::NotApplicable:
 			return ProvisionNotice::None;
 		case ProvisionOutcome::NetworkUnavailable:
 			return ProvisionNotice::MetadataUnavailable;
@@ -62,6 +65,18 @@ inline SourceResult classifyContentResult(bool hadConcreteContent,
 	return hadConcreteContent
 	    ? SourceResult::NoUsableContent
 	    : SourceResult::IncompleteContent;
+}
+
+// A product-info record whose common.type is DLC may legitimately contain
+// only virtual ownership metadata.  It is not incomplete game content and
+// must not trigger a provider retry or a user-facing preparation warning.
+inline SourceResult classifyContentResult(bool hadConcreteContent,
+                                          bool hasUsableContent,
+                                          bool isDlc)
+{
+	if (isDlc && !hadConcreteContent && !hasUsableContent)
+		return SourceResult::VirtualDlc;
+	return classifyContentResult(hadConcreteContent, hasUsableContent);
 }
 
 inline bool shouldTryProviderFallback(SourceResult result)

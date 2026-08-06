@@ -673,6 +673,17 @@ uint64_t CConfig::getManifestPin(uint32_t depotId)
 	return ManifestPins::getPin(manifestPins.get(), depotId);
 }
 
+uint64_t CConfig::getManifestPin(uint32_t appId, uint32_t depotId)
+{
+	return ManifestPins::getPinForContext(manifestPinsByApp.get(), appId, depotId);
+}
+
+uint64_t CConfig::getManifestPinForPlanner(uint32_t appId, uint32_t depotId)
+{
+	return ManifestPins::getPinForPlannerEntry(
+	    manifestPinsByApp.get(), appId, depotId);
+}
+
 bool CConfig::isAppLocked(uint32_t appId)
 {
 	return ManifestPins::isLocked(lockedApps.get(), appId);

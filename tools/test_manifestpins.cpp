@@ -34,7 +34,34 @@ int main()
 		CHECK(flat[285904] == 123456789012345ULL, "flatten: dlc gid exact");
 	}
 
-	// 2) lockedAppSet: only the locked app.
+	// 2) app-scoped lookup: the same depot id must never inherit another
+	// app's gid.  The flattened fallback is only safe for unambiguous depots.
+	{
+		CHECK(getPin(pins, 1054490, 1054491) == 4091695229428697509ULL,
+		      "scoped: owning app gets its depot gid");
+		CHECK(getPin(pins, 285900, 1054491) == 0,
+		      "scoped: another app cannot inherit the depot gid");
+		CHECK(getPinForContext(pins, 0, 1054491) == 0,
+		      "context: missing app id cannot resolve a global depot pin");
+		CHECK(getPinForPlannerEntry(pins, 285900, 285904) == 123456789012345ULL,
+		      "planner: an unlocked app's app-scoped pin remains applicable");
+
+		PinMap unique;
+		unique[700].depots[701] = 9001ULL;
+		CHECK(getPinForUniqueOwner(unique, 701) == 9001ULL,
+		      "planner: depot-only fallback requires one owner");
+		unique[701].depots[701] = 9001ULL;
+		CHECK(getPinForUniqueOwner(unique, 701) == 0,
+		      "planner: multiple owners disable depot-only fallback");
+
+		PinMap collision = pins;
+		collision[285900].depots[1054491] = 777ULL;
+		auto flat = flattenDepots(collision);
+		CHECK(flat.count(1054491) == 0,
+		      "flatten: conflicting depot ownership is omitted from fallback");
+	}
+
+	// 3) lockedAppSet: only the locked app.
 	{
 		auto locked = lockedAppSet(pins);
 		CHECK(locked.count(1054490) == 1, "locked: includes locked app");

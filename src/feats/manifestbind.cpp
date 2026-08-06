@@ -81,12 +81,14 @@ namespace
 	using BuildDepFn_t = void*(*)(void*, uint32_t, void*, uint32_t);
 
 	// DepotEntry layout (matching OpenSteamTool Structs.h):
-	//   +0x00 u32 DepotId   +0x08 u64 ManifestGid   +0x10 u64 ManifestSize
+	//   +0x00 u32 DepotId   +0x04 u32 AppId
+	//   +0x08 u64 ManifestGid   +0x10 u64 ManifestSize
 	//   +0x18 u32 DlcAppId   +0x1c u8 Lcs   +0x1d u8 bNotNewTarget
 	//   +0x1e u8 SharedInstall ; stride 0x20.
 	// CUtlVector<DepotEntry>: element base @ +0x00 (m_Memory.m_pMemory),
 	//   count (m_Size) @ +0x0c.
 	constexpr size_t kDepotEntryStride = ManagedDepotFilter::kDepotEntryStride;
+	constexpr size_t kDepotEntryAppIdOff = 0x04;
 	constexpr size_t kDepotEntryGidOff = 0x08;
 	constexpr size_t kDepotEntrySizeOff = ManagedDepotFilter::kDepotSizeOff;
 	constexpr size_t kDepotEntryDlcAppIdOff = 0x18;
@@ -116,13 +118,10 @@ namespace
 	BuildDetour g_builder;  // CDepotDownloadMgr::BuildDepotDependency
 
 	bool g_fallbackEnabled = true;
-	// Patch the depot gid in the install plan so Steam commits the pinned build
-	// for LOCKED apps.  DEFAULT ON: the pin is config-driven (ManifestPins
-	// locked apps), no longer env-gated; a non-pinned depot is a no-op because
-	// getManifestPin returns 0.  The post-commit reconcile applies the pinned
-	// target so update-check/plan/commit/reconcile agree on the pinned gid and
-	// it no longer loops.  SLSSTEAM_PIN_PLANNER=0 is an explicit opt-out for testing.
-	bool g_pinPlanner = true;
+	// BuildDepotDependency carries the owning appId in each DepotEntry.  Use
+	// that context for pin rewriting; when the field is zero, the structured
+	// pin map permits only a unique-owner fallback.  No flattened depot->gid
+	// lookup is used, so a shared depot cannot inherit another app's pin.
 
 	// Event-driven manifest staging state. BuildDepotDependency sees the exact
 	// depots Steam selected for this plan, starts their bounded background
@@ -406,7 +405,7 @@ namespace
 		    appId   && g_config.isAddedAppId(appId),
 		    depotId && g_config.isAddedAppId(depotId),
 		    DepotKey::isManagedDepot(depotId),
-		    /*depotHasPin=*/g_config.getManifestPin(depotId) != 0);
+		    /*depotHasPin=*/g_config.getManifestPin(appId, depotId) != 0);
 	}
 
 	// Shared redirect decision: when the planned (public) gid's manifest is
@@ -432,7 +431,7 @@ namespace
 		// target pass), never on this acquisition/active path.  Leaving the
 		// real gid here lets Steam load the genuine public active manifest,
 		// compute a true delta against the pinned target, and download it.
-		const uint64_t pin = g_config.getManifestPin(depotId);
+		const uint64_t pin = g_config.getManifestPin(appId, depotId);
 		if (pin)
 		{
 			// Stage the pinned manifest if absent (harmless when present: just
@@ -606,15 +605,13 @@ namespace
 		return g_planner.orig(ctx, a0C, appId, depotId, useGid, a20);
 	}
 
-	// CDepotDownloadMgr::BuildDepotDependency — patch the PLAN in place.
+	// CDepotDownloadMgr::BuildDepotDependency — filter the PLAN in place and
+	// prefetch exactly the managed or pinned manifests Steam selected.
 	//
-	// This is the real manifest-pin lever.
-	// Steam decides the depot gid + build it installs/commits from the
-	// already-built DepotEntry vector this function consumes; redirecting the
-	// gid downstream (ProcessDepotManifest/PrepareDepotDownload) only changes
-	// which .manifest is fetched, NOT the committed gid (confirmed in testing).  Here we
-	// overwrite depots[i].ManifestGid for any pinned depot BEFORE the original
-	// runs, so the planned-gid copy (ctx+0x664) and the commit see the pin.
+	// FUNC_1141 receives a populated DepotEntry vector.  DepotEntry::AppId at
+	// +0x04 is the owning app context for the app-scoped lookup; a missing app
+	// id is eligible only for a unique-owner fallback, never for an ambiguous
+	// shared depot.
 	//
 	// Defensive: bail on an implausible vector (null base / out-of-range count)
 	// so a signature/ABI drift degrades to a harmless pass-through.
@@ -669,25 +666,26 @@ namespace
 						continue;
 					}
 
-					const uint64_t pin = g_config.getManifestPin(depotId);
-					if (pin)
+					const uint32_t entryAppId =
+						*reinterpret_cast<const uint32_t*>(e + kDepotEntryAppIdOff);
+					const uint64_t pin = g_config.getManifestPinForPlanner(
+						entryAppId, depotId);
+					if (pin && *gidp != pin)
 					{
-						if (g_pinPlanner && *gidp != pin)
-						{
-							g_pLog->info(
-							    "ManifestBind[build]: depot=%u plan gid=%llu -> pinned "
-							    "gid=%llu (DepotEntry patch)\n",
-							    depotId,
-							    static_cast<unsigned long long>(*gidp),
-							    static_cast<unsigned long long>(pin));
-							*gidp = pin;
-						}
+						g_pLog->info(
+						    "ManifestBind[build]: app=%u depot=%u plan gid=%llu -> "
+						    "pinned gid=%llu (DepotEntry patch)\n",
+						    entryAppId, depotId,
+						    static_cast<unsigned long long>(*gidp),
+						    static_cast<unsigned long long>(pin));
+						*gidp = pin;
 					}
 
 					// This is the exact set Steam selected for the real plan,
 					// after pin rewriting and size-0 pruning. Kick off only
-					// these manifests on the bounded SLSsteam executor. No
-					// network or decompression runs on this Steam worker.
+					// these manifests on the bounded SLSsteam executor. A pin is
+					// also sufficient to include a depot whose key was not marked
+					// managed by the current discovery pass.
 					const uint64_t targetGid = *gidp;
 					if (targetGid
 					    && (DepotKey::isManagedDepot(depotId) || pin))
@@ -698,7 +696,7 @@ namespace
 						        planDepotcache, depotId, targetGid))
 						{
 							ManifestFetch::submitManifestBlob(
-							    targetGid, /*appId=*/0, depotId);
+							    targetGid, entryAppId, depotId);
 						}
 					}
 
@@ -805,11 +803,6 @@ namespace ManifestBind
 			g_planTrace = !(env[0] == '0' && env[1] == '\0');
 		}
 
-		if (const char* env = std::getenv("SLSSTEAM_PIN_PLANNER"))
-		{
-			g_pinPlanner = !(env[0] == '0' && env[1] == '\0');
-		}
-
 		// Both hooks cooperate; install independently so one missing
 		// signature doesn't disable the other.  The leaf alone lets the
 		// install skip BYld but crashes the planner's table lookup; the
@@ -822,18 +815,17 @@ namespace ManifestBind
 		    g_planner, Patterns::CDepotDownloadMgr::PrepareDepotDownload,
 		    reinterpret_cast<void*>(&hkPrepareDepot));
 
-		// The planner patch (the real manifest-pin lever): rewrites the depot
-		// gid in the install plan so Steam commits the pinned build.  Optional;
-		// a missing signature degrades to the leaf/planner redirect only.
+		// BuildDepotDependency applies each entry's app-scoped ManifestPin before
+		// the original planner consumes the vector. ReconcilePin also patches the
+		// target vectors used by post-commit comparison, keeping both paths aligned.
 		const bool builder = installBuilder(
 		    Patterns::CDepotDownloadMgr::BuildDepotDependency,
 		    reinterpret_cast<void*>(&hkBuildDepot));
 
-		g_pLog->debug("ManifestBind: leaf=%d planner=%d builder=%d fallback=%d pinPlanner=%d\n",
+		g_pLog->debug("ManifestBind: leaf=%d planner=%d builder=%d fallback=%d\n",
 		              static_cast<int>(leaf), static_cast<int>(planner),
 		              static_cast<int>(builder),
-		              static_cast<int>(g_fallbackEnabled),
-		              static_cast<int>(g_pinPlanner));
+		              static_cast<int>(g_fallbackEnabled));
 		return leaf || planner || builder;
 	}
 
