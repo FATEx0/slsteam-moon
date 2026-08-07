@@ -419,6 +419,16 @@ if [ -z "$STEAM_BIN" ]; then
 	echo "slsteam-moon: could not find the real Steam binary" >&2
 	exit 127
 fi
+# Canonicalize before we touch cwd below: SLSM_STEAM_BIN can be relative, and
+# a relative STEAM_BIN would break once we've cd'd elsewhere.
+STEAM_BIN="$(readlink -f "$STEAM_BIN" 2>/dev/null || echo "$STEAM_BIN")"
+
+# Some Steam launchers (Nix's FHS/bwrap wrapper) replicate our cwd inside
+# their sandbox via --chdir. If we were started from a short-lived temp dir
+# (an installer extracting to $(mktemp -d) before running us), the sandbox's
+# isolated /tmp won't have it and bwrap fails to chdir. $HOME is always
+# there, so pin cwd to it now that STEAM_BIN is resolved.
+cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
 
 slsm_exec_vanilla() {
 	# Safe mode must not depend on what a desktop entry or parent shell put in
