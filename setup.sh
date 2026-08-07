@@ -248,7 +248,14 @@ kill_steam() {
 	log_info "Stopping running Steam processes"
 
 	if command -v steam >/dev/null 2>&1; then
-		steam -shutdown >/dev/null 2>&1 || true
+		# Sandboxed launchers replicate the caller's cwd inside their sandbox.
+		# The installer may still be inside a temporary extraction directory,
+		# which does not exist in that sandbox. Keep the shutdown request local
+		# to this subshell so setup.sh itself retains its current directory.
+		(
+			cd "$HOME" 2>/dev/null || cd / 2>/dev/null || exit 0
+			steam -shutdown >/dev/null 2>&1
+		) || true
 	fi
 
 	for _ in 1 2 3 4 5; do
@@ -419,9 +426,13 @@ if [ -z "$STEAM_BIN" ]; then
 	echo "slsteam-moon: could not find the real Steam binary" >&2
 	exit 127
 fi
-# Canonicalize before we touch cwd below: SLSM_STEAM_BIN can be relative, and
-# a relative STEAM_BIN would break once we've cd'd elsewhere.
-STEAM_BIN="$(readlink -f "$STEAM_BIN" 2>/dev/null || echo "$STEAM_BIN")"
+# Canonicalize relative paths before we touch cwd below. Absolute paths must
+# remain verbatim because the bootstrap guard below matches their managed
+# launcher prefixes literally.
+case "$STEAM_BIN" in
+	/*) ;;
+	*) STEAM_BIN="$(readlink -f "$STEAM_BIN" 2>/dev/null || echo "$STEAM_BIN")" ;;
+esac
 
 # Some Steam launchers (Nix's FHS/bwrap wrapper) replicate our cwd inside
 # their sandbox via --chdir. If we were started from a short-lived temp dir
