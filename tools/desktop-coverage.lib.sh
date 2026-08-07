@@ -8,6 +8,14 @@
 # place. Such files get no backup and are DELETED (not restored) on uninstall,
 # because the user never had them.
 : "${DC_SEED_TAG:=X-SLSteamMoon-Seeded=true}"
+# Marks a minimal desktop entry created before Steam's data root exists. It is
+# intentionally tagged for ownership but remains a direct distro-installer
+# launcher until bootstrap is confirmed.
+: "${DC_PREBOOTSTRAP_TAG:=X-SLSteamMoon-Prebootstrap=true}"
+
+dc_is_prebootstrap_seed() {
+	[ -f "$1" ] && grep -qxF "$DC_PREBOOTSTRAP_TAG" "$1" 2>/dev/null
+}
 : "${WRAPPER:=$HOME/.local/share/SLSsteam/path/steam}"
 : "${DC_HOME:=$HOME}"
 
@@ -67,6 +75,101 @@ dc_autostart_dirs() {
 # without changing HOME. The mirrored absolute source path below avoids name
 # collisions between (for example) user and system steam.desktop files.
 : "${DC_BACKUP_ROOT:=}"
+
+# Launcher-policy validation is kept independent from launcher-shim.lib.sh so
+# the standalone desktop-coverage CLI can safely reconcile a stale policy.
+# Production setup sources the shim library too; tests may override the array
+# and backup root directly.
+: "${DC_LAUNCHER_TAG:=# slsteam-moon system launcher shim}"
+: "${DC_LAUNCHER_BACKUP_ROOT:=}"
+
+dc_launcher_dirs() {
+	local dir
+	if declare -p DC_LAUNCHER_DIRS >/dev/null 2>&1; then
+		for dir in "${DC_LAUNCHER_DIRS[@]}"; do
+			printf '%s\n' "$dir"
+		done
+	elif declare -p LS_LAUNCHER_DIRS >/dev/null 2>&1; then
+		for dir in "${LS_LAUNCHER_DIRS[@]}"; do
+			printf '%s\n' "$dir"
+		done
+	else
+		printf '%s\n' /usr/bin /usr/games /usr/local/bin
+	fi
+}
+
+dc_launcher_backup_root() {
+	printf '%s\n' "${DC_LAUNCHER_BACKUP_ROOT:-${LS_BACKUP_ROOT:-$DC_HOME/.local/share/SLSsteam/system-launcher-backup}}"
+}
+
+dc_launcher_backup_path() {
+	local launcher="$1" relative
+	case "$launcher" in
+		/*) relative="${launcher#/}" ;;
+		*)  relative="$launcher" ;;
+	esac
+	printf '%s/%s.orig\n' "$(dc_launcher_backup_root)" "$relative"
+}
+
+# A persisted launcher policy is authoritative only while every currently
+# detected distro launcher is still a valid shim with a usable captured
+# original. This prevents a stale policy from hiding the system .desktop
+# fallback after a package update, manual edit, or partial uninstall. A legacy
+# flat backup is accepted only when the complete launcher set is one shim.
+dc_launcher_shim_references_backup() {
+	local launcher="$1" backup="$2"
+	[ -f "$launcher" ] || return 1
+	grep -Fqx -- "SLSM_ORIG=\"$backup\"" "$launcher" 2>/dev/null && return 0
+	grep -Fqx -- "exec \"$backup\" \"\$@\"" "$launcher" 2>/dev/null
+}
+
+dc_launcher_coverage_active() {
+	local dir launcher detected=0 shim_count=0 complete=1 backup legacy
+	legacy="$(dc_launcher_backup_root)/steam.orig"
+	while IFS= read -r dir; do
+		[ -n "$dir" ] || continue
+		launcher="${dir%/}/steam"
+		[ -f "$launcher" ] || continue
+		detected=$((detected + 1))
+		# A tagged but non-executable file is not a usable distro launcher. It
+		# must invalidate launcher policy so the desktop fallback is reopened.
+		[ -x "$launcher" ] || { complete=0; continue; }
+		if ! head -3 "$launcher" 2>/dev/null | grep -qF "$DC_LAUNCHER_TAG"; then
+			complete=0
+			continue
+		fi
+		shim_count=$((shim_count + 1))
+		backup="$(dc_launcher_backup_path "$launcher")"
+		if [ ! -f "$backup" ] || [ ! -x "$backup" ] || \
+		   head -3 "$backup" 2>/dev/null | grep -qF "$DC_LAUNCHER_TAG"; then
+			complete=0
+		elif ! dc_launcher_shim_references_backup "$launcher" "$backup"; then
+			# A valid mirror is not enough if the live shim would execute a
+			# different or missing original after the wrapper disappears.
+			complete=0
+		fi
+	done < <(dc_launcher_dirs)
+	if [ "$detected" -gt 0 ] && [ "$detected" -eq "$shim_count" ] && [ "$complete" -eq 1 ]; then
+		return 0
+	fi
+	# The old flat layout is valid only when the surviving shim explicitly
+	# points at this exact flat backup. A lone shim is not enough: a stale flat
+	# file must never become the original for an unrelated launcher.
+	if [ "$detected" -eq 1 ] && [ "$shim_count" -eq 1 ] && \
+	   [ -f "$legacy" ] && [ -x "$legacy" ] && \
+	   ! head -3 "$legacy" 2>/dev/null | grep -qF "$DC_LAUNCHER_TAG"; then
+		while IFS= read -r dir; do
+			[ -n "$dir" ] || continue
+			launcher="${dir%/}/steam"
+			[ -x "$launcher" ] || continue
+			if head -3 "$launcher" 2>/dev/null | grep -qF "$DC_LAUNCHER_TAG" \
+			   && dc_launcher_shim_references_backup "$launcher" "$legacy"; then
+				return 0
+			fi
+		done < <(dc_launcher_dirs)
+	fi
+	return 1
+}
 
 dc_backup_root() {
 	printf '%s\n' "${DC_BACKUP_ROOT:-$DC_HOME/.local/share/SLSsteam/backup}"
@@ -538,13 +641,36 @@ dc_patch_one() {
 dc_patch_shortcut() {
 	local sc="$1" bak
 	[ -e "$sc" ] || return 0          # never create a shortcut the user lacked
+	if [ "${DC_STEAM_INSTALLED:-0}" != 1 ]; then
+		# Preserve both regular and symlinked Install Steam stubs before any
+		# legacy-link migration can remove or replace the user shortcut.
+		if [ "$(dc_classify "$sc")" = stub ] || dc_is_prebootstrap_seed "$sc"; then
+			return 0
+		fi
+	fi
 	if [ -L "$sc" ]; then              # migrate a legacy symlink we may have made
 		bak="$(dc_backup_path "$sc")"
-		[ -f "$bak" ] && { rm -f "$sc"; cp -- "$bak" "$sc" 2>/dev/null; } || rm -f "$sc"
+		if [ -f "$bak" ]; then
+			rm -f "$sc"
+			cp -- "$bak" "$sc" 2>/dev/null || true
+		elif [ "$(dc_classify "$sc")" = stub ] || dc_is_prebootstrap_seed "$sc"; then
+			# Keep an unbacked installer/pre-bootstrap link long enough for
+			# dc_patch_one to capture its target and atomically replace the link
+			# after bootstrap.
+			:
+		else
+			rm -f "$sc"
+		fi
 		[ -e "$sc" ] || return 0
 	fi
 	case "$(dc_classify "$sc")" in
-		launcher|patched|stub)
+		launcher|patched)
+			dc_patch_one "$sc"
+			chmod 0755 "$sc" 2>/dev/null || true
+			command -v gio >/dev/null 2>&1 && gio set "$sc" metadata::trusted true >/dev/null 2>&1 || true
+			;;
+		stub)
+			[ "${DC_STEAM_INSTALLED:-0}" = 1 ] || return 0
 			dc_patch_one "$sc"
 			chmod 0755 "$sc" 2>/dev/null || true
 			command -v gio >/dev/null 2>&1 && gio set "$sc" metadata::trusted true >/dev/null 2>&1 || true
@@ -594,6 +720,9 @@ dc_patch_glob() {
 		# migration. Make it readable first (we set 0644 anyway). With $S=sudo this
 		# fixes a system entry; without sudo it only succeeds on our own files.
 		[ -r "$f" ] || $S chmod 0644 "$f" 2>/dev/null || failed=1
+		if [ "${DC_STEAM_INSTALLED:-0}" != 1 ] && dc_is_prebootstrap_seed "$f"; then
+			continue
+		fi
 		case "$(dc_classify "$f")" in
 			launcher) dc_patch_one "$f" "$S" || failed=1 ;;
 			# Already tagged: re-run anyway so a legacy install is MIGRATED —
@@ -769,6 +898,10 @@ dc_seed_application_shadows() {
 			seen="${seen}${seen:+
 }$id"
 			target="$user_dir/$id"
+			if [ "${DC_STEAM_INSTALLED:-0}" != 1 ] && \
+			   dc_is_prebootstrap_seed "$target"; then
+				continue
+			fi
 			if [ -e "$target" ] || [ -L "$target" ]; then
 				[ -r "$target" ] || chmod 0644 "$target" 2>/dev/null || true
 				dc_patch_one "$target" 2>/dev/null || true
@@ -890,6 +1023,9 @@ dc_guardian_repair_dir() {
 		[ -f "$f" ] || [ -L "$f" ] || continue
 		name="$(dc_desktop_id "$f" | tr '[:upper:]' '[:lower:]')"
 		case "$name" in *.desktop) : ;; *) continue ;; esac
+		if [ "${DC_STEAM_INSTALLED:-0}" != 1 ] && dc_is_prebootstrap_seed "$f"; then
+			continue
+		fi
 		class="$(dc_classify "$f")"
 		candidate=0
 		case "$class" in
@@ -992,6 +1128,9 @@ dc_guardian_patch_shortcut() {
 	local shortcut class before after result
 	shortcut="$(dc_desktop_dir)/steam.desktop"
 	[ -e "$shortcut" ] || [ -L "$shortcut" ] || return 0
+	if [ "${DC_STEAM_INSTALLED:-0}" != 1 ] && dc_is_prebootstrap_seed "$shortcut"; then
+		return 0
+	fi
 	class="$(dc_classify "$shortcut")"
 	case "$class" in
 		launcher|patched) : ;;
@@ -1040,6 +1179,78 @@ dc_state_home() {
 		/*) printf '%s\n' "$XDG_STATE_HOME" ;;
 		*) printf '%s\n' "$DC_HOME/.local/state" ;;
 	esac
+}
+
+# Coverage policy is deliberately tiny and fail-safe: only the two known values
+# are persisted, and every missing/invalid value falls back to the historical
+# desktop path. DC_POLICY_FILE is a fixture/diagnostic override; production
+# state lives beside the other slsteam-moon state under XDG_STATE_HOME.
+dc_policy_path() {
+	if [ -n "${DC_POLICY_FILE:-}" ]; then
+		printf '%s\n' "$DC_POLICY_FILE"
+	else
+		printf '%s/slsteam-moon/coverage.policy\n' "$(dc_state_home)"
+	fi
+}
+
+dc_policy_status_path() {
+	if [ -n "${DC_POLICY_STATUS_FILE:-}" ]; then
+		printf '%s\n' "$DC_POLICY_STATUS_FILE"
+	else
+		printf '%s/.local/share/SLSsteam/coverage-policy.effective\n' "$DC_HOME"
+	fi
+}
+
+dc_read_policy() {
+	local path status_path
+	case "${SLSM_COVERAGE_POLICY:-}" in
+		launcher|desktop)
+			printf '%s\n' "$SLSM_COVERAGE_POLICY"
+			return 0
+			;;
+		"")
+			;;
+		*)
+			printf '%s\n' desktop
+			return 0
+			;;
+	esac
+	status_path="$(dc_policy_status_path)"
+	if [ -e "$status_path" ] || [ -L "$status_path" ]; then
+		printf '%s\n' desktop
+		return 0
+	fi
+	path="$(dc_policy_path)"
+	if cmp -s "$path" <(printf 'launcher\n'); then
+		printf '%s\n' launcher
+	elif cmp -s "$path" <(printf 'desktop\n'); then
+		printf '%s\n' desktop
+	else
+		printf '%s\n' desktop
+	fi
+}
+
+dc_write_policy() {
+	local value="${1:-}" path
+	[ "$#" -eq 1 ] || return 2
+	case "$value" in
+		launcher|desktop) : ;;
+		*) return 2 ;;
+	esac
+	path="$(dc_policy_path)"
+	mkdir -p "$(dirname "$path")" 2>/dev/null || return 1
+	printf '%s\n' "$value" > "$path" 2>/dev/null || return 1
+	chmod 0600 "$path" 2>/dev/null || true
+}
+
+dc_forget_policy() {
+	local path
+	path="$(dc_policy_path)"
+	if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+		return 0
+	fi
+	rm -f -- "$path" 2>/dev/null || return 1
+	[ ! -e "$path" ] && [ ! -L "$path" ]
 }
 
 # ── unchanged-input fast path ───────────────────────────────────────────────
@@ -1094,9 +1305,9 @@ dc_coverage_fingerprint() {
 		shopt -s nullglob nocaseglob 2>/dev/null || true
 		local dir
 		local -a dirs=() files=() named=()
-		printf 'v%s mode=%s wrapper=%s tag=%s seed=%s installed=%s\n' \
+		printf 'v%s mode=%s wrapper=%s tag=%s seed=%s prebootstrap=%s installed=%s\n' \
 			"$DC_FINGERPRINT_VERSION" "$mode" "$WRAPPER" "$DC_TAG" "$DC_SEED_TAG" \
-			"${DC_STEAM_INSTALLED:-0}"
+			"$DC_PREBOOTSTRAP_TAG" "${DC_STEAM_INSTALLED:-0}"
 		while IFS= read -r dir; do
 			[ -n "$dir" ] && dirs+=("$dir")
 		done < <(dc_application_dirs)
@@ -1262,6 +1473,22 @@ dc_run() {
 		--system) scope=system ;;
 		*) scope=user ;;
 	esac
+	# A successful mutable launcher shim owns the system launch path. Keep the
+	# mandatory user reconciliation independent, but never mutate system desktop
+	# entries while that primary launcher policy is active. An explicit environment
+	# override remains available to tests/diagnostics; persisted state is trusted
+	# only after checking the live shim and its captured original.
+	if [ "$mode" = "--system" ]; then
+		case "${SLSM_COVERAGE_POLICY:-}" in
+			launcher) return 0 ;;
+			desktop) : ;;
+			*)
+				if [ "$(dc_read_policy)" = launcher ] && dc_launcher_coverage_active; then
+					return 0
+				fi
+				;;
+		esac
+	fi
 	# Same unchanged-input fast path as the guardian (see dc_coverage_unchanged):
 	# this is the per-launch legacy path on desktops without a working user
 	# manager, so it also runs while Steam is starting.

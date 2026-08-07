@@ -95,6 +95,7 @@ cp -r tools/steamstub-bypass "$PKG_DIR/tools/"
 # Desktop-coverage helpers: reconciliation engine, user-unit/drop-in manager and
 # thin CLI. setup.sh installs all three under $SLSDIR.
 cp tools/desktop-coverage.lib.sh       "$PKG_DIR/tools/desktop-coverage.lib.sh"
+cp tools/launcher-shim.lib.sh          "$PKG_DIR/tools/launcher-shim.lib.sh"
 cp tools/desktop-guardian-units.lib.sh "$PKG_DIR/tools/desktop-guardian-units.lib.sh"
 cp ensure-desktop-coverage.sh          "$PKG_DIR/ensure-desktop-coverage.sh"
 

@@ -20,5 +20,10 @@ ck "package.sh ships the guardian unit lib" \
 ck "setup.sh installs the guardian unit lib into SLSDIR" \
    "$(grep -q 'desktop-guardian-units.lib.sh' "$HERE/setup.sh" && echo yes || echo no)"
 
+ck "package.sh ships the launcher shim lib" \
+   "$(grep -q 'launcher-shim.lib.sh' "$HERE/scripts/package.sh" && echo yes || echo no)"
+ck "setup installs the launcher shim lib into SLSDIR" \
+   "$(grep -q 'launcher-shim.lib.sh' "$HERE/setup.sh" && echo yes || echo no)"
+
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES"
 exit "$fail"

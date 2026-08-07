@@ -51,6 +51,113 @@ ck "setup verifies the guardian actually activated (is-enabled) and warns" \
    "$(awk '/setup_path_and_desktop\(\)/{f=1} f && /is-enabled slsteam-desktop-guardian.path/{a=1} f && /Cold-boot/{w=1} /^}/{if(f)exit} END{print (a&&w)?"yes":"no"}' "$HERE/setup.sh")"
 ck "sudo-denied warning explains per-user coverage still applies" \
    "$(grep -q 'system-wide Steam entry stays unpatched' "$HERE/setup.sh" && grep -q 'per-user entry' "$HERE/setup.sh" && echo yes || echo no)"
+ck "successful sudo fallback propagates its privilege prefix" \
+   "$(grep -q 'DC_SUDO="sudo"' "$HERE/setup.sh" && echo yes || echo no)"
+
+ck "setup exposes an overrideable os-release path" \
+   "$(grep -qE '^OS_RELEASE_FILE=.*(/etc/os-release)' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup supports an explicit immutable override" \
+   "$(grep -q 'SLSM_IMMUTABLE' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup sources the shared launcher shim library" \
+   "$(grep -q 'launcher-shim.lib.sh' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup delegates launcher installation to the shared library" \
+   "$(grep -q 'ls_install_shims' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup delegates launcher restoration to the shared library" \
+   "$(grep -q 'ls_restore_shims' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup retains full tree when launcher original is unrecoverable" \
+   "$(grep -q 'SLSM_KEEP_LAUNCHER_TREE' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup checks bootstrap before marking Steam installed" \
+   "$(grep -q 'ls_steam_bootstrapped' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup has a source-only test guard" \
+   "$(grep -q 'SLS_SETUP_LIB_ONLY' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup persists the effective coverage policy" \
+   "$(grep -q 'dc_write_policy' "$HERE/setup.sh" && echo yes || echo no)"
+ck "mandatory user reconciliation precedes launcher shim attempt" \
+   "$(awk '/dc_guardian_run/{g=NR} /setup_system_launcher/{s=NR} END{print (g && s && g<s)?"yes":"no"}' "$HERE/setup.sh")"
+ck "launcher shim attempt precedes policy persistence" \
+   "$(awk '/setup_system_launcher/{s=NR} /dc_write_policy/{p=NR} END{print (s && p && s<p)?"yes":"no"}' "$HERE/setup.sh")"
+ck "policy persistence precedes optional system desktop fallback" \
+   "$(awk '/dc_write_policy/{p=NR} /dc_run --system/{s=NR} END{print (p && s && p<s)?"yes":"no"}' "$HERE/setup.sh")"
+ck "setup uses a vanilla launcher before Steam bootstrap" \
+   "$(grep -q 'steam_bootstrapped.*= 1' "$HERE/setup.sh" && grep -q 'minimal_exec="\$steam_bin"' "$HERE/setup.sh" && echo yes || echo no)"
+ck "setup wrapper has a pre-bootstrap guard" \
+   "$(grep -q 'slsm_bootstrap_guard' "$HERE/setup.sh" && echo yes || echo no)"
+ck "failed policy write forces the same-run desktop fallback" \
+   "$(grep -q 'SLSM_COVERAGE_POLICY=desktop' "$HERE/setup.sh" && echo yes || echo no)"
+ck "failed policy write clears stale persisted state" \
+   "$(awk '/^setup_path_and_desktop\(\)/{inside=1} inside && /dc_forget_policy/{found=1} inside && /^}/{exit} END{print found?"yes":"no"}' "$HERE/setup.sh")"
+ck "failed policy write records desktop fallback state" \
+   "$(grep -q 'coverage-policy.effective' "$HERE/setup.sh" && echo yes || echo no)"
+ck "launcher denial skips optional system sudo fallback" \
+   "$(awk '/^setup_path_and_desktop\(\)/{inside=1} inside && /SLSM_SUDO_DENIED/{found=1} inside && /^}/{exit} END{print found?"yes":"no"}' "$HERE/setup.sh")"
+ck "setup discovers launchers before shim sudo preflight" \
+   "$(awk '/setup_system_launcher\(\)/{inside=1} inside && /ls_detect_launchers/{l=NR} inside && /sudo -v/{s=NR; exit} END{print (l && s && l<s)?"yes":"no"}' "$HERE/setup.sh")"
+ck "setup no longer contains the inline launcher writer" \
+   "$(! grep -q 'tmp_shim' "$HERE/setup.sh" && echo yes || echo no)"
+ck "runtime coverage derives installed state from bootstrap" \
+   "$(grep -q 'ls_steam_bootstrapped' "$HERE/ensure-desktop-coverage.sh" && echo yes || echo no)"
+ck "wrapper bootstrap guard requires the canonical Steam symlink" \
+   "$(grep -q '\\[ -L \"\\$HOME/.steam/steam\" \\]' "$HERE/setup.sh" && echo yes || echo no)"
+
+# Behavioral regression: an immutable host should normally have no system shim,
+# but an interrupted historical uninstall may leave one behind. In that case
+# setup.sh must report failure and retain both the backup flag and full helper
+# tree instead of returning success before the cleanup guard can act.
+SETUP_TMP="$(mktemp -d)"
+trap 'rm -rf "$SETUP_TMP"' EXIT
+SETUP_HOME="$SETUP_TMP/home"
+SETUP_BIN="$SETUP_TMP/bin"
+SETUP_OS_RELEASE="$SETUP_TMP/os-release"
+mkdir -p "$SETUP_HOME/.local/share/SLSsteam" "$SETUP_BIN"
+printf 'ID=steamos\n' > "$SETUP_OS_RELEASE"
+printf '#!/bin/sh\n# slsteam-moon system launcher shim\nexec /broken/immutable-setup\n' > "$SETUP_BIN/steam"
+chmod 0755 "$SETUP_BIN/steam"
+SETUP_IMMUTABLE_STATE="$(
+  HOME="$SETUP_HOME" \
+  OS_RELEASE_FILE="$SETUP_OS_RELEASE" \
+  SLS_SETUP_LIB_ONLY=1 \
+  bash -c '
+    source "$1/setup.sh"
+    LS_LAUNCHER_DIRS=("$2")
+    SLSM_KEEP_LAUNCHER_BACKUP=0
+    SLSM_KEEP_LAUNCHER_TREE=0
+    if restore_system_launchers; then result=yes; else result=no; fi
+    printf "%s:%s:%s" "$result" "$SLSM_KEEP_LAUNCHER_BACKUP" "$SLSM_KEEP_LAUNCHER_TREE"
+  ' bash "$HERE" "$SETUP_BIN"
+)"
+ck "setup immutable shim reports incomplete restore" yes \
+   "$([ "$SETUP_IMMUTABLE_STATE" = "no:1:1" ] && echo yes || echo no)"
+
+# A usable mirrored file that is not referenced by the live shim is not a safe
+# restore fallback; retain the complete helper tree for a later retry instead.
+MISMATCH_TMP="$(mktemp -d)"
+MISMATCH_HOME="$MISMATCH_TMP/home"
+MISMATCH_BIN="$MISMATCH_TMP/usr/bin"
+MISMATCH_OS_RELEASE="$MISMATCH_TMP/os-release"
+MISMATCH_BACKUP_ROOT="$MISMATCH_HOME/.local/share/SLSsteam/system-launcher-backup"
+MISMATCH_BACKUP="$MISMATCH_BACKUP_ROOT/${MISMATCH_BIN#/}/steam.orig"
+mkdir -p "$MISMATCH_BIN" "$(dirname "$MISMATCH_BACKUP")" "$MISMATCH_HOME/.local/share/SLSsteam"
+printf 'ID=ubuntu\n' > "$MISMATCH_OS_RELEASE"
+printf '#!/bin/sh\n# slsteam-moon system launcher shim\nSLSM_ORIG="%s"\nexec /broken/mismatch\n' \
+  "$MISMATCH_BACKUP_ROOT/wrong.orig" > "$MISMATCH_BIN/steam"
+printf '#!/bin/sh\nprintf "MISMATCH-BACKUP\\n"\n' > "$MISMATCH_BACKUP"
+chmod 0755 "$MISMATCH_BIN/steam" "$MISMATCH_BACKUP"
+MISMATCH_STATE="$(
+  HOME="$MISMATCH_HOME" \
+  OS_RELEASE_FILE="$MISMATCH_OS_RELEASE" \
+  SLS_SETUP_LIB_ONLY=1 \
+  bash -c '
+    source "$1/setup.sh"
+    log_warn() { :; }
+    LS_LAUNCHER_DIRS=("$2")
+    SLSM_KEEP_LAUNCHER_BACKUP=0
+    SLSM_KEEP_LAUNCHER_TREE=0
+    if restore_system_launchers; then result=yes; else result=no; fi
+    printf "%s:%s:%s" "$result" "$SLSM_KEEP_LAUNCHER_BACKUP" "$SLSM_KEEP_LAUNCHER_TREE"
+  ' bash "$HERE" "$MISMATCH_BIN"
+)"
+ck "setup rejects an unassociated mirrored restore fallback" \
+   "$([ "$MISMATCH_STATE" = "no:1:1" ] && echo yes || echo no)"
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES"
 exit "$fail"

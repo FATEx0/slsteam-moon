@@ -4,12 +4,35 @@
 # Legacy --user calls remain best-effort; guardian failures are explicit.
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 : "${WRAPPER:=$HOME/.local/share/SLSsteam/path/steam}"
-# steam installed? (so the stub is eligible). Overridable for tests.
-if [ -z "${DC_STEAM_INSTALLED:-}" ]; then
-	DC_STEAM_INSTALLED=0
-	for c in /usr/games/steam /usr/bin/steam /usr/local/bin/steam; do
-		[ -x "$c" ] && { DC_STEAM_INSTALLED=1; break; }
-	done
+# Prefer the shared launcher eligibility check when this helper was installed
+# with it. Tests/diagnostics may inject DC_STEAM_ROOT or LS_STEAM_ROOT; without
+# an override, production still requires Valve's canonical Steam symlink.
+if [ -n "${DC_STEAM_ROOT:-}" ] && [ -z "${LS_STEAM_ROOT:-}" ]; then
+	LS_STEAM_ROOT="$DC_STEAM_ROOT"
+fi
+# shellcheck source=/dev/null
+if [ -f "$SELF_DIR/launcher-shim.lib.sh" ]; then
+	. "$SELF_DIR/launcher-shim.lib.sh"
+elif [ -f "$SELF_DIR/tools/launcher-shim.lib.sh" ]; then
+	. "$SELF_DIR/tools/launcher-shim.lib.sh"
+fi
+DC_STEAM_INSTALLED=0
+if command -v ls_steam_bootstrapped >/dev/null 2>&1; then
+	if ls_steam_bootstrapped; then
+		DC_STEAM_INSTALLED=1
+	fi
+else
+	# Compatibility path for older installations that shipped only the
+	# desktop helper. Never infer installation from an executable package
+	# launcher: the Install Steam stub is executable before bootstrap.
+	_dc_steam_root="${LS_STEAM_ROOT:-${DC_STEAM_ROOT:-}}"
+	if [ -z "$_dc_steam_root" ] && [ -L "$HOME/.steam/steam" ]; then
+		_dc_steam_root="$(readlink -e -q "$HOME/.steam/steam" 2>/dev/null || true)"
+	fi
+	if [ -n "$_dc_steam_root" ] && [ -f "$_dc_steam_root/steam.sh" ] && \
+	   [ -x "$_dc_steam_root/steam.sh" ]; then
+		DC_STEAM_INSTALLED=1
+	fi
 fi
 export DC_STEAM_INSTALLED WRAPPER
 # shellcheck source=/dev/null

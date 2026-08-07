@@ -6,6 +6,7 @@ DC_TAG="X-SLSteamMoon-Patched=true"
 WRAPPER="/tmp/slsfake/path/steam"
 # Keep legacy fixtures hermetic even when the host exports custom XDG roots.
 unset XDG_DATA_HOME XDG_DATA_DIRS XDG_CONFIG_HOME XDG_CONFIG_DIRS XDG_DESKTOP_DIR
+unset SLSM_COVERAGE_POLICY DC_POLICY_FILE
 # shellcheck source=/dev/null
 . "$HERE/tools/desktop-coverage.lib.sh"
 
@@ -206,6 +207,34 @@ dc_patch_shortcut "$TMP/desk/steam.desktop"
 check "existing shortcut patched" "patched" "$(dc_classify "$TMP/desk/steam.desktop")"
 check "shortcut is a regular file (not symlink)" "yes" "$([ -f "$TMP/desk/steam.desktop" ] && [ ! -L "$TMP/desk/steam.desktop" ] && echo yes || echo no)"
 check "shortcut exec bit set" "yes" "$([ -x "$TMP/desk/steam.desktop" ] && echo yes || echo no)"
+
+# An existing desktop shortcut that is still the Debian Install Steam stub must
+# remain vanilla until the Steam data root has bootstrapped.
+PREBOOT_SHORTCUT="$TMP/desk/prebootstrap.desktop"
+printf '[Desktop Entry]\nName=Install Steam\nExec=/usr/games/steam %%U\n' > "$PREBOOT_SHORTCUT"
+preboot_before="$(sha256sum "$PREBOOT_SHORTCUT" | awk '{print $1}')"
+DC_STEAM_INSTALLED=0 dc_patch_shortcut "$PREBOOT_SHORTCUT"
+check "pre-bootstrap shortcut leaves installer stub vanilla" "stub" "$(dc_classify "$PREBOOT_SHORTCUT")"
+check "pre-bootstrap shortcut is byte-identical" "$preboot_before" \
+  "$(sha256sum "$PREBOOT_SHORTCUT" | awk '{print $1}')"
+PREBOOT_SYMLINK_TARGET="$TMP/installer-target.desktop"
+printf '[Desktop Entry]\nName=Install Steam\nExec=/usr/games/steam %%U\n' > "$PREBOOT_SYMLINK_TARGET"
+PREBOOT_SYMLINK="$TMP/desk/prebootstrap-link.desktop"
+ln -s "$PREBOOT_SYMLINK_TARGET" "$PREBOOT_SYMLINK"
+DC_STEAM_INSTALLED=0 dc_patch_shortcut "$PREBOOT_SYMLINK"
+check "pre-bootstrap installer symlink is preserved" "yes" \
+  "$([ -L "$PREBOOT_SYMLINK" ] && echo yes || echo no)"
+check "pre-bootstrap installer symlink still targets stub" "$PREBOOT_SYMLINK_TARGET" \
+  "$(readlink "$PREBOOT_SYMLINK" 2>/dev/null || true)"
+PREBOOT_BACKUP_ROOT="$TMP/prebootstrap-backup"
+DC_HOME="$TMP/prebootstrap-home" DC_BACKUP_ROOT="$PREBOOT_BACKUP_ROOT" \
+  DC_STEAM_INSTALLED=1 dc_patch_shortcut "$PREBOOT_SYMLINK"
+check "post-bootstrap installer symlink becomes regular file" "yes" \
+  "$([ -f "$PREBOOT_SYMLINK" ] && [ ! -L "$PREBOOT_SYMLINK" ] && echo yes || echo no)"
+check "post-bootstrap installer shortcut is patched" "patched" \
+  "$(dc_classify "$PREBOOT_SYMLINK")"
+check "post-bootstrap conversion captures the original" "yes" \
+  "$([ -f "$PREBOOT_BACKUP_ROOT/${PREBOOT_SYMLINK#/}" ] && echo yes || echo no)"
 
 # dc_run --user patches menu + autostart but NOT the stub; --system also stub
 H="$TMP/home"; mkdir -p "$H/.local/share/applications" "$H/.config/autostart"
@@ -1036,6 +1065,207 @@ check "a failed guardian pass is not cached" "no" \
 check "CLI accepts --user --force" "0" "$(cli_status "$H22" --user --force)"
 check "CLI accepts --guardian --force" "2" "$(cli_status "$H22" --guardian --force)"
 check "CLI rejects a bogus second argument" "2" "$(cli_status "$H22" --user --nope)"
+
+# Launch coverage policy: user scope remains independent, while system scope is
+# skipped only when a persisted launcher policy still has a real shim + backup.
+POLICY_FILE="$TMP/coverage.policy"
+POLICY_HOME="$TMP/policy-home"
+POLICY_BACKUP="$TMP/policy-backup"
+check "missing policy defaults to desktop" "desktop" "$(DC_POLICY_FILE="$POLICY_FILE" dc_read_policy)"
+check "invalid policy is rejected" "2" "$(DC_POLICY_FILE="$POLICY_FILE" dc_write_policy invalid >/dev/null 2>&1; echo $?)"
+DC_POLICY_FILE="$POLICY_FILE" dc_write_policy launcher
+check "launcher policy round-trips" "launcher" "$(DC_POLICY_FILE="$POLICY_FILE" dc_read_policy)"
+STATUS_POLICY_FILE="$TMP/coverage-policy.effective"
+printf 'desktop\n' > "$STATUS_POLICY_FILE"
+check "desktop fallback marker overrides stale runtime policy" "desktop" \
+  "$(DC_POLICY_FILE="$POLICY_FILE" DC_POLICY_STATUS_FILE="$STATUS_POLICY_FILE" dc_read_policy)"
+rm -f "$STATUS_POLICY_FILE"
+check "environment policy overrides file" "desktop" \
+  "$(DC_POLICY_FILE="$POLICY_FILE" SLSM_COVERAGE_POLICY=desktop dc_read_policy)"
+check "invalid environment policy fails closed" "desktop" \
+  "$(DC_POLICY_FILE="$POLICY_FILE" SLSM_COVERAGE_POLICY=invalid dc_read_policy)"
+printf 'launcher\n\n' > "$POLICY_FILE"
+check "multi-line policy defaults to desktop" "desktop" \
+  "$(DC_POLICY_FILE="$POLICY_FILE" dc_read_policy)"
+DC_POLICY_FILE="$POLICY_FILE" dc_write_policy launcher
+mkdir -p "$TMP/policy-system"
+printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam %%U\n' > "$TMP/policy-system/steam.desktop"
+# No current distro shim exists: a persisted launcher policy is stale and must
+# not suppress the system desktop fallback.
+DC_LAUNCHER_DIRS=("$TMP/no-current-shim")
+DC_HOME="$POLICY_HOME" DC_BACKUP_ROOT="$POLICY_BACKUP" DC_POLICY_FILE="$POLICY_FILE" \
+  DC_SYS_APPS="$TMP/policy-system" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_FORCE=1 \
+  dc_run --system >/dev/null 2>&1
+check "stale launcher policy enables system desktop fallback" "patched" \
+  "$(dc_classify "$TMP/policy-system/steam.desktop")"
+
+# The explicit environment override remains a supported test/diagnostic escape
+# hatch and may suppress the system pass even without a real shim.
+mkdir -p "$TMP/policy-explicit-system"
+printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam %%U\n' > "$TMP/policy-explicit-system/steam.desktop"
+explicit_before="$(sha256sum "$TMP/policy-explicit-system/steam.desktop" | awk '{print $1}')"
+SLSM_COVERAGE_POLICY=launcher DC_HOME="$POLICY_HOME" DC_BACKUP_ROOT="$POLICY_BACKUP" \
+  DC_POLICY_FILE="$POLICY_FILE" DC_SYS_APPS="$TMP/policy-explicit-system" \
+  DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_FORCE=1 dc_run --system >/dev/null 2>&1
+unset SLSM_COVERAGE_POLICY
+check "explicit launcher policy override still skips fallback" "$explicit_before" \
+  "$(sha256sum "$TMP/policy-explicit-system/steam.desktop" | awk '{print $1}')"
+
+mkdir -p "$TMP/policy-desktop"
+printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam %%U\n' > "$TMP/policy-desktop/steam.desktop"
+DC_POLICY_FILE="$POLICY_FILE" dc_write_policy desktop
+DC_HOME="$POLICY_HOME" DC_BACKUP_ROOT="$POLICY_BACKUP" DC_POLICY_FILE="$POLICY_FILE" \
+  DC_SYS_APPS="$TMP/policy-desktop" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_FORCE=1 \
+  dc_run --system >/dev/null 2>&1
+check "desktop policy enables system desktop fallback" "patched" \
+  "$(dc_classify "$TMP/policy-desktop/steam.desktop")"
+DC_POLICY_FILE="$POLICY_FILE" dc_forget_policy
+check "forget removes coverage policy" "no" "$([ -f "$POLICY_FILE" ] && echo yes || echo no)"
+
+# A legacy flat backup containing another managed shim is not a usable original,
+# even when it is the only candidate path.
+TAGGED_POLICY_ROOT="$TMP/policy-tagged"
+mkdir -p "$TAGGED_POLICY_ROOT/launcher" "$TAGGED_POLICY_ROOT/backup"
+printf '#!/bin/sh\n# slsteam-moon system launcher shim\nexec /broken/policy\n' \
+  > "$TAGGED_POLICY_ROOT/launcher/steam"
+printf '#!/bin/sh\n# slsteam-moon system launcher shim\nexec /broken/tagged-original\n' \
+  > "$TAGGED_POLICY_ROOT/backup/steam.orig"
+chmod 0755 "$TAGGED_POLICY_ROOT/launcher/steam" "$TAGGED_POLICY_ROOT/backup/steam.orig"
+DC_LAUNCHER_DIRS=("$TAGGED_POLICY_ROOT/launcher")
+DC_LAUNCHER_BACKUP_ROOT="$TAGGED_POLICY_ROOT/backup"
+check "tagged flat backup invalidates launcher policy" "no" \
+  "$(dc_launcher_coverage_active && echo yes || echo no)"
+
+# A non-executable tagged launcher is not an active system-launcher shim even
+# when its captured original is valid; desktop fallback must remain enabled.
+NONEXEC_POLICY_ROOT="$TMP/policy-nonexec"
+mkdir -p "$NONEXEC_POLICY_ROOT/launcher" "$NONEXEC_POLICY_ROOT/backup"
+printf '#!/bin/sh\n# slsteam-moon system launcher shim\nexec /broken/nonexec\n' \
+  > "$NONEXEC_POLICY_ROOT/launcher/steam"
+printf '#!/bin/sh\nprintf "NONEXEC-ORIGINAL\\n"\n' \
+  > "$NONEXEC_POLICY_ROOT/backup/steam.orig"
+chmod 0644 "$NONEXEC_POLICY_ROOT/launcher/steam"
+chmod 0755 "$NONEXEC_POLICY_ROOT/backup/steam.orig"
+DC_LAUNCHER_DIRS=("$NONEXEC_POLICY_ROOT/launcher")
+DC_LAUNCHER_BACKUP_ROOT="$NONEXEC_POLICY_ROOT/backup"
+check "non-executable live shim invalidates launcher policy" "no" \
+  "$(dc_launcher_coverage_active && echo yes || echo no)"
+
+# A flat backup is not safe merely because one shim remains: the live shim must
+# actually reference that flat path rather than a missing mirrored original.
+MISMATCH_POLICY_ROOT="$TMP/policy-mismatch"
+mkdir -p "$MISMATCH_POLICY_ROOT/launcher" "$MISMATCH_POLICY_ROOT/backup"
+printf '#!/bin/sh\n# slsteam-moon system launcher shim\n# managed\nSLSM_ORIG="%s/missing/steam.orig"\n' \
+  "$MISMATCH_POLICY_ROOT" > "$MISMATCH_POLICY_ROOT/launcher/steam"
+printf '#!/bin/sh\nprintf "UNRELATED-FLAT\\n"\n' \
+  > "$MISMATCH_POLICY_ROOT/backup/steam.orig"
+chmod 0755 "$MISMATCH_POLICY_ROOT/launcher/steam" "$MISMATCH_POLICY_ROOT/backup/steam.orig"
+DC_LAUNCHER_DIRS=("$MISMATCH_POLICY_ROOT/launcher")
+DC_LAUNCHER_BACKUP_ROOT="$MISMATCH_POLICY_ROOT/backup"
+check "unreferenced flat backup invalidates launcher policy" "no" \
+  "$(dc_launcher_coverage_active && echo yes || echo no)"
+
+# A mirrored backup is also invalid when the live shim references a different
+# original; policy must not suppress the system desktop fallback in that state.
+MIRROR_MISMATCH_ROOT="$TMP/policy-mirror-mismatch"
+mkdir -p "$MIRROR_MISMATCH_ROOT/launcher" "$MIRROR_MISMATCH_ROOT/backup"
+printf '#!/bin/sh\n# slsteam-moon system launcher shim\nSLSM_ORIG="%s/missing/steam.orig"\n' \
+  "$MIRROR_MISMATCH_ROOT" > "$MIRROR_MISMATCH_ROOT/launcher/steam"
+# Place the absolute mirror where dc_launcher_backup_path expects it.
+mkdir -p "$MIRROR_MISMATCH_ROOT/backup/${MIRROR_MISMATCH_ROOT#/}/launcher"
+printf '#!/bin/sh\nprintf "MIRROR-ORIGINAL\\n"\n' \
+  > "$MIRROR_MISMATCH_ROOT/backup/${MIRROR_MISMATCH_ROOT#/}/launcher/steam.orig"
+chmod 0755 "$MIRROR_MISMATCH_ROOT/launcher/steam" \
+  "$MIRROR_MISMATCH_ROOT/backup/${MIRROR_MISMATCH_ROOT#/}/launcher/steam.orig"
+DC_LAUNCHER_DIRS=("$MIRROR_MISMATCH_ROOT/launcher")
+DC_LAUNCHER_BACKUP_ROOT="$MIRROR_MISMATCH_ROOT/backup"
+check "unreferenced mirrored backup invalidates launcher policy" "no" \
+  "$(dc_launcher_coverage_active && echo yes || echo no)"
+
+# A persisted launcher policy is active only when every currently detected
+# distro launcher remains shimmed with its own mirrored backup. A package
+# replacement of one path must reopen the system desktop fallback.
+POLICY_LAUNCHERS="$TMP/policy-launchers"
+POLICY_LAUNCHER_BACKUP="$TMP/policy-launcher-backup"
+mkdir -p "$POLICY_LAUNCHERS/usr/bin" "$POLICY_LAUNCHERS/usr/games" \
+  "$POLICY_LAUNCHER_BACKUP/${POLICY_LAUNCHERS#/}/usr/bin" "$TMP/policy-partial-system"
+printf '#!/bin/sh\n# slsteam-moon system launcher shim\nexec /wrapper\n' \
+  > "$POLICY_LAUNCHERS/usr/bin/steam"
+printf '#!/bin/sh\nprintf "VANILLA-REPLACEMENT\\n"\n' \
+  > "$POLICY_LAUNCHERS/usr/games/steam"
+printf '#!/bin/sh\nprintf "POLICY-ORIGINAL\\n"\n' \
+  > "$POLICY_LAUNCHER_BACKUP/${POLICY_LAUNCHERS#/}/usr/bin/steam.orig"
+printf '[Desktop Entry]\nName=Steam\nExec=/usr/bin/steam %%U\n' \
+  > "$TMP/policy-partial-system/steam.desktop"
+chmod 0755 "$POLICY_LAUNCHERS/usr/bin/steam" "$POLICY_LAUNCHERS/usr/games/steam" \
+  "$POLICY_LAUNCHER_BACKUP/${POLICY_LAUNCHERS#/}/usr/bin/steam.orig"
+DC_LAUNCHER_DIRS=("$POLICY_LAUNCHERS/usr/bin" "$POLICY_LAUNCHERS/usr/games")
+DC_LAUNCHER_BACKUP_ROOT="$POLICY_LAUNCHER_BACKUP"
+DC_POLICY_FILE="$POLICY_FILE" dc_write_policy launcher
+DC_HOME="$POLICY_HOME" DC_BACKUP_ROOT="$POLICY_BACKUP" \
+  DC_POLICY_FILE="$POLICY_FILE" DC_SYS_APPS="$TMP/policy-partial-system" \
+  DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_FORCE=1 dc_run --system \
+  >/dev/null 2>&1
+check "partial live shim invalidates launcher policy" "patched" \
+  "$(dc_classify "$TMP/policy-partial-system/steam.desktop")"
+
+# The installed CLI must use the canonical bootstrap state rather than treating
+# an executable Install Steam package stub as a completed Steam installation.
+CLI_HOME="$TMP/cli-prebootstrap-home"
+CLI_ROOT="$TMP/cli-prebootstrap-root"
+CLI_WRAPPER="$CLI_HOME/.local/share/SLSsteam/path/steam"
+mkdir -p "$CLI_HOME/.local/share/applications" "${CLI_WRAPPER%/*}" "$TMP/cli-empty" "$CLI_ROOT"
+printf '#!/bin/sh\nexit 0\n' > "$CLI_WRAPPER"
+chmod 0755 "$CLI_WRAPPER"
+printf '[Desktop Entry]\nName=Install Steam\nExec=/usr/bin/steam %%U\n' \
+  > "$CLI_HOME/.local/share/applications/steam.desktop"
+HOME="$CLI_HOME" XDG_DATA_HOME="$CLI_HOME/.local/share" \
+  XDG_DATA_DIRS="$TMP/cli-empty" XDG_CONFIG_HOME="$CLI_HOME/.config" \
+  XDG_CONFIG_DIRS="$TMP/cli-empty" XDG_STATE_HOME="$CLI_HOME/state" \
+  DC_HOME="$CLI_HOME" DC_STEAM_ROOT="$CLI_ROOT" DC_STEAM_INSTALLED=1 \
+  DC_BACKUP_ROOT="$CLI_HOME/backup" DC_SYS_APPS="$TMP/none" \
+  DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_FORCE=1 WRAPPER="$CLI_WRAPPER" \
+  bash "$HERE/ensure-desktop-coverage.sh" --user >/dev/null 2>&1 || true
+check "runtime CLI leaves pre-bootstrap Install Steam vanilla" "stub" \
+  "$(DC_HOME="$CLI_HOME" WRAPPER="$CLI_WRAPPER" \
+    dc_classify "$CLI_HOME/.local/share/applications/steam.desktop")"
+
+# A minimal entry created before bootstrap is tagged for ownership but must not
+# be rewritten through the wrapper by a later user/guardian reconciliation.
+MIN_HOME="$TMP/minimal-prebootstrap-home"
+MIN_APPS="$MIN_HOME/.local/share/applications"
+MIN_WRAPPER="$MIN_HOME/.local/share/SLSsteam/path/steam"
+mkdir -p "$MIN_APPS" "${MIN_WRAPPER%/*}" "$TMP/minimal-empty"
+printf '#!/bin/sh\nexit 0\n' > "$MIN_WRAPPER"
+chmod 0755 "$MIN_WRAPPER"
+printf '[Desktop Entry]\n%s\n%s\n%s\nName=Steam\nExec=/usr/bin/steam %%U\n' \
+  "$DC_TAG" "$DC_SEED_TAG" "$DC_PREBOOTSTRAP_TAG" \
+  > "$MIN_APPS/steam.desktop"
+MIN_BEFORE="$(sha256sum "$MIN_APPS/steam.desktop" | awk '{print $1}')"
+XDG_DATA_HOME="$MIN_HOME/.local/share" XDG_DATA_DIRS="$TMP/minimal-empty" \
+  XDG_CONFIG_HOME="$MIN_HOME/.config" XDG_CONFIG_DIRS="$TMP/minimal-empty" \
+  XDG_STATE_HOME="$MIN_HOME/state" DC_HOME="$MIN_HOME" WRAPPER="$MIN_WRAPPER" \
+  DC_STEAM_INSTALLED=0 DC_BACKUP_ROOT="$MIN_HOME/backup" \
+  DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_FORCE=1 \
+  dc_run --user >/dev/null 2>&1
+check "pre-bootstrap minimal entry survives user reconciliation" "$MIN_BEFORE" \
+  "$(sha256sum "$MIN_APPS/steam.desktop" | awk '{print $1}')"
+XDG_DATA_HOME="$MIN_HOME/.local/share" XDG_DATA_DIRS="$TMP/minimal-empty" \
+  XDG_CONFIG_HOME="$MIN_HOME/.config" XDG_CONFIG_DIRS="$TMP/minimal-empty" \
+  XDG_STATE_HOME="$MIN_HOME/state" DC_HOME="$MIN_HOME" WRAPPER="$MIN_WRAPPER" \
+  DC_STEAM_INSTALLED=0 DC_BACKUP_ROOT="$MIN_HOME/backup" \
+  DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_FORCE=1 \
+  dc_guardian_run >/dev/null 2>&1
+check "pre-bootstrap minimal entry survives guardian reconciliation" "$MIN_BEFORE" \
+  "$(sha256sum "$MIN_APPS/steam.desktop" | awk '{print $1}')"
+XDG_DATA_HOME="$MIN_HOME/.local/share" XDG_DATA_DIRS="$TMP/minimal-empty" \
+  XDG_CONFIG_HOME="$MIN_HOME/.config" XDG_CONFIG_DIRS="$TMP/minimal-empty" \
+  XDG_STATE_HOME="$MIN_HOME/state" DC_HOME="$MIN_HOME" WRAPPER="$MIN_WRAPPER" \
+  DC_STEAM_INSTALLED=1 DC_BACKUP_ROOT="$MIN_HOME/backup" \
+  DC_SYS_APPS="$TMP/none" DC_SYS_AUTOSTART="$TMP/none" DC_SUDO="" DC_FORCE=1 \
+  dc_run --user >/dev/null 2>&1
+check "post-bootstrap minimal entry becomes wrapped" "Exec=$MIN_WRAPPER %U" \
+  "$(grep -m1 '^Exec=' "$MIN_APPS/steam.desktop")"
 
 [ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES"
 exit "$fail"
