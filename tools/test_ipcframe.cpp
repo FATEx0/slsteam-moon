@@ -32,6 +32,7 @@
 
 #include "../src/feats/ipcframe.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -139,6 +140,21 @@ static void test_resolveConfident_pure()
 	// Nearest exists but is outside the band (drift too large) -> refuse.
 	std::vector<IpcFrame::Cand> far = { { 0x10, 0x00009999 } };
 	CHECK(IpcFrame::resolveConfident(far, 0x00001000, 0x100) == SIZE_MAX, "out-of-band nearest -> SIZE_MAX");
+}
+
+static void test_catalog_scan_gate()
+{
+	std::printf("[1a] exact catalog gates the fallback scan (pure)\n");
+	int scans = 0;
+	const std::array<bool, 6> complete = { true, true, true, true, true, true };
+	CHECK(!IpcFrame::scanWhenCatalogIncomplete(complete, [&]{ ++scans; }),
+	      "complete catalog -> fallback scan not needed");
+	CHECK(scans == 0, "complete catalog -> scan callback never invoked");
+
+	const std::array<bool, 6> incomplete = { true, true, false, true, true, true };
+	CHECK(IpcFrame::scanWhenCatalogIncomplete(incomplete, [&]{ ++scans; }),
+	      "missing catalog entry -> fallback scan needed");
+	CHECK(scans == 1, "incomplete catalog -> scan callback invoked exactly once");
 }
 
 static void test_pattern_root_roundtrip()
@@ -426,6 +442,7 @@ static void test_required_patterns(const std::string& newPath, const std::string
 int main(int argc, char** argv)
 {
 	test_resolveConfident_pure();
+	test_catalog_scan_gate();
 	test_pattern_root_roundtrip();
 	test_scan_synthetic();
 	test_fingerprint_synthetic();

@@ -276,6 +276,19 @@ bool Pattern_t::find()
 // feats/ipcframe.hpp (host-unit-tested); this only walks live memory.
 static void autoResolveIpcFrameRoots()
 {
+	const std::array<Pattern_t*, 6> targets =
+	{
+		&Patterns::IClientApps::RunIPCFrame,
+		&Patterns::IClientAppManager::RunIPCFrame,
+		&Patterns::IClientRemoteStorage::RunIPCFrame,
+		&Patterns::IClientUGC::RunIPCFrame,
+		&Patterns::IClientUserStats::RunIPCFrame,
+		&Patterns::IClientUser::RunIPCFrame,
+	};
+	std::array<bool, targets.size()> catalogResolved {};
+	for (size_t i = 0; i < targets.size(); ++i)
+		catalogResolved[i] = catalogAddress(*targets[i], false).has_value();
+
 	struct Ctx
 	{
 		std::vector<IpcFrame::Cand> cands;
@@ -304,7 +317,13 @@ static void autoResolveIpcFrameRoots()
 			});
 		return LM_TRUE;
 	};
-	LM_EnumSegments(enumSegments, &ctx);
+	if (!IpcFrame::scanWhenCatalogIncomplete(catalogResolved, [&]
+	{
+		LM_EnumSegments(enumSegments, &ctx);
+	}))
+	{
+		return;
+	}
 
 	if (ctx.cands.empty())
 	{
@@ -312,22 +331,13 @@ static void autoResolveIpcFrameRoots()
 		return;
 	}
 
-	Pattern_t* targets[] =
+	for (size_t i = 0; i < targets.size(); ++i)
 	{
-		&Patterns::IClientApps::RunIPCFrame,
-		&Patterns::IClientAppManager::RunIPCFrame,
-		&Patterns::IClientRemoteStorage::RunIPCFrame,
-		&Patterns::IClientUGC::RunIPCFrame,
-		&Patterns::IClientUserStats::RunIPCFrame,
-		&Patterns::IClientUser::RunIPCFrame,
-	};
-
-	for (Pattern_t* p : targets)
-	{
+		Pattern_t* p = targets[i];
 		// A validated exact-SHA catalog is authoritative for this locator.  Do
 		// not mutate or scan the embedded fallback unless the catalog entry is
 		// absent or fails executable-range validation.
-		if (catalogAddress(*p, false))
+		if (catalogResolved[i])
 			continue;
 		const uint32_t seed = IpcFrame::parseTrailingRoot(p->pattern);
 		size_t idx = IpcFrame::resolveConfident(ctx.cands, seed, IpcFrame::kMaxRootDrift);

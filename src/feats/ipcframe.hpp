@@ -26,11 +26,28 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <array>
 #include <string>
 #include <vector>
 
 namespace IpcFrame
 {
+	template <size_t N, typename ScanFn>
+	inline bool scanWhenCatalogIncomplete(
+		const std::array<bool, N>& catalogResolved,
+		ScanFn&& scan)
+	{
+		for (bool resolved : catalogResolved)
+		{
+			if (!resolved)
+			{
+				scan();
+				return true;
+			}
+		}
+		return false;
+	}
+
 	struct Cand
 	{
 		size_t   offset;  // byte offset of the `E8` (dispatch tail start)
