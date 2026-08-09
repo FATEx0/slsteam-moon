@@ -1,6 +1,7 @@
 #include "catalog.hpp"
 
 #include "pattern_catalog.hpp"
+#include "utils/process_lock.hpp"
 
 #include <curl/curl.h>
 #include <openssl/evp.h>
@@ -539,6 +540,7 @@ namespace
 		CURL* easy = nullptr;
 		curl_slist* headers = nullptr;
 		bool overflow = false;
+		bool complete = false;
 	};
 
 	size_t curlWrite(char* data, size_t size, size_t count, void* opaque)
@@ -594,7 +596,8 @@ namespace
 
 	std::vector<PatternRefresh::Response> fetchBatch(
 		const std::vector<FetchRequest>& requests,
-		bool allowHttp
+		bool allowHttp,
+		const std::function<bool(const std::vector<PatternRefresh::Response>&)>& stopWhen = {}
 	)
 	{
 		std::vector<PatternRefresh::Response> failures(requests.size());
@@ -650,31 +653,52 @@ namespace
 			transfers.push_back(std::move(transfer));
 		}
 
+		const auto completedResponses = [&]
+		{
+			std::vector<PatternRefresh::Response> responses;
+			responses.reserve(transfers.size());
+			for (const auto& transfer : transfers)
+				responses.push_back(transfer->response);
+			return responses;
+		};
+		const auto drainCompleted = [&]
+		{
+			int remaining = 0;
+			while (CURLMsg* message = curl_multi_info_read(multi, &remaining))
+			{
+				if (message->msg != CURLMSG_DONE)
+					continue;
+				const auto found = std::find_if(
+					transfers.begin(), transfers.end(), [&](const auto& item)
+					{
+						return item->easy == message->easy_handle;
+					}
+				);
+				if (found == transfers.end())
+					continue;
+				CurlTransfer& transfer = **found;
+				curl_easy_getinfo(
+					transfer.easy, CURLINFO_RESPONSE_CODE, &transfer.response.status
+				);
+				transfer.response.transportOk = message->data.result == CURLE_OK
+				                             && !transfer.overflow;
+				transfer.complete = true;
+			}
+		};
+
 		int running = 0;
 		if (!setupOk || curl_multi_perform(multi, &running) != CURLM_OK)
 			running = 0;
-		while (running > 0)
+		drainCompleted();
+		while (running > 0 && !(stopWhen && stopWhen(completedResponses())))
 		{
 			int descriptors = 0;
 			if (curl_multi_poll(multi, nullptr, 0, 100, &descriptors) != CURLM_OK
 			    || curl_multi_perform(multi, &running) != CURLM_OK)
 				break;
+			drainCompleted();
 		}
-		int remaining = 0;
-		while (CURLMsg* message = curl_multi_info_read(multi, &remaining))
-		{
-			if (message->msg != CURLMSG_DONE)
-				continue;
-			const auto found = std::find_if(transfers.begin(), transfers.end(), [&](const auto& item)
-			{
-				return item->easy == message->easy_handle;
-			});
-			if (found == transfers.end())
-				continue;
-			CurlTransfer& transfer = **found;
-			curl_easy_getinfo(transfer.easy, CURLINFO_RESPONSE_CODE, &transfer.response.status);
-			transfer.response.transportOk = message->data.result == CURLE_OK && !transfer.overflow;
-		}
+		drainCompleted();
 
 		std::vector<PatternRefresh::Response> responses;
 		responses.reserve(transfers.size());
@@ -1024,6 +1048,7 @@ PatternRefresh::RefreshResult PatternRefresh::refreshComponent(
 	const std::filesystem::path& patternRoot,
 	const ExactModule& module,
 	const PublicKey& publicKey,
+	RefreshMode mode,
 	const MirrorBases& mirrors,
 	std::string* error
 )
@@ -1033,8 +1058,10 @@ PatternRefresh::RefreshResult PatternRefresh::refreshComponent(
 	if (!patternRoot.is_absolute() || !isModule(module.component, module.moduleName)
 	    || !isSha256(module.sha256) || module.size == 0
 	    || !isLowerHex(module.gnuBuildId, 128)
-	    || !validMirrorBase(mirrors.github, mirrors.allowHttpForTests)
-	    || !validMirrorBase(mirrors.jsDelivr, mirrors.allowHttpForTests))
+	    || (mode != RefreshMode::Remote && mode != RefreshMode::CacheOnly)
+	    || (mode == RefreshMode::Remote
+	        && (!validMirrorBase(mirrors.github, mirrors.allowHttpForTests)
+	            || !validMirrorBase(mirrors.jsDelivr, mirrors.allowHttpForTests))))
 	{
 		setError(error, "pattern refresh arguments are invalid");
 		return {};
@@ -1065,6 +1092,27 @@ PatternRefresh::RefreshResult PatternRefresh::refreshComponent(
 			cache = CachedPair{*cachedCatalog, *cachedSignature, true};
 		}
 	}
+	if (mode == RefreshMode::CacheOnly)
+	{
+		if (activeMetadata)
+			return {true, false, Source::OfflineCache, activeMetadata->revision};
+		setError(error, "no valid signed exact-module cache is available");
+		return {};
+	}
+
+	const Validator validator = [&](std::string_view body, std::string_view signature)
+	{
+		const auto* bytes = reinterpret_cast<const unsigned char*>(signature.data());
+		const auto candidate = validateSignedCatalog(
+			body,
+			std::span<const unsigned char>(bytes, signature.size()),
+			module,
+			publicKey
+		);
+		return candidate && acceptsRevision(
+			*candidate, body, activeMetadata, activeBody
+		);
+	};
 
 	const UrlPair githubUrls = makeUrls(mirrors.github, module.component, module.sha256);
 	const UrlPair cdnUrls = makeUrls(mirrors.jsDelivr, module.component, module.sha256);
@@ -1079,7 +1127,24 @@ PatternRefresh::RefreshResult PatternRefresh::refreshComponent(
 		{cdnUrls.signature, kSignatureSize,
 		 loadEtag(etagPath(patternRoot, module, "jsdelivr", "signature"))},
 	};
-	const auto responses = fetchBatch(requests, mirrors.allowHttpForTests);
+	const auto responses = fetchBatch(
+		requests,
+		mirrors.allowHttpForTests,
+		[&](const std::vector<Response>& partial)
+		{
+			if (partial.size() != 4)
+				return false;
+			const Selection selected = chooseCandidate(
+				{partial[0], partial[1]},
+				{partial[2], partial[3]},
+				cache,
+				validator
+			);
+			return selected.source == Source::GitHub
+			    || selected.source == Source::JsDelivr
+			    || selected.source == Source::RevalidatedCache;
+		}
+	);
 	if (responses.size() != 4)
 	{
 		setError(error, "mirror request batch failed");
@@ -1089,19 +1154,6 @@ PatternRefresh::RefreshResult PatternRefresh::refreshComponent(
 	}
 	const ResponsePair github {responses[0], responses[1]};
 	const ResponsePair jsDelivr {responses[2], responses[3]};
-	const Validator validator = [&](std::string_view body, std::string_view signature)
-	{
-		const auto* bytes = reinterpret_cast<const unsigned char*>(signature.data());
-		const auto candidate = validateSignedCatalog(
-			body,
-			std::span<const unsigned char>(bytes, signature.size()),
-			module,
-			publicKey
-		);
-		return candidate && acceptsRevision(
-			*candidate, body, activeMetadata, activeBody
-		);
-	};
 	const Selection githubOnly = chooseCandidate(
 		github, ResponsePair{}, cache, validator
 	);
@@ -1172,14 +1224,24 @@ std::optional<PatternRefresh::Invocation> PatternRefresh::parseInvocation(
 	const std::vector<std::string_view>& arguments
 )
 {
-	if (arguments.size() != 5 || arguments.front().empty())
+	if (arguments.empty() || arguments.front().empty())
 		return std::nullopt;
 	Invocation result;
 	bool steamSeen = false;
 	bool configSeen = false;
-	for (std::size_t index = 1; index < arguments.size(); index += 2)
+	bool cacheOnlySeen = false;
+	for (std::size_t index = 1; index < arguments.size();)
 	{
-		if (arguments[index + 1].empty())
+		if (arguments[index] == "--cache-only")
+		{
+			if (cacheOnlySeen)
+				return std::nullopt;
+			cacheOnlySeen = true;
+			result.mode = RefreshMode::CacheOnly;
+			++index;
+			continue;
+		}
+		if (index + 1 >= arguments.size() || arguments[index + 1].empty())
 			return std::nullopt;
 		const std::filesystem::path value(arguments[index + 1]);
 		if (!value.is_absolute())
@@ -1198,6 +1260,7 @@ std::optional<PatternRefresh::Invocation> PatternRefresh::parseInvocation(
 		{
 			return std::nullopt;
 		}
+		index += 2;
 	}
 	return steamSeen && configSeen ? std::optional<Invocation>(std::move(result))
 	                               : std::nullopt;
@@ -1207,6 +1270,7 @@ int PatternRefresh::refreshInstallation(
 	const std::filesystem::path& steamRoot,
 	const std::filesystem::path& configRoot,
 	const PublicKey& publicKey,
+	RefreshMode mode,
 	const MirrorBases& mirrors,
 	std::string* error
 )
@@ -1215,12 +1279,29 @@ int PatternRefresh::refreshInstallation(
 		error->clear();
 	std::error_code filesystemError;
 	if (!steamRoot.is_absolute() || !configRoot.is_absolute()
+	    || (mode != RefreshMode::Remote && mode != RefreshMode::CacheOnly)
 	    || !std::filesystem::is_directory(steamRoot, filesystemError) || filesystemError)
 	{
 		setError(error, "Steam or configuration root is invalid");
 		return 2;
 	}
 	const std::filesystem::path patternRoot = configRoot / "SLSsteam" / "patterns";
+	std::optional<ProcessLock::FileLock> refreshLock;
+	if (mode == RefreshMode::Remote)
+	{
+		std::filesystem::create_directories(patternRoot / ".state", filesystemError);
+		if (filesystemError)
+		{
+			setError(error, "embedded fallback refresh state directory is unavailable");
+			return 3;
+		}
+		refreshLock.emplace((patternRoot / ".state/.refresh.lock").string(), true);
+		if (!refreshLock->acquired())
+		{
+			setError(error, "embedded fallback remote refresh is already active");
+			return 3;
+		}
+	}
 	const struct
 	{
 		const char* component;
@@ -1261,6 +1342,7 @@ int PatternRefresh::refreshInstallation(
 					patternRoot,
 					modules[index]->identity,
 					publicKey,
+					mode,
 					mirrors,
 					&diagnostics[index]
 				);

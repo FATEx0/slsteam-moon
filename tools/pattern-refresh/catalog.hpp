@@ -103,6 +103,12 @@ namespace PatternRefresh
 		OfflineCache,
 	};
 
+	enum class RefreshMode
+	{
+		Remote,
+		CacheOnly,
+	};
+
 	struct RefreshResult
 	{
 		bool active = false;
@@ -115,6 +121,7 @@ namespace PatternRefresh
 	{
 		std::filesystem::path steamRoot;
 		std::filesystem::path configRoot;
+		RefreshMode mode = RefreshMode::Remote;
 	};
 
 	struct Selection
@@ -179,6 +186,7 @@ namespace PatternRefresh
 		const std::filesystem::path& patternRoot,
 		const ExactModule& module,
 		const PublicKey& publicKey,
+		RefreshMode mode = RefreshMode::Remote,
 		const MirrorBases& mirrors = {},
 		std::string* error = nullptr
 	);
@@ -192,6 +200,7 @@ namespace PatternRefresh
 		const std::filesystem::path& steamRoot,
 		const std::filesystem::path& configRoot,
 		const PublicKey& publicKey,
+		RefreshMode mode = RefreshMode::Remote,
 		const MirrorBases& mirrors = {},
 		std::string* error = nullptr
 	);

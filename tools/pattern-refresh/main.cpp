@@ -20,7 +20,8 @@ int main(int argc, char** argv)
 	const auto invocation = PatternRefresh::parseInvocation(arguments);
 	if (!invocation)
 	{
-		std::cerr << "usage: pattern-refresh --steam-root PATH --config-root PATH\n";
+		std::cerr << "usage: pattern-refresh [--cache-only] --steam-root PATH "
+		             "--config-root PATH\n";
 		return 2;
 	}
 	const auto publicKey = PatternRefresh::parsePublicKeyHex(PATTERN_PUBLIC_KEY_HEX);
@@ -35,6 +36,7 @@ int main(int argc, char** argv)
 		invocation->steamRoot,
 		invocation->configRoot,
 		*publicKey,
+		invocation->mode,
 		{},
 		&diagnostic
 	);

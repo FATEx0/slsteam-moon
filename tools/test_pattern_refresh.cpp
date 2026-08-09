@@ -22,6 +22,8 @@
 #include <vector>
 
 #include <poll.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -350,8 +352,15 @@ namespace
 				route.status = 304;
 				route.body.clear();
 			}
-			if (route.delayMilliseconds > 0)
-				std::this_thread::sleep_for(std::chrono::milliseconds(route.delayMilliseconds));
+			for (long remaining = route.delayMilliseconds;
+			     remaining > 0 && !stop_.load(); remaining -= std::min(remaining, 10L))
+			{
+				std::this_thread::sleep_for(
+					std::chrono::milliseconds(std::min(remaining, 10L))
+				);
+			}
+			if (stop_.load())
+				return;
 			const char* reason = route.status == 200 ? "OK"
 			                   : route.status == 304 ? "Not Modified" : "Not Found";
 			std::string response = "HTTP/1.1 " + std::to_string(route.status) + " " + reason
@@ -677,7 +686,8 @@ int main()
 		};
 		std::string error;
 		const auto first = refreshComponent(
-			temporary.path / "patterns", exactModule(), signing.publicKey, mirrors, &error
+			temporary.path / "patterns", exactModule(), signing.publicKey,
+			RefreshMode::Remote, mirrors, &error
 		);
 		expect(first.active && first.changed && first.source == Source::JsDelivr,
 		       "real HTTP 404 falls back and activates jsDelivr bytes");
@@ -685,7 +695,8 @@ int main()
 		       "primary and fallback catalog/signature pairs are fetched");
 
 		const auto second = refreshComponent(
-			temporary.path / "patterns", exactModule(), signing.publicKey, mirrors, &error
+			temporary.path / "patterns", exactModule(), signing.publicKey,
+			RefreshMode::Remote, mirrors, &error
 		);
 		expect(second.active && !second.changed && second.source == Source::RevalidatedCache,
 		       "ETag 304 revalidates the exact signed cache");
@@ -700,6 +711,76 @@ int main()
 		expect(stat(etagFile.c_str(), &etagStat) == 0
 		       && (etagStat.st_mode & 0777) == 0600,
 		       "ETag state is restricted to mode 0600");
+	}
+
+	{
+		TempDirectory temporary;
+		const auto patternRoot = temporary.path / "patterns";
+		const auto activated = activateSignedCatalog(
+			patternRoot, exactModule(), revisionOne, signatureOne, signing.publicKey
+		);
+		expect(activated.active, "cache-only fixture activates exact signed metadata");
+		HttpServer server({});
+		const MirrorBases mirrors
+		{
+			server.base("/github/"),
+			server.base("/cdn/"),
+			true,
+		};
+		const auto started = std::chrono::steady_clock::now();
+		const auto refreshed = refreshComponent(
+			patternRoot, exactModule(), signing.publicKey,
+			RefreshMode::CacheOnly, mirrors
+		);
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - started
+		).count();
+		expect(refreshed.active && refreshed.source == Source::OfflineCache,
+		       "cache-only refresh accepts the signed exact-module cache");
+		expect(server.requestCount() == 0,
+		       "cache-only refresh performs no HTTP requests");
+		expect(elapsed < 250, "cache-only refresh returns without a network deadline");
+	}
+
+	{
+		TempDirectory temporary;
+		const std::string catalog = canonicalToml(1);
+		const auto signature = sign(signing.key.get(), catalog);
+		const std::string signatureBody(
+			reinterpret_cast<const char*>(signature.data()), signature.size()
+		);
+		const std::string sha(64, 'a');
+		const std::string stem = "/linux32/steamclient/" + sha;
+		HttpServer fast(
+			{
+				{stem + ".toml", {200, catalog, "\"fast-catalog\""}},
+				{stem + ".sig", {200, signatureBody, "\"fast-signature\""}},
+			}
+		);
+		HttpServer stalled(
+			{
+				{stem + ".toml", {200, catalog, {}, 5000}},
+				{stem + ".sig", {200, signatureBody, {}, 5000}},
+			}
+		);
+		const MirrorBases mirrors
+		{
+			fast.base("/"),
+			stalled.base("/"),
+			true,
+		};
+		const auto started = std::chrono::steady_clock::now();
+		const auto refreshed = refreshComponent(
+			temporary.path / "patterns", exactModule(), signing.publicKey,
+			RefreshMode::Remote, mirrors
+		);
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - started
+		).count();
+		expect(refreshed.active && refreshed.source == Source::GitHub,
+		       "first complete valid signed mirror wins");
+		expect(elapsed < 1500,
+		       "a stalled secondary mirror does not hold a valid primary mirror");
 	}
 
 	{
@@ -721,8 +802,19 @@ int main()
 		const auto invocation = parseInvocation(arguments);
 		expect(invocation.has_value(), "exact refresh invocation parses");
 		expect(invocation && invocation->steamRoot == "/steam"
-		       && invocation->configRoot == "/config",
+		       && invocation->configRoot == "/config"
+		       && invocation->mode == RefreshMode::Remote,
 		       "refresh invocation retains exact absolute roots");
+		const auto cacheOnly = parseInvocation(
+			{"pattern-refresh", "--cache-only", "--steam-root", "/steam",
+			 "--config-root", "/config"}
+		);
+		expect(cacheOnly && cacheOnly->mode == RefreshMode::CacheOnly,
+		       "cache-only refresh invocation parses explicitly");
+		expect(!parseInvocation(
+			{"pattern-refresh", "--cache-only", "--cache-only",
+			 "--steam-root", "/steam", "--config-root", "/config"}
+		), "duplicate cache-only option is rejected");
 		auto duplicate = arguments;
 		duplicate.insert(duplicate.end(), {"--steam-root", "/other"});
 		expect(!parseInvocation(duplicate), "duplicate refresh option is rejected");
@@ -783,25 +875,71 @@ int main()
 			};
 			std::string error;
 			const int result = refreshInstallation(
-				steamRoot, configRoot, signing.publicKey, mirrors, &error
+				steamRoot, configRoot, signing.publicKey,
+				RefreshMode::Remote, mirrors, &error
 			);
 			if (result != 0)
 				std::cerr << "refreshInstallation diagnostic: " << error << '\n';
 			expect(result == 0, "both exact Steam modules refresh successfully");
 			expect(error.empty(), "successful installation refresh has no diagnostic");
-			expect(server.requestCount() == 8,
-			       "both modules and both mirrors are requested in the bounded refresh");
+			expect(server.requestCount() >= 4 && server.requestCount() <= 8,
+			       "both modules refresh while redundant mirror requests may be cancelled");
 			expect(std::filesystem::exists(
 				configRoot / "SLSsteam/patterns/steamclient" / (client->identity.sha256 + ".toml")
 			), "steamclient active TOML is installed");
 			expect(std::filesystem::exists(
 				configRoot / "SLSsteam/patterns/steamui" / (ui->identity.sha256 + ".toml")
 			), "steamui active TOML is installed");
+			const std::size_t requestsBeforeCacheOnly = server.requestCount();
+			expect(refreshInstallation(
+				steamRoot, configRoot, signing.publicKey,
+				RefreshMode::CacheOnly, mirrors
+			) == 0, "installation cache-only mode accepts both exact signed catalogs");
+			expect(server.requestCount() == requestsBeforeCacheOnly,
+			       "installation cache-only mode performs no HTTP requests");
 		}
 		expect(refreshInstallation(
 			temporary.path / "relative/../missing", configRoot,
-			signing.publicKey
+			signing.publicKey, RefreshMode::Remote
 		) == 2, "invalid Steam root returns invocation status 2");
+	}
+
+	{
+		TempDirectory temporary;
+		const auto steamRoot = temporary.path / "steam";
+		const auto configRoot = temporary.path / "config";
+		const auto stateRoot = configRoot / "SLSsteam/patterns/.state";
+		std::filesystem::create_directories(steamRoot / "ubuntu12_32");
+		std::filesystem::create_directories(stateRoot);
+		writeBytes(steamRoot / "ubuntu12_32/steamclient.so", testElf());
+		writeBytes(steamRoot / "ubuntu12_32/steamui.so", testElf());
+		const auto lockPath = stateRoot / ".refresh.lock";
+		const int lockDescriptor = open(
+			lockPath.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600
+		);
+		expect(lockDescriptor >= 0 && flock(lockDescriptor, LOCK_EX | LOCK_NB) == 0,
+		       "refresh lock fixture is acquired");
+		HttpServer server({});
+		const MirrorBases mirrors
+		{
+			server.base("/github/"),
+			server.base("/cdn/"),
+			true,
+		};
+		const auto started = std::chrono::steady_clock::now();
+		const int result = refreshInstallation(
+			steamRoot, configRoot, signing.publicKey,
+			RefreshMode::Remote, mirrors
+		);
+		const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - started
+		).count();
+		expect(result == 3, "concurrent remote refresh yields to the active updater");
+		expect(server.requestCount() == 0,
+		       "concurrent remote refresh does not duplicate network work");
+		expect(elapsed < 250, "concurrent remote refresh returns immediately");
+		if (lockDescriptor >= 0)
+			close(lockDescriptor);
 	}
 
 	{
@@ -839,7 +977,8 @@ int main()
 			};
 			const auto started = std::chrono::steady_clock::now();
 			const int result = refreshInstallation(
-				steamRoot, configRoot, signing.publicKey, mirrors
+				steamRoot, configRoot, signing.publicKey,
+				RefreshMode::Remote, mirrors
 			);
 			const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 				std::chrono::steady_clock::now() - started
