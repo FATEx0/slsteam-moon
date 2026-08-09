@@ -38,6 +38,8 @@
 
 #pragma once
 
+#include "dlcids.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -45,18 +47,12 @@
 namespace AppInfoProvision
 {
 
-// Collect the DLC appids advertised by every managed app,
-// read from the on-disk `picsbuffer_<appid>.bin` buffers (their
-// `extended.listofdlc` and `depots.<id>.dlcappid` fields).  Returns the
-// deduplicated set, excluding the AddedApp base ids themselves.
-//
-// These ids must be injected into Steam's package-0 AppIdVec so the
-// install planner schedules the DLC depots — ownership alone is not
-// enough (proven on the VM 2026-06-05 with Binding of Isaac 250900).
-// They are intentionally NOT added to g_config.addedAppIds, so they
-// skip the per-app provisioning path (a DLC appid has no own depots and
-// would only emit a "JSON has no depots" provisioning warning).
-std::vector<uint32_t> collectDlcAppIdsForAddedApps();
+// Collect the DLC appids advertised by every managed app from the on-disk
+// `picsbuffer_<appid>.bin` buffers.  `package0` contains the planner-facing
+// subset: every depot-tagged id plus advertised ids with known own content
+// (or all advertised ids when InjectAllAdvertisedDlc is enabled).  `appDlc`
+// retains the complete deduplicated set for local launch-time decisions.
+DlcInjectionIds collectDlcAppIdsForAddedApps();
 
 // Fetch and persist a synthetic PICS buffer for `appId` if needed.
 // `appinfoVdfPath` is the path to Steam's appcache/appinfo.vdf and is
@@ -69,6 +65,13 @@ bool provisionApp(uint32_t appId, const std::string& appinfoVdfPath);
 // Returns the number of buffers newly written (0 means everything was
 // already provisioned or none needed).
 int provisionAllAddedApps(const std::string& appinfoVdfPath);
+
+// Forget the on-disk app-scoped state for an app that was removed from
+// LuaTools. Artifacts are quarantined with a recoverable suffix rather than
+// deleted, so a mistaken removal can be restored without data loss. Returns
+// false for an invalid app id or when any app-scoped artifact could not be
+// quarantined; a missing artifact is a successful no-op.
+bool forgetApp(uint32_t appId);
 
 // True iff `appId`'s appinfo depots were SYNTHESIZED from local manifests
 // because its product-info is token-locked (access token denied -> empty

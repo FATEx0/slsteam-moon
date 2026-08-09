@@ -2,6 +2,8 @@
 
 #include "log.hpp"
 #include "utils.hpp"
+#include "config.hpp"
+#include "pattern_scan.hpp"
 
 #include "libmem/libmem.h"
 
@@ -57,13 +59,14 @@ lm_address_t MemHlp::patternScan(const char* pattern, lm_module_t targetModule)
 
 	LM_EnumSegments(enumSegments, &codeSegments);
 
-	lm_address_t address = LM_ADDRESS_BAD;
-	unsigned int matches = 0;
-
 	if (bytes.empty())
 	{
-		return address;
+		return LM_ADDRESS_BAD;
 	}
+
+	const bool countDuplicates = g_config.extendedLogging.get();
+	lm_address_t address = LM_ADDRESS_BAD;
+	std::size_t matches = 0;
 
 	for(const auto& itm : codeSegments)
 	{
@@ -76,55 +79,44 @@ lm_address_t MemHlp::patternScan(const char* pattern, lm_module_t targetModule)
 			continue;
 		}
 
-		// Stop early enough that the whole pattern fits inside the segment;
-		// never dereference past itm.second (the byte one past the segment
-		// may be an unmapped/guard page). The previous `byteAddr > itm.second`
-		// per-byte check was off-by-one (allowed reading itm.second itself).
-		if (itm.second - itm.first < bytes.size())
+		const auto result = scanPatternRange(bytes, itm.first, itm.second, countDuplicates);
+		if (result.matches == 0)
 		{
 			continue;
 		}
 
-		for (lm_address_t cur = itm.first; cur + bytes.size() <= itm.second; cur++)
+		if (!countDuplicates)
 		{
-			bool found = true;
+			return static_cast<lm_address_t>(result.address);
+		}
 
-			for(unsigned int i = 0; i < bytes.size(); i++)
-			{
-				if (bytes.at(i) == -1)
-				{
-					continue;
-				}
-
-				const lm_byte_t* pbyte = reinterpret_cast<lm_byte_t*>(cur + i);
-				if (*pbyte != bytes.at(i))
-				{
-					found = false;
-					break;
-				}
-			}
-
-			if (found)
-			{
-				address = cur;
-				matches++;
-
-				if (matches > 1 && g_pLog)
-				{
-					g_pLog->debug("Pattern %s found %i times at %p!\n", pattern, matches, cur);
-				}
-			}
+		address = static_cast<lm_address_t>(result.address);
+		matches += result.matches;
+		if (matches > 1 && g_pLog)
+		{
+			g_pLog->debug("Pattern %s found %zu times at %p!\n", pattern, matches, address);
 		}
 	}
 
 	return address;
 }
 
-lm_address_t MemHlp::searchSignature(const char* name, const char* signature, lm_module_t module, SigFollowMode mode, void* extraData, size_t extraDataSize)
+MemHlp::SignatureSearchResult MemHlp::searchSignatureDetailed(
+	const char* name,
+	const char* signature,
+	lm_module_t module,
+	SigFollowMode mode,
+	void* extraData,
+	size_t extraDataSize
+)
 {
-	//lm_address_t address = LM_SigScan(signature, module.base, module.size);
-	lm_address_t address = patternScan(signature, module);
-	if (address == LM_ADDRESS_BAD)
+	// Keep the original match separate from the followed target.  Relative and
+	// prologue resolvers deliberately return a different address, but the
+	// original signature is the proof that a local catalog must re-check.
+	SignatureSearchResult result;
+	result.match = patternScan(signature, module);
+	result.target = result.match;
+	if (result.match == LM_ADDRESS_BAD)
 	{
 		g_pLog->debug("Unable to find signature for %s!\n", name);
 	}
@@ -133,23 +125,48 @@ lm_address_t MemHlp::searchSignature(const char* name, const char* signature, lm
 		switch (mode)
 		{
 			case SigFollowMode::Relative:
-				g_pLog->debug("Resolving relative of %s at %p\n", name, address);
-				address = MemHlp::getJmpTarget(address);
+				g_pLog->debug("Resolving relative of %s at %p\n", name, result.match);
+				result.target = MemHlp::getJmpTarget(result.match);
 				break;
 
 			case SigFollowMode::PrologueUpwards:
-				g_pLog->debug("Searching function prologue of %s from %p\n", name, address);
-				address = MemHlp::findPrologue(address, static_cast<lm_byte_t*>(extraData), extraDataSize);
+				g_pLog->debug("Searching function prologue of %s from %p\n", name, result.match);
+				{
+					lm_segment_t matchSegment{};
+					if (!LM_FindSegment(result.match, &matchSegment))
+					{
+						g_pLog->warn("Unable to find matched segment for %s\n", name);
+						result.target = LM_ADDRESS_BAD;
+						break;
+					}
+					result.target = MemHlp::findPrologue(
+						result.match,
+						MemHlp::prologueLowerBound(module.base, matchSegment.base),
+						static_cast<lm_byte_t*>(extraData), extraDataSize
+					);
+				}
 				break;
 
 			default:
 				break;
 		}
 
-		g_pLog->debug("%s at %p\n", name, address);
+		g_pLog->debug("%s at %p\n", name, result.target);
 	}
 
-	return address;
+	return result;
+}
+
+lm_address_t MemHlp::searchSignature(
+	const char* name,
+	const char* signature,
+	lm_module_t module,
+	SigFollowMode mode,
+	void* extraData,
+	size_t extraDataSize
+)
+{
+	return searchSignatureDetailed(name, signature, module, mode, extraData, extraDataSize).target;
 }
 
 lm_address_t MemHlp::searchSignature(const char* name, const char* signature, lm_module_t module, SigFollowMode mode)
@@ -176,15 +193,25 @@ lm_address_t MemHlp::getJmpTarget(lm_address_t address)
 	if (strcmp(inst.mnemonic, "jmp") != 0 && strcmp(inst.mnemonic, "call") != 0)
 		return LM_ADDRESS_BAD;
 
-	return std::stoul(inst.op_str, nullptr, 16);
+	const lm_address_t target = parseJumpTargetOperand(inst.op_str);
+	if (target == LM_ADDRESS_BAD)
+	{
+		g_pLog->debug("Unsupported jump/call operand '%s'\n", inst.op_str);
+		return LM_ADDRESS_BAD;
+	}
+	return target;
 }
 
-lm_address_t MemHlp::findPrologue(lm_address_t address, lm_byte_t* prologueBytes, lm_size_t prologueSize)
+lm_address_t MemHlp::findPrologue(lm_address_t address, lm_address_t lowerBound,
+                                   const lm_byte_t* prologueBytes, lm_size_t prologueSize)
 {
 	constexpr unsigned int scanSize = 0x10000;
 
 	for(unsigned int i = 0u; i < scanSize; i++)
 	{
+		if (!prologueWindowWithin(address, lowerBound, i, prologueSize))
+			break;
+
 		bool found = true;
 		for(unsigned int j = 0u; j < prologueSize; j++)
 		{
@@ -232,7 +259,7 @@ bool MemHlp::fixPICThunkCall(const char* name, lm_address_t fn, lm_address_t tra
 		//Calculate the call address manually with it's original location
 		lm_address_t followAddress = fn + curTrampOffset + *reinterpret_cast<lm_address_t*>(startAddress + 1);
 		bool isIPCThunk = true;
-		char newInstr[sizeof(inst.mnemonic) + sizeof(inst.op_str)];
+		char newInstr[256] = {};
 
 		for(unsigned int i = 0; i < 2; i++) //Dissassemble next 2 instructions and check if they're an actual IPC thunk call
 		{
@@ -255,9 +282,25 @@ bool MemHlp::fixPICThunkCall(const char* name, lm_address_t fn, lm_address_t tra
 					if (strcmp(inst.mnemonic, "mov") != 0)
 						isIPCThunk = false;
 					
-					splits = Utils::strsplit(inst.op_str, ","); //Not checking for splits.size() since mov NEEDS a , somewhere
+					if (inst.op_str[0] == '\0')
+					{
+						isIPCThunk = false;
+						break;
+					}
+					splits = Utils::strsplit(inst.op_str, ",");
+					if (splits.empty() || splits.front().empty())
+					{
+						isIPCThunk = false;
+						break;
+					}
 					retAddress = fn + curTrampOffset; //No need to add any bytes here, since i += inst.size in the outer loop takes care of that
-					sprintf(newInstr, "%s %s, %p", inst.mnemonic, splits.at(0).c_str(), reinterpret_cast<void*>(retAddress));
+					if (!formatPICThunkInstruction(
+						newInstr, sizeof(newInstr), inst.mnemonic,
+						splits.front().c_str(), retAddress))
+					{
+						g_pLog->debug("Unable to format PIC thunk instruction\n");
+						return false;
+					}
 					break;
 
 				case 1:

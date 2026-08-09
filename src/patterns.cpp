@@ -4,7 +4,9 @@
 #include "memhlp.hpp"
 #include "feats/ipcframe.hpp"
 #include "pattern_catalog.hpp"
+#include "pattern_cache.hpp"
 #include "runtime_attestation.hpp"
+#include "config.hpp"
 #include "utils.hpp"
 
 #include "libmem/libmem.h"
@@ -18,11 +20,96 @@
 #include <optional>
 #include <system_error>
 
+#include <sys/stat.h>
+
 
 namespace
 {
 	std::optional<PatternCatalog::Catalog> g_steamClientCatalog;
 	std::optional<PatternCatalog::Catalog> g_steamUiCatalog;
+
+	struct LocalCatalogState
+	{
+		std::optional<PatternCache::ModuleIdentity> identity;
+		std::optional<PatternCache::Catalog> catalog;
+		bool writeEligible = false;
+		bool dirty = false;
+	};
+
+	LocalCatalogState g_steamClientLocal;
+	LocalCatalogState g_steamUiLocal;
+
+	std::optional<std::filesystem::path> patternRoot();
+
+	bool localCacheEnabled()
+	{
+		return PatternCache::enabled(
+			g_config.patternCache.get(), std::getenv("SLSSTEAM_PATTERN_CACHE")
+		);
+	}
+
+	std::optional<PatternCache::ModuleIdentity> moduleIdentity(
+		const char* component,
+		const char* moduleName,
+		const lm_module_t& module
+	)
+	{
+		struct stat value {};
+		if (stat(module.path, &value) != 0 || !S_ISREG(value.st_mode) || value.st_size <= 0)
+			return std::nullopt;
+		const std::string buildId = Utils::getBuildId(module.path);
+		if (buildId.empty())
+			return std::nullopt;
+		return PatternCache::ModuleIdentity
+		{
+			component,
+			moduleName,
+			buildId,
+			static_cast<std::uint64_t>(value.st_size),
+			static_cast<std::int64_t>(value.st_mtim.tv_sec),
+			static_cast<std::int64_t>(value.st_mtim.tv_nsec),
+		};
+	}
+
+	std::filesystem::path localCatalogPath(
+		const std::filesystem::path& root,
+		const PatternCache::ModuleIdentity& identity
+	)
+	{
+		const std::string key = identity.gnuBuildId + "-"
+			+ std::to_string(identity.size) + "-"
+			+ std::to_string(identity.mtimeSeconds) + "-"
+			+ std::to_string(identity.mtimeNanoseconds) + ".cache";
+		return root / "local" / identity.component / key;
+	}
+
+	LocalCatalogState loadLocalCatalog(
+		const char* component,
+		const char* moduleName,
+		const lm_module_t& module
+	)
+	{
+		LocalCatalogState state;
+		if (!localCacheEnabled())
+			return state;
+		state.identity = moduleIdentity(component, moduleName, module);
+		const auto root = patternRoot();
+		if (!state.identity || !root)
+			return state;
+
+		std::string error;
+		state.catalog = PatternCache::load(
+			localCatalogPath(*root, *state.identity), *state.identity, &error
+		);
+		if (!state.catalog)
+			state.writeEligible = true;
+		return state;
+	}
+
+	LocalCatalogState& localStateFor(const Pattern_t& pattern)
+	{
+		return pattern.module == &g_modSteamUI ? g_steamUiLocal : g_steamClientLocal;
+	}
 
 	const PatternCatalog::Catalog* catalogFor(const Pattern_t& pattern)
 	{
@@ -32,8 +119,136 @@ namespace
 		return selected ? &*selected : nullptr;
 	}
 
-	std::optional<lm_address_t> catalogAddress(const Pattern_t& pattern, bool logInvalid)
+	const char* followModeName(MemHlp::SigFollowMode mode)
 	{
+		switch (mode)
+		{
+			case MemHlp::SigFollowMode::Relative: return "Relative";
+			case MemHlp::SigFollowMode::PrologueUpwards: return "PrologueUpwards";
+			default: return "None";
+		}
+	}
+
+	std::optional<lm_address_t> localCatalogAddress(
+		const Pattern_t& pattern,
+		bool logInvalid,
+		lm_address_t* matchAddressOut
+	)
+	{
+		LocalCatalogState& state = localStateFor(pattern);
+		if (!state.catalog)
+			return std::nullopt;
+
+		const auto reject = [&](const char* message) -> std::optional<lm_address_t>
+		{
+			// The structural IPC-root probe runs before the embedded signature is
+			// normalized.  A failed non-logging probe is therefore provisional:
+			// let autoResolveIpcFrameRoots adjust the root and recheck the local
+			// catalog during the definitive Pattern_t::find() pass.  Normal
+			// resolving (logInvalid=true) remains transactional.
+			if (logInvalid)
+			{
+				state.catalog.reset();
+				state.writeEligible = true;
+				state.dirty = true;
+			}
+			if (logInvalid)
+				g_pLog->warn("Local pattern cache for '%s' rejected: %s; using embedded resolver\n",
+				             pattern.name.c_str(), message);
+			return std::nullopt;
+		};
+		const PatternCache::Locator* entry = state.catalog->entry(pattern.symbol);
+		if (entry == nullptr)
+		{
+			// Optional patterns may legitimately be absent from a catalog when
+			// they were unresolved during the cold pass.  Keep the required
+			// cached hits usable and let this optional feature fall back alone.
+			if (pattern.optional)
+				return std::nullopt;
+			return reject("locator is missing from the complete cache policy");
+		}
+		if (entry->required != !pattern.optional)
+			return reject("compiled policy mismatch");
+		if (entry->followMode != followModeName(pattern.followMode)
+		    || entry->signature != pattern.pattern)
+			return reject("compiled resolver metadata mismatch");
+
+		const lm_module_t& module = pattern.module ? *pattern.module : g_modSteamClient;
+		if (entry->targetRva >= module.size
+		    || entry->targetRva > static_cast<std::uint64_t>(LM_ADDRESS_BAD - module.base))
+			return reject("target RVA is outside the module");
+		const lm_address_t candidate = module.base
+			+ static_cast<lm_address_t>(entry->targetRva);
+		lm_segment_t targetSegment {};
+		const bool targetInside = candidate >= module.base && candidate < module.end;
+		const bool targetExecutable = targetInside && LM_FindSegment(candidate, &targetSegment)
+			&& (targetSegment.prot & LM_PROT_XR) == LM_PROT_XR;
+		if (!targetExecutable)
+			return reject("target RVA is not executable");
+
+		const auto signatureBytes = PatternCache::signatureSize(entry->signature);
+		if (!signatureBytes || entry->matchRva >= module.size
+		    || *signatureBytes > module.size - entry->matchRva
+		    || entry->matchRva > static_cast<std::uint64_t>(LM_ADDRESS_BAD - module.base))
+			return reject("match RVA is outside the module");
+		const lm_address_t match = module.base
+			+ static_cast<lm_address_t>(entry->matchRva);
+		lm_segment_t matchSegment {};
+		if (!LM_FindSegment(match, &matchSegment)
+		    || (matchSegment.prot & LM_PROT_XR) != LM_PROT_XR
+		    || match < matchSegment.base
+		    || match >= matchSegment.end
+		    || matchSegment.end - match < *signatureBytes)
+			return reject("signature range is not executable");
+		if (!PatternCache::signatureMatches(
+			entry->signature,
+			std::span<const std::uint8_t>(
+				reinterpret_cast<const std::uint8_t*>(match), *signatureBytes
+			)))
+			return reject("signature bytes changed");
+
+		lm_address_t derivedTarget = match;
+		switch (pattern.followMode)
+		{
+			case MemHlp::SigFollowMode::Relative:
+				derivedTarget = MemHlp::getJmpTarget(match);
+				break;
+			case MemHlp::SigFollowMode::PrologueUpwards:
+				derivedTarget = MemHlp::findPrologue(
+					match,
+					MemHlp::prologueLowerBound(module.base, matchSegment.base),
+					pattern.prologue.empty() ? nullptr : pattern.prologue.data(),
+					pattern.prologue.size()
+				);
+				break;
+			case MemHlp::SigFollowMode::None:
+				break;
+		}
+		if (derivedTarget == LM_ADDRESS_BAD
+		    || derivedTarget < module.base || derivedTarget >= module.end)
+			return reject("followed target is outside the module");
+		const auto derivedTargetRva = static_cast<std::uint64_t>(
+			derivedTarget - module.base
+		);
+		if (!PatternCache::targetRvaMatches(
+			entry->followMode, entry->matchRva, entry->targetRva,
+			derivedTargetRva
+		))
+			return reject("target RVA does not match the matched signature");
+
+		if (matchAddressOut != nullptr)
+			*matchAddressOut = match;
+		return candidate;
+	}
+
+	std::optional<lm_address_t> catalogAddress(
+		const Pattern_t& pattern,
+		bool logInvalid,
+		lm_address_t* matchAddressOut = nullptr
+	)
+	{
+		if (const auto local = localCatalogAddress(pattern, logInvalid, matchAddressOut))
+			return local;
 		const PatternCatalog::Catalog* catalog = catalogFor(pattern);
 		if (catalog == nullptr)
 			return std::nullopt;
@@ -163,29 +378,144 @@ namespace
 		return result;
 	}
 
+	std::vector<PatternCache::CompiledLocator> compiledLocalPolicy(bool steamUi)
+	{
+		std::vector<PatternCache::CompiledLocator> result;
+		for (const Pattern_t* pattern : Patterns::patterns())
+		{
+			if ((pattern->module == &g_modSteamUI) != steamUi)
+				continue;
+			result.push_back({pattern->symbol, !pattern->optional});
+		}
+		return result;
+	}
+
 	void loadActiveCatalogs()
 	{
-		g_steamClientCatalog = loadCatalog("steamclient", "steamclient.so", g_modSteamClient);
-		g_steamUiCatalog = loadCatalog("steamui", "steamui.so", g_modSteamUI);
+		g_steamClientLocal = loadLocalCatalog(
+			"steamclient", "steamclient.so", g_modSteamClient
+		);
+		g_steamUiLocal = loadLocalCatalog("steamui", "steamui.so", g_modSteamUI);
+		g_steamClientCatalog.reset();
+		g_steamUiCatalog.reset();
 
 		const auto clientPolicy = compiledPolicy(false);
+		const auto localClientPolicy = compiledLocalPolicy(false);
+		if (g_steamClientLocal.catalog
+		    && !PatternCache::policyMatches(g_steamClientLocal.catalog.value(), localClientPolicy))
+		{
+			g_pLog->warn("Local pattern cache for steamclient changed compiled locator policy; ignoring it\n");
+			g_steamClientLocal.catalog.reset();
+			g_steamClientLocal.writeEligible = true;
+			g_steamClientLocal.dirty = true;
+		}
+		const auto uiPolicy = compiledPolicy(true);
+		const auto localUiPolicy = compiledLocalPolicy(true);
+		if (g_steamUiLocal.catalog
+		    && !PatternCache::policyMatches(g_steamUiLocal.catalog.value(), localUiPolicy))
+		{
+			g_pLog->warn("Local pattern cache for steamui changed compiled locator policy; ignoring it\n");
+			g_steamUiLocal.catalog.reset();
+			g_steamUiLocal.writeEligible = true;
+			g_steamUiLocal.dirty = true;
+		}
+
+		// The local catalog is attempted before SHA-256 attestation.  If it is
+		// absent or disabled, retain the existing signed remote catalog path;
+		// otherwise a warm boot does no full-module hashing at all.
+		if (!g_steamClientLocal.catalog)
+			g_steamClientCatalog = loadCatalog("steamclient", "steamclient.so", g_modSteamClient);
+		if (!g_steamUiLocal.catalog)
+			g_steamUiCatalog = loadCatalog("steamui", "steamui.so", g_modSteamUI);
+
 		if (g_steamClientCatalog && !g_steamClientCatalog->validatePolicy(clientPolicy))
 		{
 			g_pLog->warn("Pattern catalog for steamclient changed compiled locator policy; ignoring it\n");
 			g_steamClientCatalog.reset();
 		}
-		const auto uiPolicy = compiledPolicy(true);
 		if (g_steamUiCatalog && !g_steamUiCatalog->validatePolicy(uiPolicy))
 		{
 			g_pLog->warn("Pattern catalog for steamui changed compiled locator policy; ignoring it\n");
 			g_steamUiCatalog.reset();
 		}
+		if (g_steamClientLocal.catalog)
+			g_pLog->info("Pattern cache: loaded steamclient local catalog\n");
+		if (g_steamUiLocal.catalog)
+			g_pLog->info("Pattern cache: loaded steamui local catalog\n");
 		if (g_steamClientCatalog)
 			g_pLog->info("Pattern catalog: loaded steamclient revision %llu\n",
 			             static_cast<unsigned long long>(g_steamClientCatalog->revision()));
 		if (g_steamUiCatalog)
 			g_pLog->info("Pattern catalog: loaded steamui revision %llu\n",
 			             static_cast<unsigned long long>(g_steamUiCatalog->revision()));
+	}
+
+	std::optional<PatternCache::Catalog> buildLocalCatalog(bool steamUi)
+	{
+		LocalCatalogState& state = steamUi ? g_steamUiLocal : g_steamClientLocal;
+		if (!state.identity)
+			return std::nullopt;
+		const lm_module_t& module = steamUi ? g_modSteamUI : g_modSteamClient;
+		PatternCache::Catalog result {*state.identity, {}};
+		for (const Pattern_t* pattern : Patterns::patterns())
+		{
+			if ((pattern->module == &g_modSteamUI) != steamUi)
+				continue;
+			if (pattern->address == LM_ADDRESS_BAD || pattern->matchAddress == LM_ADDRESS_BAD)
+			{
+				if (!pattern->optional)
+					return std::nullopt;
+				continue;
+			}
+			if (pattern->address < module.base || pattern->matchAddress < module.base
+			    || pattern->address >= module.end || pattern->matchAddress >= module.end)
+				return std::nullopt;
+			const lm_address_t targetRva = pattern->address - module.base;
+			const lm_address_t matchRva = pattern->matchAddress - module.base;
+			if (targetRva >= module.size || matchRva >= module.size)
+				return std::nullopt;
+			result.locators.push_back(
+				{
+					pattern->symbol,
+					static_cast<std::uint64_t>(targetRva),
+					static_cast<std::uint64_t>(matchRva),
+					pattern->pattern,
+					followModeName(pattern->followMode),
+					!pattern->optional,
+				}
+			);
+		}
+		return result.locators.empty() ? std::nullopt : std::optional<PatternCache::Catalog>(std::move(result));
+	}
+
+	void writeLocalCatalog(bool steamUi)
+	{
+		LocalCatalogState& state = steamUi ? g_steamUiLocal : g_steamClientLocal;
+		if ((!state.writeEligible && !state.dirty)
+		    || (steamUi ? g_steamUiCatalog.has_value() : g_steamClientCatalog.has_value()))
+			return;
+		const auto root = patternRoot();
+		const auto catalog = buildLocalCatalog(steamUi);
+		if (!root || !catalog)
+			return;
+		const std::string body = PatternCache::serialize(*catalog);
+		if (body.empty())
+			return;
+		if (PatternCache::writeAtomic(
+			localCatalogPath(*root, catalog->identity), body
+		))
+		{
+			g_pLog->info("Pattern cache: wrote %s local catalog (%zu locators)\n",
+			             steamUi ? "steamui" : "steamclient", catalog->locators.size());
+			state.writeEligible = false;
+			state.dirty = false;
+		}
+	}
+
+	void writeLocalCatalogs()
+	{
+		writeLocalCatalog(false);
+		writeLocalCatalog(true);
 	}
 }
 
@@ -214,17 +544,22 @@ Pattern_t::Pattern_t(const char* name, const char* pattern,
 bool Pattern_t::find()
 {
 	lm_module_t& targetModule = module ? *module : g_modSteamClient;
-	if (const auto trusted = catalogAddress(*this, true))
+	matchAddress = LM_ADDRESS_BAD;
+	lm_address_t cachedMatch = LM_ADDRESS_BAD;
+	if (const auto trusted = catalogAddress(*this, true, &cachedMatch))
 	{
 		address = *trusted;
+		matchAddress = cachedMatch;
 	}
 	else
 	{
-		address = MemHlp::searchSignature
+		const auto resolved = MemHlp::searchSignatureDetailed
 		(
 			name.c_str(), pattern.c_str(), targetModule, followMode,
 			prologue.empty() ? nullptr : prologue.data(), prologue.size()
 		);
+		matchAddress = resolved.match;
+		address = resolved.target;
 	}
 	const bool resolved = address != LM_ADDRESS_BAD;
 
@@ -444,6 +779,8 @@ bool Patterns::init()
 		}
 	}
 
+	if (found)
+		writeLocalCatalogs();
 	return found;
 }
 

@@ -2,6 +2,8 @@
 #include "depotkey.hpp"
 
 #include "depotkey_scope.hpp"
+#include "depotkey_import.hpp"
+#include "depotkey_index.hpp"
 
 #include "../config.hpp"
 #include "../globals.hpp"
@@ -33,12 +35,13 @@ namespace
 {
 
 std::mutex g_cacheMu;
-std::map<uint32_t, SavedKey> g_keyMap;
+DepotKey::LazyIndex<uint32_t, SavedKey> g_keyIndex;
 
 std::mutex g_pendingMu;
 std::map<uint32_t /*depotId*/, uint32_t /*appId*/> g_pendingReqs;
 
 bool g_startupDone = false;
+LuaScriptImportGate g_importGate;
 
 std::string hexToBytes(const std::string& hex)
 {
@@ -85,6 +88,55 @@ std::string findSteamRoot()
 	return {};
 }
 
+bool parseCachedKeyFile(const std::filesystem::path& path, SavedKey& out)
+{
+	try
+	{
+		auto node = YAML::LoadFile(path.string());
+		if (!node["appId"] || !node["depotId"] || !node["key"])
+			return false;
+		out = {};
+		out.appId = node["appId"].as<uint32_t>();
+		out.depotId = node["depotId"].as<uint32_t>();
+		out.key = std::string(base64::from_base64(node["key"].as<std::string>()));
+		if (node["managed"]) out.managed = node["managed"].as<bool>();
+		return out.depotId != 0;
+	}
+	catch (const std::exception& e)
+	{
+		g_pLog->debug("DepotKey: failed to load %s: %s\n",
+		              path.c_str(), e.what());
+		return false;
+	}
+}
+
+// Caller holds g_cacheMu.  The catalog is deliberately loaded lazily: most
+// boots never need a depot key before the importer, and one directory walk
+// plus one YAML parse per file is cheaper than reloading the same file for
+// every Lua-script match.
+void loadKeyIndexLocked()
+{
+	g_keyIndex.loadOnce([](auto& entries) {
+		const auto dir = getKeyDir();
+		std::error_code ec;
+		if (!std::filesystem::is_directory(dir, ec) || ec) return;
+
+		static const std::regex fileRe("depotkey_(\\d+)\\.yaml");
+		std::filesystem::directory_iterator it(dir, ec);
+		const std::filesystem::directory_iterator end;
+		for (; it != end && !ec; it.increment(ec))
+		{
+			if (!it->is_regular_file()) continue;
+			const auto name = it->path().filename().string();
+			if (!std::regex_match(name, fileRe)) continue;
+
+			SavedKey key;
+			if (parseCachedKeyFile(it->path(), key))
+				entries[key.depotId] = std::move(key);
+		}
+	});
+}
+
 } // namespace
 
 
@@ -110,36 +162,10 @@ std::string getKeyPath(uint32_t depotId)
 
 SavedKey getCachedKey(uint32_t depotId)
 {
-	{
-		std::lock_guard<std::mutex> lk(g_cacheMu);
-		auto it = g_keyMap.find(depotId);
-		if (it != g_keyMap.end()) return it->second;
-	}
-
-	SavedKey k;
-	const auto path = getKeyPath(depotId);
-	if (!std::filesystem::exists(path.c_str())) return k;
-
-	try
-	{
-		auto node = YAML::LoadFile(path);
-		k.appId = node["appId"].as<uint32_t>();
-		k.depotId = node["depotId"].as<uint32_t>();
-		k.key = std::string(base64::from_base64(node["key"].as<std::string>()));
-		// Legacy catalog files (pre managed-tracking) lack the field; a
-		// missing flag means "observed" (the safe default — Steam handles
-		// it).  Lua re-import at startup upgrades genuine LuaTools depots.
-		if (node["managed"]) k.managed = node["managed"].as<bool>();
-	}
-	catch (const std::exception& e)
-	{
-		g_pLog->debug("DepotKey: failed to load %s: %s\n", path.c_str(), e.what());
-		return {};
-	}
-
 	std::lock_guard<std::mutex> lk(g_cacheMu);
-	g_keyMap[depotId] = k;
-	return k;
+	loadKeyIndexLocked();
+	const auto* cached = g_keyIndex.find(depotId);
+	return cached ? *cached : SavedKey{};
 }
 
 bool saveKeyToCache(uint32_t appId, uint32_t depotId, const std::string& key, bool managed)
@@ -151,21 +177,12 @@ bool saveKeyToCache(uint32_t appId, uint32_t depotId, const std::string& key, bo
 		return false;
 	}
 
-	SavedKey existing;
 	const auto path = getKeyPath(depotId);
-	bool fileExists = std::filesystem::exists(path.c_str());
-	if (fileExists)
-	{
-		try
-		{
-			auto node = YAML::LoadFile(path);
-			existing.appId = node["appId"].as<uint32_t>();
-			existing.depotId = node["depotId"].as<uint32_t>();
-			existing.key = std::string(base64::from_base64(node["key"].as<std::string>()));
-			if (node["managed"]) existing.managed = node["managed"].as<bool>();
-		}
-		catch (...) { existing = {}; }
-	}
+	std::lock_guard<std::mutex> lk(g_cacheMu);
+	loadKeyIndexLocked();
+
+	SavedKey existing;
+	if (const auto* cached = g_keyIndex.find(depotId)) existing = *cached;
 
 	uint32_t finalAppId = appId ? appId : existing.appId;
 	// managed is sticky: a passive re-observation must never downgrade a
@@ -174,8 +191,6 @@ bool saveKeyToCache(uint32_t appId, uint32_t depotId, const std::string& key, bo
 	if (existing.depotId == depotId && existing.key == key
 	    && existing.appId == finalAppId && existing.managed == finalManaged)
 	{
-		std::lock_guard<std::mutex> lk(g_cacheMu);
-		g_keyMap[depotId] = existing;
 		return true;
 	}
 
@@ -191,23 +206,23 @@ bool saveKeyToCache(uint32_t appId, uint32_t depotId, const std::string& key, bo
 	node << YAML::Value << finalManaged;
 	node << YAML::EndMap;
 
-	std::ofstream ofs(path.c_str(), std::ios::out);
+	std::ofstream ofs(path.c_str(), std::ios::out | std::ios::trunc);
 	if (!ofs.is_open())
 	{
 		g_pLog->debug("DepotKey: cannot write %s\n", path.c_str());
 		return false;
 	}
 	ofs.write(node.c_str(), node.size());
+	if (!ofs.good()) return false;
 
 	g_pLog->infoOnce("DepotKey: cached key for app=%u depot=%u\n", finalAppId, depotId);
 
-	SavedKey k;
-	k.appId = finalAppId;
-	k.depotId = depotId;
-	k.key = key;
-	k.managed = finalManaged;
-	std::lock_guard<std::mutex> lk(g_cacheMu);
-	g_keyMap[depotId] = k;
+	SavedKey saved;
+	saved.appId = finalAppId;
+	saved.depotId = depotId;
+	saved.key = key;
+	saved.managed = finalManaged;
+	g_keyIndex.upsert(depotId, std::move(saved));
 	return true;
 }
 
@@ -223,33 +238,14 @@ std::vector<uint32_t> managedDepotsForApp(uint32_t appId)
 	std::vector<uint32_t> out;
 	if (appId == 0) return out;
 
-	const auto dir = getKeyDir();
-	std::error_code ec;
-	if (!std::filesystem::exists(dir, ec)) return out;
-
-	std::set<uint32_t> seen;
-	for (const auto& entry : std::filesystem::directory_iterator(dir, ec))
+	std::lock_guard<std::mutex> lk(g_cacheMu);
+	loadKeyIndexLocked();
+	for (const auto& [depotId, key] : g_keyIndex.entries())
 	{
-		if (ec) break;
-		const auto& p = entry.path();
-		const auto name = p.filename().string();
-		if (name.rfind("depotkey_", 0) != 0 || p.extension() != ".yaml")
-			continue;
-
-		try
-		{
-			auto node = YAML::LoadFile(p.string());
-			if (!node["appId"] || !node["depotId"]) continue;
-			if (node["appId"].as<uint32_t>() != appId) continue;
-			// Only MANAGED (Lua-injected) depots: an observed owned-game /
-			// runtime key must never be synthesized into an app's appinfo.
-			const bool managed = node["managed"] && node["managed"].as<bool>();
-			if (!managed) continue;
-			const uint32_t depotId = node["depotId"].as<uint32_t>();
-			if (depotId && seen.insert(depotId).second)
-				out.push_back(depotId);
-		}
-		catch (...) { continue; }
+		if (key.appId != appId || !key.managed || depotId == 0) continue;
+		// Only MANAGED (Lua-injected) depots: an observed owned-game /
+		// runtime key must never be synthesized into an app's appinfo.
+		out.push_back(depotId);
 	}
 	return out;
 }
@@ -257,14 +253,17 @@ std::vector<uint32_t> managedDepotsForApp(uint32_t appId)
 
 void importLuaScripts()
 {
-	const auto steamRoot = findSteamRoot();
-	if (steamRoot.empty()) return;
+	std::string stplug;
+	g_importGate.run(
+		[&]() {
+			const auto steamRoot = findSteamRoot();
+			if (steamRoot.empty()) return false;
 
-	const auto stplug = steamRoot + "/config/stplug-in";
-	if (!std::filesystem::exists(stplug.c_str())) return;
-
-
-	static const std::regex addappidWithKeyRe(
+			stplug = steamRoot + "/config/stplug-in";
+			return std::filesystem::exists(stplug.c_str());
+		},
+		[&]() {
+			static const std::regex addappidWithKeyRe(
 		"addappid\\s*\\(\\s*(\\d+)\\s*,\\s*\\d+\\s*,\\s*\"([0-9A-Fa-f]{64})\"\\s*\\)"
 	);
 
@@ -313,6 +312,7 @@ void importLuaScripts()
 		g_pLog->infoOnce("DepotKey: imported %d Lua-script depot keys from %s\n",
 		             imported, stplug.c_str());
 	}
+		});
 }
 
 

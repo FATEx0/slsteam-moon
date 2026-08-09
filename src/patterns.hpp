@@ -31,7 +31,10 @@ public:
 	// than disabling SLSsteam entirely.
 	bool optional = false;
 
-	lm_address_t address;
+	lm_address_t address = LM_ADDRESS_BAD;
+	// The raw signature match is kept separately from the followed target so a
+	// local cache can revalidate the exact bytes that produced the target RVA.
+	lm_address_t matchAddress = LM_ADDRESS_BAD;
 	lm_module_t* const module;
 
 	Pattern_t(const char* name, const char* pattern,

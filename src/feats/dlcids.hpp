@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <charconv>
 #include <cstdint>
 #include <string>
 #include <unordered_set>
@@ -73,14 +74,66 @@ inline bool nextQuotedValueFor(const std::string& s, const std::string& key,
 
 } // namespace detail
 
-// Parse `wire` (a provisioned appinfo wire-text VDF) and return every
-// DLC appid it advertises via `extended.listofdlc` and any
-// `depots.<id>.dlcappid`, deduplicated and excluding `baseAppId`.
-inline std::vector<uint32_t> extractDlcAppIds(const std::string& wire,
-                                              uint32_t baseAppId)
+// Keep the two appinfo DLC sources separate.  Depot-tagged ids are
+// planner-critical; advertised ids are storefront metadata and need an
+// additional content check before they enter package 0.
+struct DlcAppIds
 {
-	std::vector<uint32_t> out;
-	std::unordered_set<uint32_t> seen;
+	std::vector<uint32_t> depotTagged;
+	std::vector<uint32_t> advertised;
+};
+
+// Parse the depot id from a valid depotcache/ManifestStore filename.  The
+// artifact stores use <depot>_<gid>.manifest; keep this parser pure so the
+// startup artifact index can be tested without Steam or filesystem state.
+inline bool depotIdFromManifestName(const std::string& name,
+                                    uint32_t& depotIdOut)
+{
+	depotIdOut = 0;
+	constexpr const char* kSuffix = ".manifest";
+	const std::size_t underscore = name.find('_');
+	if (underscore == std::string::npos || underscore == 0 ||
+	    name.size() <= underscore + 1 + std::char_traits<char>::length(kSuffix) ||
+	    name.compare(name.size() - std::char_traits<char>::length(kSuffix),
+	                 std::char_traits<char>::length(kSuffix), kSuffix) != 0)
+	{
+		return false;
+	}
+
+	uint32_t parsedDepot = 0;
+	const auto first = name.data();
+	const auto last = first + underscore;
+	const auto depotResult = std::from_chars(first, last, parsedDepot);
+	if (depotResult.ec != std::errc{} || depotResult.ptr != last ||
+	    parsedDepot == 0)
+	{
+		return false;
+	}
+
+	const std::size_t suffixLength = std::char_traits<char>::length(kSuffix);
+	const auto gidFirst = name.data() + underscore + 1;
+	const auto gidLast = name.data() + name.size() - suffixLength;
+	uint64_t parsedGid = 0;
+	const auto gidResult = std::from_chars(gidFirst, gidLast, parsedGid);
+	if (gidResult.ec != std::errc{} || gidResult.ptr != gidLast ||
+	    parsedGid == 0)
+	{
+		return false;
+	}
+
+	depotIdOut = parsedDepot;
+	return true;
+}
+
+// Parse `wire` (a provisioned appinfo wire-text VDF) and return DLC appids
+// grouped by their source.  Each source is deduplicated independently and
+// excludes `baseAppId`.
+inline DlcAppIds extractDlcAppIdsBySource(const std::string& wire,
+                                          uint32_t baseAppId)
+{
+	DlcAppIds out;
+	std::unordered_set<uint32_t> advertisedSeen;
+	std::unordered_set<uint32_t> depotTaggedSeen;
 	if (wire.empty()) return out;
 
 	// Source A: extended.listofdlc (one comma-separated value; appears
@@ -95,7 +148,8 @@ inline std::vector<uint32_t> extractDlcAppIds(const std::string& wire,
 			{
 				std::size_t j = value.find(',', i);
 				if (j == std::string::npos) j = value.size();
-				detail::addDlcId(out, seen, value.substr(i, j - i), baseAppId);
+				detail::addDlcId(out.advertised, advertisedSeen,
+				                 value.substr(i, j - i), baseAppId);
 				i = j + 1;
 			}
 		}
@@ -107,10 +161,86 @@ inline std::vector<uint32_t> extractDlcAppIds(const std::string& wire,
 		std::string value;
 		while (detail::nextQuotedValueFor(wire, "dlcappid", pos, value, pos))
 		{
-			detail::addDlcId(out, seen, value, baseAppId);
+			detail::addDlcId(out.depotTagged, depotTaggedSeen, value, baseAppId);
 		}
 	}
 
+	return out;
+}
+
+// Parse `wire` and return every DLC appid it advertises via
+// `extended.listofdlc` and any `depots.<id>.dlcappid`, deduplicated and
+// excluding `baseAppId`.  Keep this compatibility wrapper so existing
+// callers/tests retain the original merged behavior.
+inline std::vector<uint32_t> extractDlcAppIds(const std::string& wire,
+                                              uint32_t baseAppId)
+{
+	const DlcAppIds grouped = extractDlcAppIdsBySource(wire, baseAppId);
+	std::vector<uint32_t> out;
+	std::unordered_set<uint32_t> seen;
+	for (uint32_t id : grouped.advertised)
+	{
+		if (seen.insert(id).second) out.push_back(id);
+	}
+	for (uint32_t id : grouped.depotTagged)
+	{
+		if (seen.insert(id).second) out.push_back(id);
+	}
+	return out;
+}
+
+// Select the appids for the two consumers.  `package0` is the narrow set
+// that must reach Steam's planner; `appDlc` is the broader local set used by
+// launch-time checks such as legacy-CD-key suppression.
+struct DlcInjectionIds
+{
+	std::vector<uint32_t> package0;
+	std::vector<uint32_t> appDlc;
+};
+
+inline bool hasDepotsInDlc(const std::string& wire)
+{
+	std::size_t pos = 0;
+	std::string value;
+	while (detail::nextQuotedValueFor(wire, "hasdepotsindlc", pos, value, pos))
+	{
+		return value == "1" || value == "yes" || value == "true";
+	}
+	return false;
+}
+
+inline void appendUnique(std::vector<uint32_t>& out,
+                         std::unordered_set<uint32_t>& seen, uint32_t id)
+{
+	if (id != 0 && seen.insert(id).second) out.push_back(id);
+}
+
+// `advertisedWithContent` contains advertised DLC ids for which the caller
+// found own content in the base appinfo or on disk.  Depot-tagged ids always
+// enter package 0; other advertised ids enter it only when content-backed,
+// unless the compatibility switch is enabled.
+inline DlcInjectionIds selectDlcInjectionIds(
+	const DlcAppIds& sources,
+	const std::unordered_set<uint32_t>& advertisedWithContent,
+	bool injectAllAdvertised)
+{
+	DlcInjectionIds out;
+	std::unordered_set<uint32_t> packageSeen;
+	std::unordered_set<uint32_t> appSeen;
+
+	for (uint32_t id : sources.depotTagged)
+	{
+		appendUnique(out.package0, packageSeen, id);
+		appendUnique(out.appDlc, appSeen, id);
+	}
+	for (uint32_t id : sources.advertised)
+	{
+		appendUnique(out.appDlc, appSeen, id);
+		if (injectAllAdvertised || advertisedWithContent.count(id) != 0)
+		{
+			appendUnique(out.package0, packageSeen, id);
+		}
+	}
 	return out;
 }
 

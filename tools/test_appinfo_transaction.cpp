@@ -1,5 +1,6 @@
 // Integration regression test for the appinfo.vdf transaction boundary.
 
+#include "../src/config.hpp"
 #include "../src/feats/appinfo_vdf.hpp"
 #include "../src/log.hpp"
 #include "../src/utils/atomic_file.hpp"
@@ -14,6 +15,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <unistd.h>
 
@@ -105,12 +107,29 @@ int main()
 	g_pLog = std::unique_ptr<CLog>(new CLog((root + "/test.log").c_str()));
 
 	createEmptyAppInfo(appinfo);
+	g_config.managedAppIds.set(std::unordered_set<uint32_t>{1001, 1002});
 	const auto first = wireFor(456);
 	const auto second = wireFor(789);
+	const auto orphan = wireFor(999);
 	writeCache(cacheDir, 1001, 10, first);
 	writeCache(cacheDir, 1002, 20, second);
+	writeCache(cacheDir, 1003, 30, orphan);
 
 	assert(AppInfoVdf::injectAllCached(appinfo) == 2);
+	assert(!std::filesystem::exists(cacheDir + "/picsbuffer_1003.bin"));
+	assert(!std::filesystem::exists(cacheDir + "/picsbuffer_1003.yaml"));
+	bool orphanQuarantined = false;
+	for (const auto& entry : std::filesystem::directory_iterator(cacheDir))
+	{
+		const auto name = entry.path().filename().string();
+		if (name.rfind("picsbuffer_1003.", 0) == 0 &&
+		    name.find(".orphaned.") != std::string::npos)
+		{
+			orphanQuarantined = true;
+			break;
+		}
+	}
+	assert(orphanQuarantined);
 	const auto published = readAll(appinfo);
 	assert(!published.empty());
 	assert(std::filesystem::exists(appinfo + ".slssteam-previous"));
@@ -119,11 +138,14 @@ int main()
 	assert(AppInfoVdf::injectAllCached(appinfo) == 2);
 	assert(readAll(appinfo) == published);
 
-	// Simulate a torn/corrupt v41 file.  The previous good snapshot is restored
-	// and the cache transaction can continue without exposing the bad bytes.
+	// Simulate a torn/corrupt v41 file.  Keep the published snapshot as the
+	// rollback baseline so recovery is tested against a known-good file.
+	std::filesystem::copy_file(appinfo, appinfo + ".slssteam-previous",
+	                           std::filesystem::copy_options::overwrite_existing);
 	{
 		std::ofstream out(appinfo, std::ios::binary | std::ios::trunc);
-		out << "\x29\x44\x56\x07broken";
+		out.write("\x29\x44\x56\x07", 4);
+		out << "broken";
 	}
 	assert(AppInfoVdf::injectAllCached(appinfo) == 2);
 	assert(readAll(appinfo) == published);

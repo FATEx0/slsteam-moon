@@ -39,9 +39,40 @@ int main()
 {
 	using AppInfoProvision::cache::CacheUse;
 	using AppInfoProvision::cache::CacheRecordFacts;
+	using AppInfoProvision::cache::CacheValidationKey;
 	using AppInfoProvision::cache::chooseCacheUse;
 	using AppInfoProvision::cache::isBufferReusable;
 	using AppInfoProvision::cache::isCacheRecordValid;
+	using AppInfoProvision::cache::shouldValidateCache;
+	using AppInfoProvision::cache::wireSizeMatches;
+
+	const CacheValidationKey fileIdentity{
+	    .appId = 420530,
+	    .mtimeSecs = 1'000'000,
+	    .mtimeNsecs = 123'000'000,
+	    .size = 8192,
+	    .inode = 7001,
+	};
+	CHECK(fileIdentity == fileIdentity,
+	      "unchanged appinfo file identity reuses its validation result");
+	{
+		auto changed = fileIdentity;
+		++changed.mtimeNsecs;
+		CHECK(!(changed == fileIdentity),
+		      "nanosecond mtime change invalidates same-second cache identity");
+	}
+	{
+		auto changed = fileIdentity;
+		++changed.inode;
+		CHECK(!(changed == fileIdentity),
+		      "replacement inode invalidates same-size cache identity");
+	}
+	{
+		auto changed = fileIdentity;
+		++changed.size;
+		CHECK(!(changed == fileIdentity),
+		      "size change invalidates cache identity");
+	}
 
 	const long long ttl = 300; // 5 minutes
 	const long long now = 1'000'000;
@@ -89,6 +120,21 @@ int main()
 	      "stale valid cache is accepted after refresh becomes unavailable");
 	CHECK(chooseCacheUse(false, false, true) == CacheUse::None,
 	      "invalid cache is never accepted as an offline fallback");
+
+	// A stale cache must not pay the expensive YAML/SHA-1/VDF validation
+	// while a live refresh is available. It is validated only if the refresh
+	// path is unavailable and the stale buffer may actually be served.
+	CHECK(!shouldValidateCache(/*cacheFresh=*/false,
+	                           /*refreshUnavailable=*/false),
+	      "stale online buffer bypasses expensive validation");
+	CHECK(shouldValidateCache(false, true),
+	      "stale buffer is validated for offline fallback");
+	CHECK(shouldValidateCache(true, false),
+	      "fresh buffer is validated before it is served");
+	CHECK(wireSizeMatches(/*actual=*/8192, /*declared=*/8192),
+	      "matching metadata wire size passes the cheap gate");
+	CHECK(!wireSizeMatches(8191, 8192),
+	      "truncated buffer fails the cheap wire-size gate");
 
 	const CacheRecordFacts validRecord{
 	    .requestedAppId = 420530,

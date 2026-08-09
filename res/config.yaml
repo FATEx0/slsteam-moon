@@ -101,6 +101,14 @@ API: no
 #NOT using CloudRedirect, to avoid a doomed cloud sync that Steam rejects.
 DisableCloud: no
 
+# Inject every storefront-advertised DLC into package 0. Keep disabled by
+# default; content-backed DLC is still injected automatically.
+InjectAllAdvertisedDlc: no
+
+# Local pattern cache keyed by GNU build-id, module size, and mtime. Each
+# cached signature is rechecked before an address is accepted.
+PatternCache: yes
+
 #Changes your account's E-Mail clientsided. Leave blank to disable
 FakeEmail: ""
 

@@ -8,10 +8,12 @@
 #include "ownerwork.hpp"
 #include "yaml-cpp/yaml.h"
 
+#include "feats/appinfo_provision.hpp"
 #include "feats/depotkey.hpp"
 #include "config_discovery.hpp"
 #include "feats/manifestid.hpp"
 #include "feats/packagepatch.hpp"
+#include "feats/ticket.hpp"
 
 #include <cerrno>
 #include <cmath>
@@ -253,16 +255,33 @@ static void onFileChange()
 
 	const auto after = g_config.addedAppIds.get();
 
-	// On a newly-seen appid, re-import its Lua keys/pins, inject it into
-	// package 0 and re-broadcast the license update so it can appear without
-	// a Steam restart.  (Runtime live library refresh is still incomplete.)
+	// Removed apps are tombstoned before native cache quarantine. This ordering
+	// prevents a concurrent ticket load/save from repopulating state while the
+	// app's on-disk artifacts are being moved.
+	for (const uint32_t appId : ConfigDiscovery::removedAppIds(before, after))
+	{
+		const bool ticketsForgotten = Ticket::forgetApp(appId);
+		const bool cacheForgotten = AppInfoProvision::forgetApp(appId);
+		g_pLog->info("Config watcher: removed app=%u cache=%s tickets=%s\n",
+		             appId, cacheForgotten ? "cleared" : "partial",
+		             ticketsForgotten ? "cleared" : "rejected");
+	}
+
+	// Re-scan manifest pins for every watcher event, not only when the app-id
+	// set changes: editing an existing <appid>.lua can change its depot/GID
+	// relations without changing AdditionalApps membership.
+	ManifestId::importLuaScripts();
+
+	// On a newly-seen appid, inject it into package 0 and re-broadcast the
+	// license update so it can appear without a Steam restart. (Runtime live
+	// library refresh is still incomplete.)
 	bool hasNewApp = false;
 	for (uint32_t appId : after)
 	{
 		if (!before.contains(appId))
 		{
 			hasNewApp = true;
-			break;
+			Ticket::restoreApp(appId);
 		}
 	}
 
@@ -271,7 +290,6 @@ static void onFileChange()
 		// Local (non-Steam) work stays on this thread, unchanged and in the
 		// same order as before.
 		DepotKey::importLuaScripts();
-		ManifestId::importLuaScripts();
 
 		// Steam-owned work: same two calls, same order, same inputs, but
 		// executed on the owner IPC thread. This does NOT wait for the owner —
@@ -404,28 +422,27 @@ bool CConfig::loadSettings()
 	fakeEmail = getSetting<std::string>(node, "FakeEmail", "");
 	fakeWalletBalance = getSetting<int32_t>(node, "FakeWalletBalance", 0);
 	disableCloud = getSetting<bool>(node, "DisableCloud", true);
+	injectAllAdvertisedDlc = getSetting<bool>(node, "InjectAllAdvertisedDlc", false);
 	achievements = getSetting<bool>(node, "Achievements", true);
 	achievementOwnerId = getSetting<uint64_t>(node, "AchievementOwnerId", 76561198028121353ULL);
 	extendedLogging = getSetting<bool>(node, "ExtendedLogging", false);
+	patternCache = getSetting<bool>(node, "PatternCache", true);
 	logLevel = getSetting<unsigned int>(node, "LogLevel", 2);
 
 	//TODO: Create smart logging function to log them automatically via getSetting
-	g_pLog->info("DisableFamilyShareLock: %i\n", disableFamilyLock.get());
-	g_pLog->info("DisableParentalRestrictions: %i\n", disableParentalRestrictions.get());
-	g_pLog->info("UseWhitelist: %i\n", useWhiteList.get());
-	g_pLog->info("AutoFilterList: %i\n", automaticFilter.get());
-	g_pLog->info("PlayNotOwnedGames: %i\n", playNotOwnedGames.get());
-	g_pLog->info("SafeMode: %i\n", safeMode.get());
-	g_pLog->info("Notifications: %i\n", notifications.get());
-	g_pLog->info("WarnHashMissmatch: %i\n", warnHashMissmatch.get());
-	g_pLog->info("NotifyInit: %i\n", notifyInit.get());
-	g_pLog->info("API: %i\n", api.get());
-	g_pLog->info("FakeEmail: %s\n", fakeEmail.get().c_str());
-	g_pLog->info("FakeWalletBalance: %i\n", fakeWalletBalance.get());
-	g_pLog->info("DisableCloud: %i\n", disableCloud.get());
-	g_pLog->info("Achievements: %i\n", achievements.get());
-	g_pLog->info("ExtendedLogging: %i\n", extendedLogging.get());
-	g_pLog->info("LogLevel: %i\n", logLevel.get());
+	g_pLog->info(
+		"Config: DisableFamilyShareLock=%i DisableParentalRestrictions=%i "
+		"UseWhitelist=%i AutoFilterList=%i PlayNotOwnedGames=%i SafeMode=%i "
+		"Notifications=%i WarnHashMissmatch=%i NotifyInit=%i API=%i "
+		"FakeEmail=%s FakeWalletBalance=%i DisableCloud=%i "
+		"InjectAllAdvertisedDlc=%i Achievements=%i PatternCache=%i "
+		"ExtendedLogging=%i LogLevel=%u\n",
+		disableFamilyLock.get(), disableParentalRestrictions.get(),
+		useWhiteList.get(), automaticFilter.get(), playNotOwnedGames.get(),
+		safeMode.get(), notifications.get(), warnHashMissmatch.get(),
+		notifyInit.get(), api.get(), fakeEmail.get().c_str(),
+		fakeWalletBalance.get(), disableCloud.get(), injectAllAdvertisedDlc.get(),
+		achievements.get(), patternCache.get(), extendedLogging.get(), logLevel.get());
 
 	appIds = getList<uint32_t>(node, "AppIds");
 

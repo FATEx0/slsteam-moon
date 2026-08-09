@@ -65,9 +65,10 @@ namespace DepotKey
 	bool isManagedDepot(uint32_t depotId);
 
 	// Every MANAGED (Lua-injected) depot whose catalog entry records the
-	// given appId.  Walks the on-disk depotkey cache.  Used to rebuild a
-	// token-locked app's appinfo depots from data we already hold when its
-	// product-info comes back without a `depots` block (manifestsynth).
+	// given appId.  The catalog is loaded lazily into an in-memory index and
+	// parsed at most once per process.  Used to rebuild a token-locked app's
+	// appinfo depots from data we already hold when its product-info comes
+	// back without a `depots` block (manifestsynth).
 	// Returns deduped depot ids; empty on any error / no $HOME.
 	std::vector<uint32_t> managedDepotsForApp(uint32_t appId);
 

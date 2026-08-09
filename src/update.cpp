@@ -8,6 +8,7 @@
 #include "version.hpp"
 
 #include "update_cache.hpp"
+#include "thread_start.hpp"
 
 #include <sys/stat.h>
 
@@ -29,8 +30,9 @@ namespace
 	// load()-time verifySafeModeHash() reader never race.
 	std::mutex g_hashMapMtx;
 
-	// Ensures we only ever spawn one background refresh worker.
-	std::atomic<bool> g_refreshStarted{false};
+	// Ensures only one refresh generation is active; failed generations are
+	// released only after their detached worker exits.
+	Updater::cache::RefreshGate g_refreshGate;
 
 	constexpr const char* kUpdatesUrl =
 	    "https://raw.githubusercontent.com/AceSLS/SLSsteam/refs/heads/main/res/updates.yaml";
@@ -161,8 +163,7 @@ void Updater::refreshInBackgroundIfStale()
 	// Idempotent: only one refresh per process.  MUST be called from a
 	// real Steam worker thread (e.g. the PICS recv path), never from the
 	// LD_AUDIT load()/setup() path — spawning a thread there crashes Steam.
-	bool expected = false;
-	if (!g_refreshStarted.compare_exchange_strong(expected, true))
+	if (!g_refreshGate.tryStart())
 	{
 		return;
 	}
@@ -172,16 +173,51 @@ void Updater::refreshInBackgroundIfStale()
 	const long long now = static_cast<long long>(std::time(nullptr));
 	if (cache::isCacheFresh(mtime >= 0, mtime, now, ttl))
 	{
+		g_refreshGate.markSucceeded();
+		g_refreshGate.finish();
 		g_pLog->debug("Updater: cache fresh (age<%llds), skipping refresh\n", ttl);
 		return;
 	}
 
-	std::thread([] {
-		if (fetchParseAndStore())
+	const bool started = ThreadStart::startDetached(
+		[]
 		{
-			g_pLog->debug("Updater: background refresh of updates.yaml done\n");
-		}
-	}).detach();
+			ThreadStart::runGuarded(
+				[]
+				{
+					if (fetchParseAndStore())
+					{
+						g_refreshGate.markSucceeded();
+						g_pLog->debug("Updater: background refresh of updates.yaml done\n");
+					}
+					else
+					{
+						g_pLog->debug("Updater: background refresh returned no usable data; will retry\n");
+					}
+				},
+				[]
+				{
+					g_pLog->warn("Updater: background refresh worker failed unexpectedly; will retry\n");
+				},
+				[]
+				{
+					// Release an ordinary-failure generation only after its body
+					// has exited; success leaves the gate one-shot.
+					g_refreshGate.finish();
+				});
+		},
+		[]
+		{
+			g_refreshGate.finish();
+		},
+		[]
+		{
+			g_pLog->warn("Updater: background refresh detach failed; joining worker\n");
+		});
+	if (!started)
+	{
+		g_pLog->warn("Updater: unable to start background refresh; will retry\n");
+	}
 }
 
 std::string Updater::getCacheFilePath()

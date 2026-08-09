@@ -1,0 +1,282 @@
+#include "pattern_cache.hpp"
+#include "pattern_scan.hpp"
+
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace
+{
+	int failures = 0;
+
+	void expect(bool condition, std::string_view message)
+	{
+		if (condition)
+			return;
+		std::cerr << "FAIL: " << message << '\n';
+		++failures;
+	}
+
+	PatternCache::ModuleIdentity identity()
+	{
+		return
+		{
+			"steamclient",
+			"steamclient.so",
+			"abcdef0123456789abcdef0123456789abcdef01",
+			256,
+			123456,
+			789,
+		};
+	}
+
+	std::vector<std::uint8_t> fixtureBytes()
+	{
+		std::vector<std::uint8_t> bytes(256, 0x90);
+		bytes[40] = 0x55;
+		bytes[41] = 0x89;
+		bytes[42] = 0xE5;
+		bytes[100] = 0x8B;
+		bytes[101] = 0x45;
+		bytes[102] = 0x08;
+		return bytes;
+	}
+
+	std::vector<int16_t> patternBytes(std::initializer_list<int16_t> values)
+	{
+		return {values};
+	}
+
+	PatternCache::Catalog coldCatalog(const std::vector<std::uint8_t>& bytes)
+	{
+		const auto first = MemHlp::scanPatternRange(
+			patternBytes({0x55, 0x89, 0xE5}),
+			reinterpret_cast<std::uintptr_t>(bytes.data()),
+			reinterpret_cast<std::uintptr_t>(bytes.data() + bytes.size()),
+			false
+		);
+		const auto second = MemHlp::scanPatternRange(
+			patternBytes({0x8B, 0x45, -1}),
+			reinterpret_cast<std::uintptr_t>(bytes.data()),
+			reinterpret_cast<std::uintptr_t>(bytes.data() + bytes.size()),
+			false
+		);
+		expect(first.matches == 1 && second.matches == 1,
+		       "fixture cold scan resolves every locator once");
+		const auto base = reinterpret_cast<std::uintptr_t>(bytes.data());
+		return
+		{
+			identity(),
+			{
+				{"Patterns::First", first.address - base, first.address - base,
+				 "55 89 E5", "None", true},
+				{"Patterns::Second", second.address - base, second.address - base,
+				 "8B 45 ?", "None", false},
+			},
+		};
+	}
+
+	struct TempDirectory
+	{
+		std::filesystem::path path;
+
+		TempDirectory()
+		{
+			path = std::filesystem::temp_directory_path()
+			       / "slsteam-pattern-cache-test";
+			std::error_code error;
+			std::filesystem::remove_all(path, error);
+			std::filesystem::create_directories(path, error);
+			expect(!error, "temporary cache directory is created");
+		}
+
+		~TempDirectory()
+		{
+			std::error_code error;
+			std::filesystem::remove_all(path, error);
+		}
+	};
+}
+
+int main()
+{
+	const auto bytes = fixtureBytes();
+	const auto expected = identity();
+	const auto catalog = coldCatalog(bytes);
+	const PatternCache::CompiledLocator policy[] =
+	{
+		{"Patterns::First", true},
+		{"Patterns::Second", false},
+	};
+
+	expect(PatternCache::identityMatches(catalog.identity, expected),
+	       "build-id, size, and mtime identity matches exactly");
+	{
+		auto changed = expected;
+		++changed.mtimeNanoseconds;
+		expect(!PatternCache::identityMatches(catalog.identity, changed),
+		       "mtime change invalidates the local identity");
+	}
+	{
+		auto changed = expected;
+		++changed.size;
+		expect(!PatternCache::identityMatches(catalog.identity, changed),
+		       "module size change invalidates the local identity");
+	}
+	{
+		auto changed = expected;
+		changed.gnuBuildId[0] = 'f';
+		expect(!PatternCache::identityMatches(catalog.identity, changed),
+		       "build-id change invalidates the local identity");
+	}
+
+	expect(PatternCache::signatureMatches(
+		"8B 45 ?", std::span<const std::uint8_t>(bytes.data() + 100, 3)),
+		"wildcard signature validates the bytes at a cached match");
+	expect(!PatternCache::signatureMatches(
+		"8B 46 ?", std::span<const std::uint8_t>(bytes.data() + 100, 3)),
+		"fixed signature byte mismatch rejects the cache");
+	expect(!PatternCache::signatureMatches(
+		"8B 45 ?", std::span<const std::uint8_t>(bytes.data() + 100, 2)),
+		"truncated signature bytes reject the cache");
+
+	expect(PatternCache::validate(catalog, expected, policy, bytes),
+	       "all cache locators validate against the fixture");
+	if (const auto first = catalog.entry("Patterns::First"); first != nullptr)
+	{
+		const auto cold = MemHlp::scanPatternRange(
+			patternBytes({0x55, 0x89, 0xE5}),
+			reinterpret_cast<std::uintptr_t>(bytes.data()),
+			reinterpret_cast<std::uintptr_t>(bytes.data() + bytes.size()),
+			false
+		);
+		expect(first->targetRva == cold.address
+		       - reinterpret_cast<std::uintptr_t>(bytes.data()),
+		       "cache-hit first RVA equals the cold-scan RVA");
+		expect(PatternCache::targetRvaMatches(
+			first->followMode, first->matchRva, first->targetRva, first->matchRva),
+		       "cached None target is bound to its matched signature");
+
+		auto mutated = *first;
+		++mutated.targetRva;
+		expect(!PatternCache::targetRvaMatches(
+			mutated.followMode, mutated.matchRva, mutated.targetRva,
+			mutated.matchRva),
+		       "independent target RVA mutation rejects the cache locator");
+	}
+	expect(PatternCache::targetRvaMatches("Relative", 40, 120, 120),
+	       "relative cache target accepts the derived target");
+	expect(!PatternCache::targetRvaMatches("Relative", 40, 121, 120),
+	       "relative target mutation rejects the cache locator");
+	expect(PatternCache::targetRvaMatches("PrologueUpwards", 40, 32, 32),
+	       "prologue cache target accepts the derived target");
+	expect(!PatternCache::targetRvaMatches("PrologueUpwards", 40, 33, 32),
+	       "prologue target mutation rejects the cache locator");
+	if (const auto second = catalog.entry("Patterns::Second"); second != nullptr)
+	{
+		const auto cold = MemHlp::scanPatternRange(
+			patternBytes({0x8B, 0x45, -1}),
+			reinterpret_cast<std::uintptr_t>(bytes.data()),
+			reinterpret_cast<std::uintptr_t>(bytes.data() + bytes.size()),
+			false
+		);
+		expect(second->targetRva == cold.address
+		       - reinterpret_cast<std::uintptr_t>(bytes.data()),
+		       "cache-hit second RVA equals the cold-scan RVA");
+	}
+
+	{
+		auto mutated = bytes;
+		mutated[101] = 0x46;
+		expect(!PatternCache::validate(catalog, expected, policy, mutated),
+		       "one signature mismatch rejects the complete cache hit");
+	}
+	{
+		const PatternCache::CompiledLocator incomplete[] =
+		{
+			{"Patterns::First", true},
+		};
+		expect(!PatternCache::validate(catalog, expected, incomplete, bytes),
+		       "compiled policy mismatch rejects the cache");
+	}
+	{
+		auto incompleteCatalog = catalog;
+		incompleteCatalog.locators.pop_back();
+		const PatternCache::CompiledLocator required[] =
+		{
+			{"Patterns::First", true},
+			{"Patterns::Second", true},
+		};
+		expect(!PatternCache::policyMatches(incompleteCatalog, required),
+		       "a missing required locator rejects the complete cache policy");
+		const PatternCache::CompiledLocator optional[] =
+		{
+			{"Patterns::First", true},
+			{"Patterns::Second", false},
+		};
+		expect(PatternCache::policyMatches(incompleteCatalog, optional),
+		       "a missing optional locator may fall back without invalidating required hits");
+	}
+
+	const std::string serialized = PatternCache::serialize(catalog);
+	expect(!serialized.empty() && serialized.back() == '\n',
+	       "local catalog serialization is newline terminated");
+	std::string parseError;
+	const auto parsed = PatternCache::parse(serialized, &parseError);
+	expect(parsed.has_value() && parseError.empty(),
+	       "local catalog round-trips through the bounded parser");
+	if (!parsed)
+		std::cerr << "parse diagnostic: " << parseError << '\n';
+	if (parsed)
+	{
+		expect(parsed->identity.mtimeSeconds == expected.mtimeSeconds
+		       && parsed->identity.mtimeNanoseconds == expected.mtimeNanoseconds,
+		       "serialized seconds and nanoseconds are retained");
+		expect(parsed->locators.size() == catalog.locators.size(),
+		       "serialized locator count is retained");
+	}
+	{
+		auto oversized = serialized;
+		oversized.append(PatternCache::kMaximumBodySize, 'x');
+		expect(!PatternCache::parse(oversized, &parseError),
+		       "oversized local catalog is rejected before use");
+	}
+
+	{
+		TempDirectory temporary;
+		const auto path = temporary.path / "steamclient.catalog";
+		expect(PatternCache::writeAtomic(path, serialized),
+		       "local catalog is written atomically");
+		const auto loaded = PatternCache::load(path, expected, &parseError);
+		expect(loaded.has_value() && parseError.empty(),
+		       "written local catalog loads with its exact identity");
+		std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);
+		corrupt << "schema=1\n";
+		corrupt.close();
+		expect(!PatternCache::load(path, expected, &parseError),
+		       "truncated local catalog falls back instead of being used");
+	}
+
+	expect(PatternCache::enabled(true, nullptr),
+	       "config enables the local pattern cache by default");
+	expect(!PatternCache::enabled(false, nullptr),
+	       "config kill-switch disables the local pattern cache");
+	expect(!PatternCache::enabled(true, "0"),
+	       "environment kill-switch disables the local pattern cache");
+	expect(!PatternCache::enabled(true, "off"),
+	       "text environment kill-switch disables the local pattern cache");
+	expect(PatternCache::enabled(false, "1"),
+	       "explicit environment enable overrides the config value");
+
+	if (failures != 0)
+	{
+		std::cerr << failures << " pattern cache test(s) failed\n";
+		return 1;
+	}
+	std::cout << "pattern cache tests passed\n";
+	return 0;
+}

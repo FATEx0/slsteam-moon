@@ -41,6 +41,7 @@ static const UserMsg kAll[] = {
 	UserMsg::GamePreparationFailed,
 	UserMsg::DrmRemovalFailed,
 	UserMsg::LocalStorageError,
+	UserMsg::RuntimeDependencyMissing,
 	UserMsg::ConfigUnreadable,
 	UserMsg::ConfigParseFailed,
 	UserMsg::ConfigRepaired,

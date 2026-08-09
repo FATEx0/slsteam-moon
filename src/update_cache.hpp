@@ -21,10 +21,46 @@
 
 #pragma once
 
+#include <mutex>
+
 namespace Updater
 {
 namespace cache
 {
+
+// Serializes the lifetime of the background refresh generation. Ordinary
+// failures release the gate only from the worker's exit callback; success
+// keeps the refresh one-shot for the rest of the process. The mutex also
+// prevents a retry from racing the previous generation's final cleanup.
+class RefreshGate
+{
+public:
+	bool tryStart() noexcept
+	{
+		std::lock_guard<std::mutex> lk(m_lock);
+		if (m_started) return false;
+		m_started = true;
+		m_succeeded = false;
+		return true;
+	}
+
+	void markSucceeded() noexcept
+	{
+		std::lock_guard<std::mutex> lk(m_lock);
+		m_succeeded = true;
+	}
+
+	void finish() noexcept
+	{
+		std::lock_guard<std::mutex> lk(m_lock);
+		if (!m_succeeded) m_started = false;
+	}
+
+private:
+	std::mutex m_lock;
+	bool m_started = false;
+	bool m_succeeded = false;
+};
 
 // Decide whether the cached updates.yaml is still fresh enough to skip a
 // background network refresh, given:

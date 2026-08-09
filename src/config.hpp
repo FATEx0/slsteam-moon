@@ -78,12 +78,17 @@ public:
 	MTVariable<bool> notifyInit;
 	MTVariable<bool> api;
 	MTVariable<bool> disableCloud;
+	// Restore the pre-Phase-3 behavior of injecting every advertised DLC
+	// into package 0. Default false keeps storefront-only DLC out of CM
+	// ownership traffic unless it has content of its own.
+	MTVariable<bool> injectAllAdvertisedDlc;
 	MTVariable<bool> achievements;
 	MTVariable<uint64_t> achievementOwnerId;
 	MTVariable<std::unordered_map<uint32_t, uint64_t>> achievementOwners;
 	MTVariable<std::string> fakeEmail;
 	MTVariable<int32_t> fakeWalletBalance;
 	MTVariable<unsigned int> logLevel;
+	MTVariable<bool> patternCache;
 	MTVariable<bool> extendedLogging;
 
 	//Using incomplete class to avoid runtime linking errors

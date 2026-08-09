@@ -1,6 +1,9 @@
 #include <dlfcn.h>
 #include "afftrace.hpp"
 #include "api.hpp"
+#include "audit_log.hpp"
+#include "audit_policy.hpp"
+#include "audit_symbols.hpp"
 #include "config.hpp"
 #include "globals.hpp"
 #include "hooks.hpp"
@@ -8,6 +11,7 @@
 #include "ownerwork.hpp"
 #include "patterns.hpp"
 #include "runtime_attestation.hpp"
+#include "runtime_dependencies.hpp"
 #include "update.hpp"
 #include "utils.hpp"
 #include "utils/process_lock.hpp"
@@ -29,6 +33,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -130,6 +135,17 @@ static bool g_cefKeepDefaultPort = false;
 static long g_clientPid = 0;
 static unsigned long long g_clientStartTicks = 0;
 
+// Audit callbacks and post-fork exec wrappers must not consult C++ logging
+// state.  setup() opens this descriptor before any webhelper fork; callbacks
+// only use write(2)-style operations against the inherited fd. Steam may close
+// inherited descriptors in the fork child, so keep a fixed path for an
+// async-signal-safe O_APPEND reopen at the last possible moment.
+static int g_rawLogFd = -1;
+static char g_rawLogPath[4096] = {};
+static std::atomic<bool> g_auditDiagnosticsEnabled{false};
+static std::atomic<bool> g_auditPolicyReady{false};
+static std::atomic<bool> g_auditBindAll{true};
+
 static void setup()
 {
 	lm_process_t proc {};
@@ -152,6 +168,30 @@ static void setup()
 		unload();
 		return;
 	}
+
+	// Every auditor namespace gets its own copy of these statics. A secondary
+	// namespace may still dispatch an exec wrapper after the process-wide setup
+	// lock is owned by another copy, so remember the path and open the
+	// async-signal-safe diagnostic fd before that lock can reject this instance.
+	if (g_rawLogPath[0] == '\0' && !g_pLog->path.empty())
+	{
+		std::snprintf(g_rawLogPath, sizeof(g_rawLogPath), "%s", g_pLog->path.c_str());
+	}
+	if (g_rawLogFd < 0 && g_rawLogPath[0] != '\0')
+	{
+		g_rawLogFd = open(g_rawLogPath, O_WRONLY | O_APPEND | O_CLOEXEC);
+	}
+
+	// Publish the environment-only audit policy before taking the process-wide
+	// setup lock. Each audit namespace has its own statics; a secondary copy
+	// still needs to return narrow flags even when it skips the heavier setup.
+	const bool narrowAudit = AuditBinding::narrowValueEnabled(
+		std::getenv("SLSSTEAM_AUDIT_NARROW"));
+	const bool bindAllAudit = !narrowAudit
+		|| AuditBinding::bindAllValueEnabled(
+			std::getenv("SLSSTEAM_AUDIT_BINDALL"));
+	g_auditBindAll.store(bindAllAudit, std::memory_order_release);
+	g_auditPolicyReady.store(true, std::memory_order_release);
 
 	g_setupLock = std::make_unique<ProcessLock::FileLock>(
 		ProcessLock::perProcessPath(".slssteam.setup"));
@@ -195,6 +235,11 @@ static void setup()
 		unload();
 		return;
 	}
+
+	g_auditDiagnosticsEnabled.store(g_config.extendedLogging.get(),
+	                               std::memory_order_release);
+
+	RuntimeDependencies::check();
 
 	// Decide this session's CEF debug port ONCE, as EARLY as possible (this is
 	// la_preinit, before the client can spawn the webhelper) so g_cefSessionPort
@@ -304,6 +349,8 @@ static void load()
 		return;
 	}
 
+	try
+	{
 	// la_objopen fires load() once per audited module that opens — i.e. for
 	// BOTH steamclient.so AND steamui.so. The hooking work below must run
 	// exactly once PER PROCESS: the first pass overwrites the target
@@ -533,29 +580,21 @@ static void load()
 		const auto added = g_config.addedAppIds.get();
 		std::vector<uint32_t> ids(added.begin(), added.end());
 
-		// Also inject the DLC appids advertised by each AddedApp's
-		// provisioned appinfo (extended.listofdlc / depots.*.dlcappid).
-		// Steam's install planner only schedules a `dlcappid`-tagged
-		// depot when the DLC's appid is present in package 0's AppIdVec
-		// — ownership alone is not enough (proven on the VM 2026-06-05
-		// with Binding of Isaac 250900: the base installed but its DLC
-		// depots were filtered out until the DLC ids were in package 0).
-		// These are NOT added to addedAppIds, so they skip the per-app
-		// provisioning path (a DLC appid has no own depots).  Their
-		// depots are already eligible (depot keys recorded under the
-		// base) and their manifests already stage via PICS recv.
+		// Collect DLC ids from each managed app's provisioned appinfo.
+		// Depot-tagged ids are planner-critical; advertised-only ids enter
+		// package 0 only when own content is known, unless the compatibility
+		// switch InjectAllAdvertisedDlc is enabled.  The local appDlc list is
+		// broader and remains available to launch-time gates.
 		//
-		// Register them with PackagePatch so the LoadPackage detour
-		// keeps re-injecting them across package-0 reloads (e.g. the
-		// reload the license reconcile triggers), then do the one-shot
-		// manual inject for the case Steam already loaded package 0.
+		// Register the planner subset with PackagePatch so the LoadPackage
+		// detour keeps re-injecting it across package-0 reloads, then do the
+		// one-shot manual inject for the case Steam already loaded package 0.
 		const auto dlcIds = AppInfoProvision::collectDlcAppIdsForAddedApps();
-		PackagePatch::setExtraAppIds(dlcIds);
-		// Also register them for legacy-CD-key suppression: an owned DLC that
-		// still requires a legacy key would otherwise fail the base app's
-		// launch at GettingLegacyKey (see Apps::shouldDisableCDKey).
-		Apps::setAddedAppDlcIds(dlcIds);
-		ids.insert(ids.end(), dlcIds.begin(), dlcIds.end());
+		// Only planner-relevant DLC ids enter PackagePatch.  The broader
+		// appDlc set still feeds launch-time legacy-CD-key suppression.
+		PackagePatch::setExtraAppIds(dlcIds.package0);
+		Apps::setAddedAppDlcIds(dlcIds.appDlc);
+		ids.insert(ids.end(), dlcIds.package0.begin(), dlcIds.package0.end());
 
 		if (!ids.empty())
 		{
@@ -579,6 +618,21 @@ static void load()
 			g_pLog->notify("Loaded successfully");
 			g_pLog->notifyUser(UserMsg::LoadSuccess);
 		}
+	}
+	}
+	catch (...)
+	{
+		// Never let an exception cross the rtld-audit callback boundary: the
+		// dynamic linker cannot unwind through la_objopen safely.
+		try
+		{
+			unload();
+		}
+		catch (...)
+		{
+			// Cleanup is best effort after a failed load.
+		}
+		return;
 	}
 }
 
@@ -653,6 +707,81 @@ namespace
 	execve_t g_realExecvpe   = nullptr;
 	spawn_t  g_realSpawn     = nullptr;
 	spawn_t  g_realSpawnp    = nullptr;
+
+	std::atomic<unsigned int> g_auditDiagnosticMask {0};
+
+	const char* auditSymbolName(AuditBinding::Symbol symbol) noexcept
+	{
+		switch (symbol)
+		{
+			case AuditBinding::Symbol::Execv: return "execv";
+			case AuditBinding::Symbol::Execvp: return "execvp";
+			case AuditBinding::Symbol::Execve: return "execve";
+			case AuditBinding::Symbol::Execvpe: return "execvpe";
+			case AuditBinding::Symbol::PosixSpawn: return "posix_spawn";
+			case AuditBinding::Symbol::PosixSpawnp: return "posix_spawnp";
+			default: return "<unknown>";
+		}
+	}
+
+	const char* auditObjectName(uintptr_t* cookie) noexcept
+	{
+		if (cookie == nullptr || *cookie == 0)
+			return "<unknown>";
+		const auto* map = reinterpret_cast<const link_map*>(*cookie);
+		if (map == nullptr || map->l_name == nullptr || map->l_name[0] == '\0')
+			return "<main executable>";
+		return map->l_name;
+	}
+
+	void writeRawLog(const char* text) noexcept
+	{
+		AuditLog::write(g_rawLogFd, g_rawLogPath, text);
+	}
+
+	void writeRawUnsigned(unsigned int value) noexcept
+	{
+		char digits[11] = {};
+		size_t pos = sizeof(digits) - 1;
+		do
+		{
+			digits[--pos] = static_cast<char>('0' + (value % 10));
+			value /= 10;
+		}
+		while (value != 0);
+		writeRawLog(digits + pos);
+	}
+
+	void logAuditBinding(AuditBinding::Symbol symbol,
+	                     uintptr_t* refcook,
+	                     uintptr_t* defcook) noexcept
+	{
+		// la_symbind32 is a loader callback: diagnostics use only a lock-free
+		// one-shot bit and write() to a descriptor opened by setup().  Never call
+		// CLog, getenv, std::string formatting, or allocation here.
+		if (!g_auditDiagnosticsEnabled.load(std::memory_order_acquire))
+			return;
+		const unsigned int bit = 1u << static_cast<unsigned int>(symbol);
+		if ((g_auditDiagnosticMask.fetch_or(bit, std::memory_order_relaxed) & bit) != 0)
+			return;
+		writeRawLog("[Info] audit: ");
+		writeRawLog(auditSymbolName(symbol));
+		writeRawLog(" referenced by ");
+		writeRawLog(auditObjectName(refcook));
+		writeRawLog(" (definition ");
+		writeRawLog(auditObjectName(defcook));
+		writeRawLog(")\n");
+	}
+
+	void logCefRewrite(uint16_t port) noexcept
+	{
+		// This runs in a fork child immediately before exec.  The fd was opened
+		// in the parent during setup, so this path performs no env lookup,
+		// allocation, formatted I/O, or C++ logger locking after fork.
+		writeRawLog("[Info] CEF: rewrote --remote-debugging-port to ");
+		writeRawUnsigned(port);
+		writeRawLog(" (8080 freed)\n");
+	}
 
 	// Returns a heap argv copy with the CEF debug port rewritten to a free
 	// loopback port, or nullptr if argv carries no such switch (caller then
@@ -744,10 +873,7 @@ namespace
 		}
 		out[n] = nullptr;
 
-		if (g_pLog)
-		{
-			g_pLog->info("CEF: rewrote --remote-debugging-port to %u (8080 freed)\n", port);
-		}
+		logCefRewrite(port);
 		return out;
 	}
 
@@ -787,44 +913,42 @@ namespace
 
 extern "C" uintptr_t la_symbind32(Elf32_Sym* sym,
                                   __attribute__((unused)) unsigned int ndx,
-                                  __attribute__((unused)) uintptr_t* refcook,
-                                  __attribute__((unused)) uintptr_t* defcook,
+                                  uintptr_t* refcook,
+                                  uintptr_t* defcook,
                                   __attribute__((unused)) unsigned int* flags,
                                   const char* symname)
 {
-	if (symname)
+	if (sym == nullptr)
+		return 0;
+
+	const AuditBinding::Symbol symbol = AuditBinding::classify(symname);
+	if (symbol == AuditBinding::Symbol::None)
+		return sym->st_value;
+
+	logAuditBinding(symbol, refcook, defcook);
+	const auto orig = static_cast<uintptr_t>(sym->st_value);
+	switch (symbol)
 	{
-		const auto orig = static_cast<uintptr_t>(sym->st_value);
-		if (std::strcmp(symname, "execv") == 0)
-		{
+		case AuditBinding::Symbol::Execv:
 			if (!g_realExecv) g_realExecv = reinterpret_cast<execv_t>(orig);
 			return reinterpret_cast<uintptr_t>(&cefExecv);
-		}
-		if (std::strcmp(symname, "execvp") == 0)
-		{
+		case AuditBinding::Symbol::Execvp:
 			if (!g_realExecvp) g_realExecvp = reinterpret_cast<execv_t>(orig);
 			return reinterpret_cast<uintptr_t>(&cefExecvp);
-		}
-		if (std::strcmp(symname, "execve") == 0)
-		{
+		case AuditBinding::Symbol::Execve:
 			if (!g_realExecve) g_realExecve = reinterpret_cast<execve_t>(orig);
 			return reinterpret_cast<uintptr_t>(&cefExecve);
-		}
-		if (std::strcmp(symname, "execvpe") == 0)
-		{
+		case AuditBinding::Symbol::Execvpe:
 			if (!g_realExecvpe) g_realExecvpe = reinterpret_cast<execve_t>(orig);
 			return reinterpret_cast<uintptr_t>(&cefExecvpe);
-		}
-		if (std::strcmp(symname, "posix_spawn") == 0)
-		{
+		case AuditBinding::Symbol::PosixSpawn:
 			if (!g_realSpawn) g_realSpawn = reinterpret_cast<spawn_t>(orig);
 			return reinterpret_cast<uintptr_t>(&cefSpawn);
-		}
-		if (std::strcmp(symname, "posix_spawnp") == 0)
-		{
+		case AuditBinding::Symbol::PosixSpawnp:
 			if (!g_realSpawnp) g_realSpawnp = reinterpret_cast<spawn_t>(orig);
 			return reinterpret_cast<uintptr_t>(&cefSpawnp);
-		}
+		case AuditBinding::Symbol::None:
+			break;
 	}
 	return sym->st_value;
 }
@@ -834,8 +958,8 @@ extern "C" unsigned int la_objopen(struct link_map* map,
                                    __attribute__((unused)) uintptr_t* cookie)
 {
 	if (map && map->l_name &&
-	    (std::string(map->l_name).ends_with("/steamclient.so") ||
-	     std::string(map->l_name).ends_with("/steamui.so")))
+	    (AuditBinding::hasSuffix(map->l_name, "/steamclient.so") ||
+	     AuditBinding::hasSuffix(map->l_name, "/steamui.so")))
 	{
 		if (!setupSuccess)
 		{
@@ -844,10 +968,15 @@ extern "C" unsigned int la_objopen(struct link_map* map,
 		load();
 	}
 
-	// Flag every object BINDFROM|BINDTO so la_symbind32 is invoked for its
-	// symbol bindings — required for the CEF debug-port rewrite. Without these
-	// flags the loader never calls la_symbind*.
-	return LA_FLG_BINDFROM | LA_FLG_BINDTO;
+	// Keep the historical bind-all policy unless narrowing is explicitly
+	// enabled after its live importer/rewrite gates have been measured.
+	// SLSSTEAM_AUDIT_BINDALL=1 remains a visible rollback switch for a
+	// narrowed session, while the default is already the safe rollback.  The
+	// preinit-ready guard avoids getenv() in this loader callback; before setup
+	// publishes policy, bind-all is the conservative behavior.
+	const bool bindAll = !g_auditPolicyReady.load(std::memory_order_acquire)
+		|| g_auditBindAll.load(std::memory_order_acquire);
+	return AuditBinding::flagsForObject(map ? map->l_name : nullptr, bindAll);
 }
 
 extern "C" void la_preinit(__attribute__((unused)) uintptr_t* cookie)

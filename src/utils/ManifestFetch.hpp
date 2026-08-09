@@ -1,13 +1,85 @@
 
 #pragma once
 
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <optional>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
 
 
 namespace ManifestFetch
 {
+	namespace detail
+	{
+		// Kill the whole helper process group and always reap the child.  This
+		// is used on both timeout and waitpid-error paths so no unzip process
+		// can outlive the manifest job and write into a removed temp file.
+		inline void killAndReap(pid_t pid, int& status) noexcept
+		{
+			if (pid <= 0) return;
+			if (kill(-pid, SIGKILL) != 0) (void)kill(pid, SIGKILL);
+			while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+		}
+
+		// The caller must hold the in-flight-job mutex while invoking this.
+		// Keeping registration beside lookup/creation prevents a last waiter
+		// from cancelling a job before a concurrent joiner is counted.
+		inline void registerWaiterLocked(std::atomic<int>& waiters) noexcept
+		{
+			waiters.fetch_add(1, std::memory_order_acq_rel);
+		}
+
+		inline bool releaseWaiterLocked(std::atomic<int>& waiters) noexcept
+		{
+			return waiters.fetch_sub(1, std::memory_order_acq_rel) == 1;
+		}
+		inline bool shouldCancelBlobJob(bool producerActive, bool lastWaiter,
+		                                bool cancelIfLast) noexcept
+		{
+			return cancelIfLast && lastWaiter && !producerActive;
+		}
+
+	} // namespace detail
+
+	// A blob job has one deadline shared by all callers. A fire-and-forget
+	// producer owns the job until completion; a caller timeout can cancel only
+	// after that producer has released ownership and the caller is last. Queued
+	// work also expires without ever entering a worker thread.
+	struct JobBudget
+	{
+		explicit JobBudget(std::chrono::milliseconds duration)
+			: deadline(std::chrono::steady_clock::now() + duration) {}
+
+		void cancel() noexcept
+		{
+			cancelled.store(true, std::memory_order_release);
+		}
+
+		bool shouldStop() const noexcept
+		{
+			return cancelled.load(std::memory_order_acquire)
+				|| std::chrono::steady_clock::now() >= deadline;
+		}
+
+		std::chrono::milliseconds remaining() const noexcept
+		{
+			if (cancelled.load(std::memory_order_acquire))
+				return std::chrono::milliseconds(0);
+			const auto now = std::chrono::steady_clock::now();
+			if (now >= deadline) return std::chrono::milliseconds(0);
+			return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+		}
+
+		std::chrono::steady_clock::time_point deadline;
+		std::atomic<bool> cancelled{false};
+	};
+
 	// One CDN host fetch outcome, reduced to the two facts the expired-code
 	// retry policy cares about.
 	struct CdnOutcome

@@ -1,6 +1,7 @@
 #include "ticket.hpp"
 
 #include "fakeappid.hpp"
+#include "apps.hpp"
 
 #include "../config.hpp"
 #include "../globals.hpp"
@@ -18,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <mutex>
 #include <sstream>
 
 uint32_t Ticket::oneTimeSteamIdSpoof = 0;
@@ -48,20 +50,18 @@ std::string Ticket::getTicketPath(uint32_t appId)
 
 Ticket::SavedTicket Ticket::getCachedTicket(uint32_t appId)
 {
-	if (ticketMap.contains(appId))
-	{
-		return ticketMap[appId];
-	}
+	std::lock_guard<std::mutex> lock(cacheMutex);
+	if (invalidatedApps.contains(appId)) return {};
+
+	const auto it = ticketMap.find(appId);
+	if (it != ticketMap.end()) return it->second;
 
 	SavedTicket ticket {};
-
 	const auto path = getTicketPath(appId);
 	if (!std::filesystem::exists(path.c_str()))
 	{
 		return ticket;
 	}
-
-	std::ifstream ifs(path, std::ios::in);
 
 	g_pLog->debug("Reading ticket for %u\n", appId);
 
@@ -73,8 +73,10 @@ Ticket::SavedTicket Ticket::getCachedTicket(uint32_t appId)
 	);
 	//g_pLog->debug("Ticket: %u, %s\n", ticket.steamId, ticket.ticket.c_str());
 
+	// Keep the disk read and map publication in one transaction with the
+	// invalidation check. forgetApp() cannot interleave and leave a late cache
+	// entry for an app that was removed while this load was in progress.
 	ticketMap[appId] = ticket;
-
 	return ticket;
 }
 
@@ -86,6 +88,9 @@ bool Ticket::saveTicketToCache(CMsgClientGetAppOwnershipTicketResponse* resp)
 
 	auto bytes = resp->ticket();
 
+	std::lock_guard<std::mutex> lock(cacheMutex);
+	if (invalidatedApps.contains(appId)) return false;
+
 	YAML::Emitter node;
 	node << YAML::BeginMap;
 	node << YAML::Key << "steamId";
@@ -95,9 +100,10 @@ bool Ticket::saveTicketToCache(CMsgClientGetAppOwnershipTicketResponse* resp)
 	node << YAML::EndMap;
 
 	const auto path = Ticket::getTicketPath(appId);
-	std::ofstream ofs(path.c_str(), std::ios::out);
-
+	std::ofstream ofs(path.c_str(), std::ios::out | std::ios::trunc);
+	if (!ofs.is_open()) return false;
 	ofs.write(node.c_str(), node.size());
+	if (!ofs.good()) return false;
 
 	g_pLog->infoOnce("Saved ticket for %u\n", appId);
 
@@ -105,7 +111,6 @@ bool Ticket::saveTicketToCache(CMsgClientGetAppOwnershipTicketResponse* resp)
 	SavedTicket ticket {};
 	ticket.ticket = bytes;
 	ticketMap[appId] = ticket;
-	
 	return true;
 }
 
@@ -160,18 +165,17 @@ Ticket::SavedTicket Ticket::getCachedEncryptedTicket(uint32_t appId)
 		return ticket;
 	}
 
-	if (encryptedTicketMap.contains(appId))
-	{
-		return encryptedTicketMap[appId];
-	}
+	std::lock_guard<std::mutex> lock(cacheMutex);
+	if (invalidatedApps.contains(appId)) return {};
+
+	const auto it = encryptedTicketMap.find(appId);
+	if (it != encryptedTicketMap.end()) return it->second;
 
 	const auto path = getEncryptedTicketPath(appId);
 	if (!std::filesystem::exists(path.c_str()))
 	{
 		return ticket;
 	}
-
-	std::ifstream ifs(path, std::ios::in);
 
 	g_pLog->debug("Reading encrypted ticket for %u\n", appId);
 
@@ -189,8 +193,9 @@ Ticket::SavedTicket Ticket::getCachedEncryptedTicket(uint32_t appId)
 	);
 	//g_pLog->debug("Ticket: %u, %s\n", ticket.steamId, ticket.ticket.c_str());
 
+	// Keep the disk read and map publication in one transaction with the
+	// invalidation check, just like ordinary ownership tickets.
 	encryptedTicketMap[appId] = ticket;
-
 	return ticket;
 }
 
@@ -202,6 +207,9 @@ bool Ticket::saveEncryptedTicketToCache(CMsgClientRequestEncryptedAppTicketRespo
 
 	auto bytes = resp->SerializeAsString();
 
+	std::lock_guard<std::mutex> lock(cacheMutex);
+	if (invalidatedApps.contains(appId)) return false;
+
 	YAML::Emitter node;
 	node << YAML::BeginMap;
 	node << YAML::Key << "steamId";
@@ -212,9 +220,10 @@ bool Ticket::saveEncryptedTicketToCache(CMsgClientRequestEncryptedAppTicketRespo
 	node << YAML::EndMap;
 
 	const auto path = getEncryptedTicketPath(appId);
-	std::ofstream ofs(path.c_str(), std::ios::out);
-
+	std::ofstream ofs(path.c_str(), std::ios::out | std::ios::trunc);
+	if (!ofs.is_open()) return false;
 	ofs.write(node.c_str(), node.size());
+	if (!ofs.good()) return false;
 
 	g_pLog->infoOnce("Saved encrypted ticket for %u\n", appId);
 
@@ -223,7 +232,6 @@ bool Ticket::saveEncryptedTicketToCache(CMsgClientRequestEncryptedAppTicketRespo
 	ticket.steamId = g_currentSteamId;
 	ticket.ticket = bytes;
 	encryptedTicketMap[appId] = ticket;
-	
 	return true;
 }
 
@@ -269,7 +277,8 @@ void Ticket::recvAppTicket(CMsgClientGetAppOwnershipTicketResponse* msg)
 	// strictly validates the ticket bytes we may need to re-route this
 	// through a fresh message buffer (mirror what hkBRouteMsgToJob does
 	// for GetManifestRequestCode), but try the minimal change first.
-	if (g_config.isAddedAppId(appId))
+	if (Ticket::shouldStampAppOwnershipTicket(
+			g_config.isAddedAppId(appId), Apps::isAddedAppDlcId(appId)))
 	{
 		msg->set_eresult(static_cast<int32_t>(ERESULT_OK));
 		// One-time log so we don't spam every retry.  Note: do NOT

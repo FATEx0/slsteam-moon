@@ -45,6 +45,7 @@ enum class UserMsg
 	GamePreparationFailed,     // could not assemble a title's metadata
 	DrmRemovalFailed,          // SteamStub unpack failed; title may not launch
 	LocalStorageError,         // local write/extract failed (disk full / perms)
+	RuntimeDependencyMissing,   // required unzip/gzip helper is unavailable
 
 	// --- configuration ---
 	ConfigUnreadable,          // config.yaml unreadable; using defaults
@@ -224,6 +225,13 @@ inline UiMessage messageFor(UserMsg m, Lang lang)
 			              "livre e permissões na pasta da Steam."
 			            : "Failed to write files to disk. Check that you have free "
 			              "space and permissions in your Steam folder.",
+			         Severity::Error };
+
+		case UserMsg::RuntimeDependencyMissing:
+			return { pt ? "Faltam ferramentas necessárias ({detail}) para processar "
+			              "manifests. Instale-as e reinicie a Steam."
+			            : "Required tools ({detail}) are missing for manifest processing. "
+			              "Install them and restart Steam.",
 			         Severity::Error };
 
 		case UserMsg::ConfigUnreadable:

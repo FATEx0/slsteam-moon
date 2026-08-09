@@ -12,6 +12,7 @@
 #include "dlcids.hpp"
 #include "manifestid.hpp"
 #include "manifeststore.hpp"
+#include "manifeststore_io.hpp"
 #include "manifestsynth.hpp"
 #include "provision_cache.hpp"
 #include "provision_network.hpp"
@@ -45,11 +46,14 @@
 #include <fstream>
 #include <ios>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 #include <unordered_set>
 #include <vector>
 
@@ -65,6 +69,15 @@ namespace
 // treating the title as "no applicable platform" (which surfaces as the
 // install committing 0 bytes / "0 mounted depots").
 std::set<uint32_t> g_needProton;
+
+struct CacheValidationResult
+{
+	bool valid = false;
+	std::string diag;
+};
+
+std::mutex g_cacheValidationMu;
+std::map<cache::CacheValidationKey, CacheValidationResult> g_cacheValidationMemo;
 
 
 // ---------------------------------------------------------------------------
@@ -518,7 +531,7 @@ void pruneUnsupportedDepots(YAML::Node& body, uint32_t appId)
 }
 
 // Forward declaration: defined with the on-disk cache helpers below.
-std::string getCacheDir();
+const std::string& getCacheDir();
 
 // Rebuild a missing `depots` block for a token-locked app from data we
 // already hold on disk.  Some titles (e.g. Risk of Rain 2, app 632360)
@@ -740,14 +753,17 @@ SourceResult renderAppinfoBuffer(const YAML::Node& appNode, uint32_t appId,
 // picks the buffers up at next start).
 // ---------------------------------------------------------------------------
 
-std::string getCacheDir()
+const std::string& getCacheDir()
 {
-	const std::string dir = g_config.getDir() + "/cache";
-	if (!std::filesystem::exists(dir))
-	{
-		std::error_code ec;
-		std::filesystem::create_directories(dir, ec);
-	}
+	static const std::string dir = [] {
+		const std::string value = g_config.getDir() + "/cache";
+		if (!std::filesystem::exists(value))
+		{
+			std::error_code ec;
+			std::filesystem::create_directories(value, ec);
+		}
+		return value;
+	}();
 	return dir;
 }
 
@@ -761,16 +777,23 @@ std::string getMetaPath(uint32_t appId)
 	return getCacheDir() + "/picsbuffer_" + std::to_string(appId) + ".yaml";
 }
 
-// Return the last-modified time (epoch seconds) of `appId`'s on-disk
-// provisioned buffer, and whether it exists and is non-empty.  Used by
-// provisionApp's short-lived cache to skip the network fetch during the
-// setup() re-exec storm of a single boot.
-bool statBuffer(uint32_t appId, long long& mtimeSecsOut)
+// Return the full identity of `appId`'s on-disk provisioned buffer, and
+// whether it exists and is non-empty.  Used by provisionApp's short-lived
+// cache to skip the network fetch during the setup() re-exec storm of a
+// single boot and to key the expensive validation memo safely across atomic
+// replacements.
+bool statBuffer(uint32_t appId, cache::CacheValidationKey& identityOut)
 {
 	struct stat st{};
 	if (stat(getBufferPath(appId).c_str(), &st) != 0) return false;
 	if (st.st_size <= 0) return false;
-	mtimeSecsOut = static_cast<long long>(st.st_mtime);
+	identityOut = cache::CacheValidationKey{
+	    .appId = appId,
+	    .mtimeSecs = static_cast<long long>(st.st_mtime),
+	    .mtimeNsecs = static_cast<long long>(st.st_mtim.tv_nsec),
+	    .size = static_cast<long long>(st.st_size),
+	    .inode = static_cast<std::uint64_t>(st.st_ino),
+	};
 	return true;
 }
 
@@ -971,6 +994,45 @@ std::string steamRootForConfig()
 		if (stat((c + "/steam.sh").c_str(), &st) == 0) return c;
 	}
 	return {};
+}
+
+// Build one index of depot ids backed by valid manifest artifacts.  The
+// collector below may see many advertised DLC ids, so querying
+// ManifestStore::bestArchivedGid() for each one would rescan the store once
+// per id.  Index both durable storage locations once per collection pass;
+// filenames are parsed with the same strict shape used by the DLC tests and
+// invalid/corrupt files never qualify an id.
+std::unordered_set<uint32_t> collectValidManifestDepotIds()
+{
+	std::unordered_set<uint32_t> depotIds;
+
+	auto scanDirectory = [&depotIds](const std::filesystem::path& directory)
+	{
+		std::error_code ec;
+		if (!std::filesystem::is_directory(directory, ec) || ec) return;
+
+		std::filesystem::directory_iterator it(directory, ec);
+		const std::filesystem::directory_iterator end;
+		while (!ec && it != end)
+		{
+			const auto path = it->path();
+			uint32_t depotId = 0;
+			if (depotIdFromManifestName(path.filename().string(), depotId) &&
+			    ManifestStoreIO::isValidManifest(path))
+			{
+				depotIds.insert(depotId);
+			}
+			it.increment(ec);
+		}
+	};
+
+	scanDirectory(ManifestStore::dir());
+	const auto root = steamRootForConfig();
+	if (!root.empty())
+	{
+		scanDirectory(std::filesystem::path(root) / "depotcache");
+	}
+	return depotIds;
 }
 
 // Inject a `CompatToolMapping` entry for each app in g_needProton into
@@ -1248,23 +1310,66 @@ bool hasValidatedCachedBuffer(uint32_t appId, std::string& diag)
 	}
 }
 
+bool cachedWireSizeMatches(uint32_t appId, long long actualSize)
+{
+	if (actualSize <= 0) return false;
+	try
+	{
+		const YAML::Node meta = YAML::LoadFile(getMetaPath(appId));
+		const auto declaredSize = meta["wire_size"].as<unsigned long long>();
+		return cache::wireSizeMatches(
+		    static_cast<unsigned long long>(actualSize), declaredSize);
+	}
+	catch (...)
+	{
+		return false;
+	}
+}
+
 cache::CacheUse cacheUseForApp(uint32_t appId, bool refreshUnavailable)
 {
-	long long mtime = 0;
-	const bool present = statBuffer(appId, mtime);
+	cache::CacheValidationKey key{};
+	const bool present = statBuffer(appId, key);
 	if (!present) return cache::CacheUse::None;
 
-	std::string diag;
-	const bool valid = hasValidatedCachedBuffer(appId, diag);
-	if (!valid)
-	{
-		g_pLog->info("AppInfoProvision: app=%u cached buffer rejected (%s)\n",
-		             appId, diag.c_str());
-	}
 	const long long now = static_cast<long long>(std::time(nullptr));
 	const bool fresh = cache::isBufferReusable(
-	    present, mtime, now, provisionTtlSecs());
-	return cache::chooseCacheUse(valid, fresh, refreshUnavailable);
+	    present, key.mtimeSecs, now, provisionTtlSecs());
+	if (!cache::shouldValidateCache(fresh, refreshUnavailable))
+	{
+		// A stale online buffer will be refreshed; do not parse YAML, hash the
+		// whole wire or build a VDF tree just to discard it below.
+		return cache::CacheUse::None;
+	}
+
+	// Cheap metadata gate before the expensive integrity/structure check.
+	if (!cachedWireSizeMatches(appId, key.size))
+	{
+		g_pLog->info("AppInfoProvision: app=%u cached buffer rejected (wire_size mismatch)\n",
+		             appId);
+		return cache::CacheUse::None;
+	}
+
+	CacheValidationResult result;
+	{
+		std::lock_guard<std::mutex> lk(g_cacheValidationMu);
+		auto it = g_cacheValidationMemo.find(key);
+		if (it != g_cacheValidationMemo.end())
+		{
+			result = it->second;
+		}
+		else
+		{
+			result.valid = hasValidatedCachedBuffer(appId, result.diag);
+			g_cacheValidationMemo.emplace(key, result);
+		}
+	}
+	if (!result.valid)
+	{
+		g_pLog->info("AppInfoProvision: app=%u cached buffer rejected (%s)\n",
+		             appId, result.diag.c_str());
+	}
+	return cache::chooseCacheUse(result.valid, fresh, refreshUnavailable);
 }
 
 // Render+prune+sha+persist a parsed appinfo node (shared tail used by
@@ -1709,13 +1814,19 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath)
 	return provisioned;
 }
 
-std::vector<uint32_t> collectDlcAppIdsForAddedApps()
+DlcInjectionIds collectDlcAppIdsForAddedApps()
 {
-	std::vector<uint32_t> out;
-	std::unordered_set<uint32_t> seen;
+	DlcAppIds sources;
+	std::unordered_set<uint32_t> taggedSeen;
+	std::unordered_set<uint32_t> advertisedSeen;
+	std::unordered_set<uint32_t> advertisedWithContent;
 
 	const auto added = g_config.managedAppIds.get();
-	if (added.empty()) return out;
+	if (added.empty()) return {};
+
+	// Build this once: each advertised DLC is only a membership lookup after
+	// the two manifest directories have been scanned.
+	const auto manifestDepotIds = collectValidManifestDepotIds();
 
 	for (uint32_t appId : added)
 	{
@@ -1731,36 +1842,96 @@ std::vector<uint32_t> collectDlcAppIdsForAddedApps()
 		wire.resize(static_cast<std::size_t>(sz));
 		ifs.seekg(0);
 		ifs.read(wire.data(), sz);
+		if (!ifs) continue;
 
-		for (uint32_t dlcId : extractDlcAppIds(wire, appId))
+		const auto grouped = extractDlcAppIdsBySource(wire, appId);
+		const bool baseHasDlcDepots = hasDepotsInDlc(wire);
+		for (uint32_t dlcId : grouped.depotTagged)
 		{
 			// Never shadow a base AddedApp, and dedup across apps.
+			if (!added.count(dlcId))
+			{
+				appendUnique(sources.depotTagged, taggedSeen, dlcId);
+			}
+		}
+		for (uint32_t dlcId : grouped.advertised)
+		{
 			if (added.count(dlcId)) continue;
-			if (seen.insert(dlcId).second) out.push_back(dlcId);
+			appendUnique(sources.advertised, advertisedSeen, dlcId);
+
+			// `hasdepotsindlc` is a base-app marker for DLCs with their own
+			// appinfo/depots.  A matching depot artifact is the offline
+			// fallback for buffers that do not carry the marker.
+			if (baseHasDlcDepots || manifestDepotIds.count(dlcId) != 0)
+			{
+				advertisedWithContent.insert(dlcId);
+			}
 		}
 	}
 
-	if (!out.empty())
+	const auto selected = selectDlcInjectionIds(
+		sources, advertisedWithContent, g_config.injectAllAdvertisedDlc.get());
+	if (!selected.appDlc.empty())
 	{
-		// List the ids, not just how many: these enter package 0 without an
-		// appinfo entry of their own, so when a boot stalls on the client's
-		// library reconcile the log has to name the exact suspects.  Bounded so
-		// a large library cannot flood the file.
+		// List the ids, not just counts: the local set may include
+		// storefront-only entries that were intentionally kept out of
+		// package 0.  Bounded so a large library cannot flood the file.
 		constexpr std::size_t kMaxLogged = 24;
 		std::string ids;
-		for (std::size_t i = 0; i < out.size() && i < kMaxLogged; ++i)
+		for (std::size_t i = 0; i < selected.appDlc.size() && i < kMaxLogged; ++i)
 		{
 			if (i) ids += ' ';
-			ids += std::to_string(out[i]);
+			ids += std::to_string(selected.appDlc[i]);
 		}
-		if (out.size() > kMaxLogged)
+		if (selected.appDlc.size() > kMaxLogged)
 		{
-			ids += " ... (+" + std::to_string(out.size() - kMaxLogged) + ")";
+			ids += " ... (+" +
+				std::to_string(selected.appDlc.size() - kMaxLogged) + ")";
 		}
-		g_pLog->info("AppInfoProvision: collected %zu DLC appid(s) from %zu AdditionalApps: %s\n",
-		             out.size(), added.size(), ids.c_str());
+		g_pLog->info(
+			"AppInfoProvision: collected %zu DLC appid(s) from %zu AdditionalApps: "
+			"package0=%zu local=%zu: %s\n",
+			selected.appDlc.size(), added.size(), selected.package0.size(),
+			selected.appDlc.size(), ids.c_str());
 	}
-	return out;
+	return selected;
+}
+
+bool forgetApp(uint32_t appId)
+{
+	if (appId == 0) return false;
+
+	const auto cacheDir = getCacheDir();
+	const auto relatedDepots = ManifestId::getExclusiveDepotsForApp(appId);
+	const std::string suffix =
+		".forgotten." +
+		std::to_string(static_cast<long long>(std::time(nullptr))) + "." +
+		std::to_string(static_cast<long long>(::getpid()));
+	const auto records = SynthMark::quarantineAppArtifacts(
+		cacheDir, appId, relatedDepots, suffix);
+	for (const auto& record : records)
+	{
+		g_pLog->infoOnce("AppInfoProvision: quarantined removed-app cache %s -> %s\n",
+		                record.original.string().c_str(),
+		                record.quarantined.string().c_str());
+	}
+	const bool complete = !SynthMark::hasAppArtifacts(
+		cacheDir, appId, relatedDepots);
+	if (complete)
+	{
+		// Drop this app's relation only after every source artifact has been
+		// moved. A partial quarantine remains retryable with the same depot
+		// ownership information, while shared depots stay in the catalog.
+		ManifestId::forgetApp(appId);
+	}
+	if (!complete)
+	{
+		g_pLog->warn("AppInfoProvision: app=%u cleanup left one or more cache "
+		             "artifacts in place\n", appId);
+	}
+	g_pLog->infoOnce("AppInfoProvision: forgot app=%u (%zu cache artifact(s), %s)\n",
+	             appId, records.size(), complete ? "complete" : "partial");
+	return complete;
 }
 
 bool isSynthesizedApp(uint32_t appId)

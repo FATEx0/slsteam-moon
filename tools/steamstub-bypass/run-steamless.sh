@@ -36,6 +36,8 @@
 #   STEAMLESS_HOME    where Steamless.CLI.exe + Plugins/ live;
 #                     default: <script dir>/../steamless-bin
 #   WINE_BIN          override wine binary path (default: probe Proton then PATH)
+#   WINESERVER        override the compatible wineserver binary; must be
+#                     executable and match WINE_BIN when set
 #   WINE_PREFIX       override prefix path
 #                     (default: ~/.local/share/SLSsteam/steamless-prefix)
 #   QUIET             non-empty -> suppress informational stdout
@@ -59,6 +61,13 @@ esac
 log()  { [ -z "${QUIET:-}" ] && echo "[steamless-bypass] $*"; return 0; }
 warn() { echo "[steamless-bypass] WARN: $*" >&2; }
 die()  { echo "[steamless-bypass] ERROR: $*" >&2; exit "${2:-1}"; }
+
+# Every bounded Wine/Steamless operation below relies on the GNU coreutils
+# timeout command.  Fail before touching the prefix when a minimal host does
+# not provide it, instead of leaking a confusing shell rc=127 or leaving a
+# half-initialised prefix behind.
+TIMEOUT_BIN="$(command -v timeout 2>/dev/null || true)"
+[ -n "$TIMEOUT_BIN" ] || die "required command 'timeout' not found in PATH" 4
 
 # ── 1. validate args ────────────────────────────────────────────────────
 if [ "$PREWARM" -eq 0 ]; then
@@ -192,10 +201,20 @@ WINE_BIN="$(find_wine)" || die "no usable Wine binary found" 3
 log "using wine: $WINE_BIN"
 
 # Wine and wineserver have to come from the same install or the
-# version mismatch crashes the prefix. Always pair them.
+# version mismatch crashes the prefix. Prefer the paired binary, then an
+# explicit override, and finally a PATH-resolved wineserver for system Wine
+# layouts where the two executables live in different directories.
 WINE_DIR="$(dirname "$WINE_BIN")"
 WINESERVER_BIN="$WINE_DIR/wineserver"
-[ -x "$WINESERVER_BIN" ] || warn "wineserver not at $WINESERVER_BIN; relying on PATH"
+if [ -n "${WINESERVER:-}" ]; then
+    [ -x "$WINESERVER" ] || die "configured WINESERVER is not executable: $WINESERVER" 3
+elif [ -x "$WINESERVER_BIN" ]; then
+    WINESERVER="$WINESERVER_BIN"
+else
+    WINESERVER="$(command -v wineserver 2>/dev/null || true)"
+    [ -n "$WINESERVER" ] || die "no usable wineserver found at $WINESERVER_BIN or on PATH" 3
+    warn "wineserver not at $WINESERVER_BIN; using PATH binary $WINESERVER"
+fi
 
 # ── 5. set up environment ───────────────────────────────────────────────
 WINE_PREFIX="${WINE_PREFIX:-$HOME/.local/share/SLSsteam/steamless-prefix}"
@@ -214,7 +233,7 @@ fi
 
 export WINEPREFIX="$WINE_PREFIX"
 export WINEDEBUG="${WINEDEBUG:--all}"
-export WINESERVER="${WINESERVER:-$WINESERVER_BIN}"
+export WINESERVER
 export WINEARCH="${WINEARCH:-win64}"
 
 # Steamless is a .NET app and renders no HTML, so disable Wine's Gecko
@@ -231,8 +250,15 @@ pkill -9 -f wineserver 2>/dev/null || true
 # ── 6. lazy prefix init (~30s on first run) ─────────────────────────────
 if [ ! -f "$WINEPREFIX/system.reg" ]; then
     log "initializing Wine prefix at $WINEPREFIX (one-time, ~30s)"
-    "$WINE_BIN" wineboot --init >/dev/null 2>&1 || die "wineboot --init failed" 4
-    "$WINESERVER" -w 2>/dev/null || true
+    # Both operations can wait on a broken Wine runtime forever.  Keep the
+    # prewarm worker bounded so a detach-failure recovery join cannot hang
+    # Steam indefinitely; the launch-time path remains the fallback.
+    if ! "$TIMEOUT_BIN" 90 "$WINE_BIN" wineboot --init >/dev/null 2>&1; then
+        die "wineboot --init failed or timed out" 4
+    fi
+    if ! "$TIMEOUT_BIN" 90 "$WINESERVER" -w 2>/dev/null; then
+        die "wineserver wait failed or timed out" 4
+    fi
 fi
 
 # Prewarm path stops here — the prefix is now initialised, the wineserver
@@ -256,7 +282,7 @@ cd "$STEAMLESS_HOME"
 # Steamless CLI exit codes: 0 = unpacked OK, 1 = no SteamStub DRM present
 # (benign — treat as "nothing to do"), >1 = real failure.
 set +e
-timeout 90 "$WINE_BIN" Steamless.CLI.exe \
+"$TIMEOUT_BIN" 90 "$WINE_BIN" Steamless.CLI.exe \
         --quiet --realign --recalcchecksum -f "$WIN_PATH" \
         > /tmp/steamless-bypass.$$.log 2>&1
 sl_rc=$?

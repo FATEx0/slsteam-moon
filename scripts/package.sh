@@ -81,6 +81,33 @@ if [ ! -s bin/SLSsteam.so ] || [ ! -s bin/library-inject.so ] \
 	exit 1
 fi
 
+# bin/ is intentionally ignored by git, so an old non-empty binary can look
+# valid after a source checkout. Refuse to package either artifact when any
+# compile input is newer; release.sh builds first, while direct package.sh
+# callers get an explicit instruction instead of a stale release.
+check_binary_freshness() {
+	local binary="$1"
+	local label="$2"
+	shift 2
+	local stale
+	stale="$(find "$@" -type f -newer "$binary" -print -quit 2>/dev/null)"
+	if [ -n "$stale" ]; then
+		echo "$label is older than build input: $stale" >&2
+		echo "rebuild before packaging: scripts/build.sh" >&2
+		exit 1
+	fi
+}
+check_binary_freshness bin/SLSsteam.so SLSsteam.so \
+	src include lib res Makefile scripts/build.sh scripts/_build-host.sh \
+	scripts/_build-portable.sh scripts/Dockerfile scripts/check-sls-abi.sh embed-config.sh embed-version.sh
+check_binary_freshness bin/library-inject.so library-inject.so \
+	tools/library-inject Makefile
+check_binary_freshness bin/pattern-refresh pattern-refresh \
+	tools/pattern-refresh src/pattern_catalog.cpp src/pattern_catalog.hpp \
+	src/utils/process_lock.hpp res/pattern-public-key.hex Makefile \
+	scripts/build.sh scripts/_build-host.sh scripts/_build-portable.sh scripts/Dockerfile
+
+scripts/check-sls-abi.sh bin/SLSsteam.so
 scripts/check-pattern-refresh-abi.sh bin/pattern-refresh
 
 PKG_DIR="dist/slsteam-moon-${VERSION}"

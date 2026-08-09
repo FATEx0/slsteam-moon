@@ -5,6 +5,7 @@
 #include "manifestid.hpp"
 
 #include "../config.hpp"
+#include "../config_discovery.hpp"
 #include "../globals.hpp"
 #include "../log.hpp"
 
@@ -31,12 +32,10 @@ namespace
 
 // In-memory catalog (depotId -> gid).  Loaded lazily; written through.
 std::mutex g_catalogMu;
+std::mutex g_importMu;
 std::map<uint32_t, std::string> g_catalog;
+AppDepotIndex g_appDepotIndex;
 bool g_catalogLoaded = false;
-
-// Whether importLuaScripts has been called (idempotent gate, mirrors
-// DepotKey).
-bool g_importDone = false;
 
 std::vector<std::string> steamPathCandidates()
 {
@@ -145,6 +144,19 @@ std::string getPinnedGid(uint32_t depotId)
 	return it->second;
 }
 
+std::vector<uint32_t> getExclusiveDepotsForApp(uint32_t appId)
+{
+	std::lock_guard<std::mutex> lk(g_catalogMu);
+	return g_appDepotIndex.exclusiveDepotsForApp(appId);
+}
+
+std::vector<uint32_t> forgetApp(uint32_t appId)
+{
+	if (appId == 0) return {};
+	std::lock_guard<std::mutex> lk(g_catalogMu);
+	return g_appDepotIndex.releaseApp(appId);
+}
+
 bool savePin(uint32_t depotId, const std::string& gid)
 {
 	if (!depotId || gid.empty()) return false;
@@ -203,15 +215,46 @@ bool savePin(uint32_t depotId, const std::string& gid)
 	return true;
 }
 
+namespace
+{
+void retireDepotsLocked(const std::vector<uint32_t>& depotIds)
+{
+	loadCatalogLocked();
+	for (const uint32_t depotId : depotIds)
+	{
+		if (depotId == 0) continue;
+		const auto path = getCatalogPath(depotId);
+		std::error_code ec;
+		std::filesystem::remove(path, ec);
+		if (ec)
+		{
+			g_pLog->debug("ManifestId: cannot retire stale pin %s: %s\n",
+			              path.c_str(), ec.message().c_str());
+			continue;
+		}
+		g_catalog.erase(depotId);
+	}
+}
+} // namespace
+
+void retireDepots(const std::vector<uint32_t>& depotIds)
+{
+	if (depotIds.empty()) return;
+	std::lock_guard<std::mutex> lk(g_catalogMu);
+	retireDepotsLocked(depotIds);
+}
+
 // ---------------------------------------------------------------------------
 // Importer
 // ---------------------------------------------------------------------------
 
 void importLuaScripts()
 {
-	if (g_importDone) return;
-	g_importDone = true;
-
+	std::lock_guard<std::mutex> importLock(g_importMu);
+	// Re-scan on every call so a script added or re-added while Steam is
+	// running is imported without a restart. savePin() is idempotent and each
+	// script's AppDepotIndex relation is reconciled, so repeated startup and
+	// hot-add scans are safe.
 	const auto steamRoot = findSteamRoot();
 	if (steamRoot.empty()) return;
 
@@ -234,6 +277,8 @@ void importLuaScripts()
 		if (!entry.is_regular_file()) continue;
 		const auto& path = entry.path();
 		if (path.extension() != ".lua") continue;
+		const uint32_t appId = ConfigDiscovery::appIdFromScriptName(
+			path.filename().string());
 
 		std::ifstream ifs(path);
 		if (!ifs.is_open()) continue;
@@ -245,6 +290,7 @@ void importLuaScripts()
 		// GID that no longer matched what Steam requested — the
 		// install would hang.  Strip everything from the first `--`
 		// on each line before matching.
+		std::vector<uint32_t> scriptDepots;
 		std::string line;
 		while (std::getline(ifs, line))
 		{
@@ -262,11 +308,20 @@ void importLuaScripts()
 				const uint32_t depotId =
 					static_cast<uint32_t>(std::stoul((*it)[1].str()));
 				const std::string gid = (*it)[2].str();
-				if (savePin(depotId, gid))
-				{
-					++imported;
-				}
+				if (appId != 0) scriptDepots.push_back(depotId);
+				if (savePin(depotId, gid)) ++imported;
 			}
+		}
+
+		// Replace the complete relation set only after the script was read
+		// successfully. This removes depots deleted from an edited script while
+		// preserving shared ownership for depots still referenced by others.
+		if (appId != 0)
+		{
+			std::lock_guard<std::mutex> lk(g_catalogMu);
+			const auto released =
+				g_appDepotIndex.replaceApp(appId, scriptDepots);
+			retireDepotsLocked(released);
 		}
 	}
 	if (imported > 0)

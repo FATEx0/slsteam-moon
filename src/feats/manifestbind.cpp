@@ -11,6 +11,8 @@
 #include "manifestselection.hpp"
 #include "manifeststore.hpp"
 
+#include "../manifest_index.hpp"
+
 #include "../config.hpp"
 #include "../globals.hpp"
 #include "../log.hpp"
@@ -20,6 +22,7 @@
 
 #include "libmem/libmem.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -31,6 +34,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unordered_map>
+#include <vector>
 
 
 namespace
@@ -352,47 +356,98 @@ namespace
 		return stat(p.c_str(), &st) == 0 && st.st_size > 0;
 	}
 
+	struct LocalManifestCandidate
+	{
+		uint64_t gid = 0;
+		std::filesystem::file_time_type mtime{};
+	};
+
+	struct LocalManifestIndex
+	{
+		bool initialized = false;
+		std::string directory;
+		std::filesystem::file_time_type directoryMtime{};
+		std::unordered_map<uint32_t, std::vector<LocalManifestCandidate>> byDepot;
+	};
+
+	std::mutex g_localManifestIndexLock;
+	LocalManifestIndex g_localManifestIndex;
+
+	void rebuildLocalManifestIndexLocked(
+		const std::string& depotcacheDir,
+		std::filesystem::file_time_type directoryMtime)
+	{
+		LocalManifestIndex next;
+		next.initialized = true;
+		next.directory = depotcacheDir;
+		next.directoryMtime = directoryMtime;
+
+		std::error_code ec;
+		for (const auto& entry :
+		     std::filesystem::directory_iterator(depotcacheDir, ec))
+		{
+			if (ec) break;
+			ec.clear();
+			if (!entry.is_regular_file(ec) || ec) continue;
+			const auto parsed = ManifestIndex::parseManifestName(
+				entry.path().filename().string());
+			if (!parsed) continue;
+
+			ec.clear();
+			const auto mtime = entry.last_write_time(ec);
+			if (ec) continue;
+			next.byDepot[parsed->depotId].push_back(
+				{parsed->gid, mtime});
+		}
+
+		for (auto& [depotId, candidates] : next.byDepot)
+		{
+			(void)depotId;
+			std::sort(candidates.begin(), candidates.end(),
+				[](const LocalManifestCandidate& lhs,
+				   const LocalManifestCandidate& rhs)
+				{
+					if (lhs.mtime != rhs.mtime) return lhs.mtime > rhs.mtime;
+					return lhs.gid > rhs.gid;
+				});
+		}
+		g_localManifestIndex = std::move(next);
+	}
+
 	// Find a locally-staged manifest for `depotId` whose gid differs from
-	// `planned` (i.e. the LuaTools zip's own manifest).  Picks the most
-	// recently written one when several exist.  Returns 0 if none.
+	// `planned` (i.e. the LuaTools zip's own manifest).  The directory is
+	// indexed once and refreshed only when its mtime changes; each lookup then
+	// checks at most the newest candidates instead of walking every manifest.
 	uint64_t findLocalAltGid(const std::string& depotcacheDir,
 	                         uint32_t depotId, uint64_t planned)
 	{
 		std::error_code ec;
 		if (!std::filesystem::is_directory(depotcacheDir, ec)) return 0;
+		const auto directoryMtime =
+			std::filesystem::last_write_time(depotcacheDir, ec);
+		if (ec) return 0;
 
-		const std::string prefix = std::to_string(depotId) + "_";
-		uint64_t best = 0;
-		long bestMtime = -1;
-		for (const auto& entry :
-		     std::filesystem::directory_iterator(depotcacheDir, ec))
+		std::lock_guard<std::mutex> lk(g_localManifestIndexLock);
+		if (!g_localManifestIndex.initialized
+		    || g_localManifestIndex.directory != depotcacheDir
+		    || g_localManifestIndex.directoryMtime != directoryMtime)
 		{
-			if (ec) break;
-			if (!entry.is_regular_file(ec)) continue;
-			const auto name = entry.path().filename().string();
-			if (name.rfind(prefix, 0) != 0) continue;
-			const auto dot = name.rfind(".manifest");
-			if (dot == std::string::npos || dot + 9 != name.size()) continue;
-			const auto gidStr = name.substr(prefix.size(),
-			                                dot - prefix.size());
-			if (gidStr.empty()) continue;
-
-			uint64_t gid = 0;
-			try { gid = std::stoull(gidStr); } catch (...) { continue; }
-			if (!gid || gid == planned) continue;
-
-			struct stat st{};
-			if (stat(entry.path().c_str(), &st) != 0 || st.st_size <= 0)
-			{
-				continue;
-			}
-			if (static_cast<long>(st.st_mtime) > bestMtime)
-			{
-				bestMtime = static_cast<long>(st.st_mtime);
-				best = gid;
-			}
+			rebuildLocalManifestIndexLocked(depotcacheDir, directoryMtime);
 		}
-		return best;
+
+		const auto it = g_localManifestIndex.byDepot.find(depotId);
+		if (it == g_localManifestIndex.byDepot.end()) return 0;
+		for (const auto& candidate : it->second)
+		{
+			if (candidate.gid == planned) continue;
+			const std::string path = depotcacheDir + "/"
+				+ std::to_string(depotId) + "_"
+				+ std::to_string(candidate.gid) + ".manifest";
+			struct stat st{};
+			if (stat(path.c_str(), &st) == 0 && st.st_size > 0)
+				return candidate.gid;
+		}
+		return 0;
 	}
 
 	bool depotInScope(uint32_t appId, uint32_t depotId)

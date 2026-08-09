@@ -53,6 +53,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "synthmark.hpp"
+
 namespace AppInfoVdf
 {
 	// Append (or replace, by appid) one entry into the on-disk

@@ -20,8 +20,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ctime>
 #include <mutex>
 #include <sstream>
+#include <unordered_map>
 #include <sys/stat.h>
 #include <unordered_set>
 #include <vector>
@@ -178,6 +180,60 @@ namespace
 			anyInstalledPinMatched = true;
 		}
 		return anyInstalledPinMatched;
+	}
+
+	SynthMark::StripBudget g_synthStripBudget;
+
+	const SynthMark::StripLimits& synthStripLimits()
+	{
+		static const SynthMark::StripLimits limits = SynthMark::parseStripLimits(
+		    std::getenv("SLSSTEAM_SYNTH_STRIP_MAX"),
+		    std::getenv("SLSSTEAM_SYNTH_STRIP_SECS"));
+		return limits;
+	}
+
+	bool stripInstallEligible(uint32_t appId)
+	{
+		const bool appManagerResolved = g_pClientAppManager != nullptr;
+		bool fullyInstalled = false;
+		if (appManagerResolved)
+		{
+			fullyInstalled = (g_pClientAppManager->getAppInstallState(appId) &
+			                  APPSTATE_FULLY_INSTALLED) != 0;
+		}
+		return SynthMark::installStateAllowsStrip(
+		    AppInfoProvision::isSynthesizedApp(appId),
+		    g_config.isAddedAppId(appId), appManagerResolved, fullyInstalled);
+	}
+
+	const char* stripDecisionName(SynthMark::StripDecision decision)
+	{
+		switch (decision)
+		{
+			case SynthMark::StripDecision::Disabled:   return "disabled";
+			case SynthMark::StripDecision::CountLimit: return "count";
+			case SynthMark::StripDecision::TimeLimit:  return "time";
+			case SynthMark::StripDecision::Allow:      return "allow";
+		}
+		return "unknown";
+	}
+
+	bool permitSynthStrip(uint32_t appId)
+	{
+		if (!stripInstallEligible(appId)) return false;
+
+		const auto& limits = synthStripLimits();
+		const auto now = static_cast<std::int64_t>(std::time(nullptr));
+		const auto evaluation = g_synthStripBudget.reserve(appId, limits, now);
+		if (evaluation.decision == SynthMark::StripDecision::Allow) return true;
+
+		g_pLog->infoOnce(
+		    "SynthMark: strip cap tripped app=%u reason=%s count=%llu max=%llu secs=%llu\n",
+		    appId, stripDecisionName(evaluation.decision),
+		    static_cast<unsigned long long>(evaluation.nextState.count),
+		    static_cast<unsigned long long>(limits.maxStrips),
+		    static_cast<unsigned long long>(limits.maxSeconds));
+		return false;
 	}
 }
 
@@ -542,7 +598,8 @@ void Apps::sendPICSInfoRequest(CMsgClientPICSProductInfoRequest* msg)
 	// depots + installdir we synthesized into appinfo at startup, dropping
 	// the install dialog to 0 B with "Invalid install path".  By removing
 	// them from the request, Steam never re-fetches them and keeps the
-	// startup splice.  (Removing them does not make Steam request buffers it never asked for.)
+	// startup splice. Protection is gated off after full installation and is
+	// bounded per app so a stalled install cannot spin forever.
 	{
 		std::vector<uint32_t> requested;
 		requested.reserve(static_cast<size_t>(msg->apps_size()));
@@ -550,8 +607,7 @@ void Apps::sendPICSInfoRequest(CMsgClientPICSProductInfoRequest* msg)
 			requested.push_back(msg->apps(i).appid());
 
 		const auto strip = SynthMark::stripIndices(
-		    requested,
-		    [](uint32_t a) { return AppInfoProvision::isSynthesizedApp(a); });
+		    requested, [](uint32_t appId) { return permitSynthStrip(appId); });
 
 		for (int idx : strip) // descending, safe for in-place delete
 		{

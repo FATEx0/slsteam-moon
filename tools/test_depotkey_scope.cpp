@@ -26,8 +26,15 @@
 //   g++ -std=c++20 -I include tools/test_depotkey_scope.cpp -o /tmp/test_depotkey_scope && /tmp/test_depotkey_scope
 
 #include "../src/feats/depotkey_scope.hpp"
+#include "../src/feats/depotkey_import.hpp"
+#include "../src/feats/depotkey_index.hpp"
 
+#include <atomic>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
 static int g_failures = 0;
 
@@ -90,6 +97,84 @@ int main()
 	      "Lua-managed then observed stays managed (no downgrade)");
 	CHECK(mergeManagedFlag(true, true) == true,
 	      "managed then managed stays managed");
+
+	// The importer is called from both preinit and the later startup path.
+	// A missing prerequisite must not consume the gate: a later startup call
+	// with a valid Steam root must still run the importer.
+	DepotKey::LuaScriptImportGate importGate;
+	bool prerequisitesReady = false;
+	int imported = 0;
+	CHECK(!importGate.run([&] { return prerequisitesReady; },
+	                      [&] { ++imported; }),
+	      "missing Lua import prerequisite does not claim the gate");
+	CHECK(!importGate.done(),
+	      "missing Lua import prerequisite leaves the gate retryable");
+	prerequisitesReady = true;
+	CHECK(importGate.run([&] { return prerequisitesReady; },
+	                     [&] { ++imported; }),
+	      "Lua import claims the gate when prerequisites become available");
+	CHECK(imported == 1,
+	      "Lua import executes once after a retryable prerequisite miss");
+	CHECK(!importGate.run([&] { return prerequisitesReady; },
+	                      [&] { ++imported; }),
+	      "completed Lua import rejects later claims");
+	CHECK(imported == 1,
+	      "completed Lua import remains idempotent");
+
+	// A failed import must also leave the gate retryable, rather than
+	// permanently suppressing the next startup/watcher attempt.
+	DepotKey::LuaScriptImportGate failureGate;
+	int attempts = 0;
+	CHECK(!failureGate.run([] { return true; }, [&]
+	{
+		++attempts;
+		throw std::runtime_error("deterministic import failure");
+	}), "failed Lua import does not consume the gate");
+	CHECK(!failureGate.done(), "failed Lua import remains retryable");
+	CHECK(failureGate.run([] { return true; }, [&] { ++attempts; }),
+	      "Lua import succeeds on the retry after a failure");
+	CHECK(attempts == 2, "failed Lua import is attempted again exactly once");
+
+	// Startup and watcher calls may race.  The synchronized gate permits only
+	// one importer body even when all callers arrive concurrently.
+	DepotKey::LuaScriptImportGate concurrentGate;
+	std::atomic<int> concurrentImports{0};
+	std::atomic<int> acceptedClaims{0};
+	std::vector<std::thread> callers;
+	for (int i = 0; i < 8; ++i)
+	{
+		callers.emplace_back([&]
+		{
+			if (concurrentGate.run([] { return true; },
+			                         [&] { ++concurrentImports; }))
+			{
+				++acceptedClaims;
+			}
+		});
+	}
+	for (auto& caller : callers) caller.join();
+	CHECK(concurrentImports.load() == 1,
+	      "concurrent Lua import callers execute one body");
+	CHECK(acceptedClaims.load() == 1,
+	      "concurrent Lua import callers receive one claim");
+
+	// The disk catalog is loaded lazily once, then all subsequent key writes
+	// use the in-memory index.  This fixture makes the one-load contract
+	// observable without linking the Steam protobuf hook implementation.
+	DepotKey::LazyIndex<unsigned int, bool> index;
+	int loadCalls = 0;
+	index.loadOnce([&](auto& entries) {
+		++loadCalls;
+		entries.emplace(701u, false);
+	});
+	index.loadOnce([&](auto&) { ++loadCalls; });
+	CHECK(loadCalls == 1, "depot-key index loader runs once");
+	CHECK(index.find(701u) && !*index.find(701u),
+	      "depot-key index keeps the parsed record");
+	index.upsert(701u, DepotKey::mergeManagedFlag(*index.find(701u), true));
+	index.upsert(701u, DepotKey::mergeManagedFlag(*index.find(701u), false));
+	CHECK(index.find(701u) && *index.find(701u),
+	      "depot-key index preserves managed after passive re-observation");
 
 	if (g_failures == 0) std::printf("\nall depotkey-scope checks passed\n");
 	else                 std::printf("\n%d depotkey-scope check(s) FAILED\n", g_failures);

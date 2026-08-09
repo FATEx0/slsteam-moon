@@ -45,21 +45,39 @@ fi
 # Use throwaway stub .so files if a real build isn't present, so the test
 # stays fast and build-independent.  Restore the tree afterwards.
 STUBBED=()
+BACKUP_DIR="$(mktemp -d)"
+BACKED_UP=()
 for f in bin/SLSsteam.so bin/library-inject.so bin/pattern-refresh; do
-    if [ ! -s "$f" ]; then
-        mkdir -p bin
-        printf 'stub' > "$f"
-        [ "$f" != bin/pattern-refresh ] || chmod +x "$f"
-        STUBBED+=("$f")
+    mkdir -p bin
+    if [ -e "$f" ]; then
+        cp -a "$f" "$BACKUP_DIR/$(basename "$f")"
+        BACKED_UP+=("$f")
     fi
+    printf 'stub' > "$f"
+    [ "$f" != bin/pattern-refresh ] || chmod +x "$f"
+    STUBBED+=("$f")
 done
 
 ABI_TMP="$(mktemp -d)"
 ABI_READELF="$ABI_TMP/readelf"
 cat > "$ABI_READELF" <<'READELF'
 #!/bin/sh
-printf '  0x0010:   Name: GLIBC_%s  Flags: none  Version: 2\n' \
-    "${TEST_GLIBC_VERSION:-2.34}"
+case "$*" in
+    *--version-info*)
+        version="${TEST_GLIBC_VERSION:-2.34}"
+        case "$*" in
+            *bin/pattern-refresh*)
+                version="${TEST_PATTERN_GLIBC_VERSION:-$version}"
+                ;;
+        esac
+        printf '  0x0010:   Name: GLIBC_%s  Flags: none  Version: 2\n' \
+            "$version"
+        ;;
+    *-h*)
+        printf '  Class:                             ELF32\n'
+        printf '  Machine:                           Intel 80386\n'
+        ;;
+esac
 READELF
 chmod +x "$ABI_READELF"
 export READELF="$ABI_READELF" TEST_GLIBC_VERSION=2.34
@@ -79,13 +97,49 @@ else
     bad "scripts/check-pattern-refresh-abi.sh is missing"
 fi
 
+if [ -x scripts/check-sls-abi.sh ]; then
+    READELF="$ABI_READELF" TEST_GLIBC_VERSION=2.34 \
+        scripts/check-sls-abi.sh bin/SLSsteam.so >/dev/null 2>&1 \
+        && ok "SLS ABI gate accepts ELF32 GLIBC_2.34" \
+        || bad "SLS ABI gate rejected ELF32 GLIBC_2.34"
+    if READELF="$ABI_READELF" TEST_GLIBC_VERSION=2.35 \
+        scripts/check-sls-abi.sh bin/SLSsteam.so >/dev/null 2>&1; then
+        bad "SLS ABI gate accepted GLIBC_2.35"
+    else
+        ok "SLS ABI gate rejects symbols newer than GLIBC_2.34"
+    fi
+else
+    bad "scripts/check-sls-abi.sh is missing"
+fi
+
+STALE_VERSION="selftest-stale-$$"
 TEST_VERSION="selftest-$$"
+INCOMPATIBLE_VERSION="selftest-incompatible-$$"
 cleanup() {
-    rm -rf "dist/slsteam-moon-${TEST_VERSION}" \
-           "dist/slsteam-moon-linux-${TEST_VERSION}.zip" "$ABI_TMP"
+    rm -rf "dist/slsteam-moon-${STALE_VERSION}" \
+           "dist/slsteam-moon-linux-${STALE_VERSION}.zip" \
+           "dist/slsteam-moon-${TEST_VERSION}" \
+           "dist/slsteam-moon-linux-${TEST_VERSION}.zip" \
+           "dist/slsteam-moon-${INCOMPATIBLE_VERSION}" \
+           "dist/slsteam-moon-linux-${INCOMPATIBLE_VERSION}.zip" "$ABI_TMP"
     for f in "${STUBBED[@]}"; do rm -f "$f"; done
+    for f in "${BACKED_UP[@]}"; do cp -a "$BACKUP_DIR/$(basename "$f")" "$f"; done
+    rm -rf "$BACKUP_DIR"
 }
 trap cleanup EXIT
+
+# Non-empty but stale binaries must not be accepted as a release input. This
+# catches the ignored-bin failure mode where package.sh silently copies a
+# previous build after source files have changed.
+touch -d '@1' bin/SLSsteam.so bin/library-inject.so bin/pattern-refresh
+if scripts/package.sh --version "$STALE_VERSION" >/dev/null 2>&1; then
+    bad "package.sh accepted stale binaries"
+else
+    ok "package.sh rejects stale binaries"
+fi
+
+# Make the test binaries current for the positive packaging assertion below.
+touch bin/SLSsteam.so bin/library-inject.so bin/pattern-refresh
 
 if scripts/package.sh --version "$TEST_VERSION" >/dev/null 2>&1; then
     ZIP="dist/slsteam-moon-linux-${TEST_VERSION}.zip"
@@ -117,6 +171,39 @@ if scripts/package.sh --version "$TEST_VERSION" >/dev/null 2>&1; then
     fi
 else
     bad "package.sh exited non-zero"
+fi
+
+# The integrated package path must reject an incompatible SLSsteam ABI before
+# staging a release zip, not merely pass the helper's standalone unit check.
+if READELF="$ABI_READELF" TEST_GLIBC_VERSION=2.35 \
+    TEST_PATTERN_GLIBC_VERSION=2.34 \
+    scripts/package.sh --version "$INCOMPATIBLE_VERSION" >/dev/null 2>&1; then
+    bad "package.sh accepted incompatible SLSsteam ABI"
+elif [ -e "dist/slsteam-moon-${INCOMPATIBLE_VERSION}" ] \
+     || [ -e "dist/slsteam-moon-linux-${INCOMPATIBLE_VERSION}.zip" ]; then
+    bad "package.sh staged an incompatible SLSsteam release"
+else
+    ok "package.sh rejects incompatible SLSsteam ABI before staging"
+fi
+
+# A file with the target name must not suppress the regression target. The
+# target is intentionally phony so a checkout artifact cannot make CI skip it.
+PHONY_PROBE="test-depotkey-scope"
+PHONY_BACKUP=""
+if [ -e "$PHONY_PROBE" ]; then
+    PHONY_BACKUP="$(mktemp)"
+    cp -a "$PHONY_PROBE" "$PHONY_BACKUP"
+fi
+touch "$PHONY_PROBE"
+if make -n "$PHONY_PROBE" 2>/dev/null | grep -q "tools/test_depotkey_scope.cpp"; then
+    ok "test-depotkey-scope remains phony when a file exists"
+else
+    bad "test-depotkey-scope is suppressed by a same-named file"
+fi
+rm -f "$PHONY_PROBE"
+if [ -n "$PHONY_BACKUP" ]; then
+    cp -a "$PHONY_BACKUP" "$PHONY_PROBE"
+    rm -f "$PHONY_BACKUP"
 fi
 
 echo "== test-package: $PASS passed, $FAIL failed =="

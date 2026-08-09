@@ -46,7 +46,7 @@ ifeq ($(shell type mold &> /dev/null && echo "found"),found)
 	LDFLAGS += -fuse-ld=mold
 endif
 
-.PHONY: all build rebuild clean install release test-cmwire test-pattern-catalog test-pattern-refresh test-process-lock test-atomic-file test-appinfo-transaction
+.PHONY: all build rebuild clean install release test-cmwire test-pattern-catalog test-pattern-cache test-pattern-refresh test-process-lock test-atomic-file test-appinfo-transaction test-audit-symbols test-audit-policy test-memhlp-target test-memhlp-prologue test-memhlp-pic test-utils-sha test-provision-cache test-runtime-dependencies test-thread-start test-steamstub-warmup test-boundedexecutor test-steamless-prewarm test-depotkey-scope test-curl-timeout test-manifest-index test-prewarm-backoff
 .NOTPARALLEL: clean rebuild
 
 all: build
@@ -128,12 +128,100 @@ test-pattern-catalog:
 		-o /tmp/test_pattern_catalog
 	/tmp/test_pattern_catalog
 
+test-pattern-cache:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_pattern_cache.cpp src/pattern_cache.cpp \
+		-o /tmp/test_pattern_cache
+	/tmp/test_pattern_cache
+
 test-pattern-refresh:
 	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I tools -I src \
 		tools/test_pattern_refresh.cpp tools/pattern-refresh/catalog.cpp \
 		src/pattern_catalog.cpp -lcurl -lcrypto -lpthread \
 		-o /tmp/test_pattern_refresh
 	/tmp/test_pattern_refresh
+
+test-audit-symbols:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_audit_symbols.cpp -o /tmp/test_audit_symbols
+	/tmp/test_audit_symbols
+
+test-audit-policy:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_audit_policy.cpp -o /tmp/test_audit_policy
+	/tmp/test_audit_policy
+
+test-depotkey-scope:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I include \
+		tools/test_depotkey_scope.cpp -pthread -o /tmp/test_depotkey_scope
+	/tmp/test_depotkey_scope
+
+test-memhlp-target:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src -I include \
+		tools/test_memhlp_target.cpp -o /tmp/test_memhlp_target
+	/tmp/test_memhlp_target
+
+test-memhlp-prologue:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src -I include \
+		tools/test_memhlp_prologue.cpp -o /tmp/test_memhlp_prologue
+	/tmp/test_memhlp_prologue
+
+test-memhlp-pic:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src -I include \
+		tools/test_memhlp_pic.cpp -o /tmp/test_memhlp_pic
+	/tmp/test_memhlp_pic
+
+test-utils-sha:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_utils_sha.cpp src/utils.cpp -o /tmp/test_utils_sha
+	/tmp/test_utils_sha
+
+test-provision-cache:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_provision_cache.cpp -o /tmp/test_provision_cache
+	/tmp/test_provision_cache
+
+test-runtime-dependencies:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -ffunction-sections -fdata-sections -I src \
+		-c src/runtime_dependencies.cpp -o /tmp/runtime_dependencies.o
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -ffunction-sections -fdata-sections -I src \
+		tools/test_runtime_dependencies.cpp /tmp/runtime_dependencies.o \
+		-Wl,--gc-sections -o /tmp/test_runtime_dependencies
+	/tmp/test_runtime_dependencies
+
+test-thread-start:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_thread_start.cpp -o /tmp/test_thread_start
+	/tmp/test_thread_start
+
+test-steamstub-warmup:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_steamstub_warmup.cpp -o /tmp/test_steamstub_warmup
+	/tmp/test_steamstub_warmup
+
+test-boundedexecutor:
+	$(CXX) -std=c++20 -pthread -Wall -Wextra -Wpedantic -Werror \
+		tools/test_boundedexecutor.cpp -o /tmp/test_boundedexecutor
+	/tmp/test_boundedexecutor
+
+test-steamless-prewarm:
+	bash scripts/test-steamless-prewarm.sh
+
+test-curl-timeout:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_curl_timeout.cpp src/curl.cpp -ldl -pthread \
+		-o /tmp/test_curl_timeout
+	/tmp/test_curl_timeout
+
+test-manifest-index:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_manifest_index.cpp -o /tmp/test_manifest_index
+	/tmp/test_manifest_index
+
+test-prewarm-backoff:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_prewarm_backoff.cpp -o /tmp/test_prewarm_backoff
+	/tmp/test_prewarm_backoff
 
 test-process-lock:
 	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \

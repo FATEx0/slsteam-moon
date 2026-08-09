@@ -21,10 +21,45 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace AppInfoProvision
 {
 namespace cache
 {
+
+// Identity of the on-disk buffer used as the memoization key for its
+// expensive YAML/SHA-1/VDF validation.  Seconds plus size are not enough:
+// an atomic replacement can preserve both while changing the content within
+// the same second.  Include nanoseconds and inode so that replacement files
+// cannot inherit a previous validation result.
+struct CacheValidationKey
+{
+	uint32_t appId = 0;
+	long long mtimeSecs = 0;
+	long long mtimeNsecs = 0;
+	long long size = 0;
+	std::uint64_t inode = 0;
+
+	bool operator==(const CacheValidationKey& other) const noexcept
+	{
+		return appId == other.appId
+		    && mtimeSecs == other.mtimeSecs
+		    && mtimeNsecs == other.mtimeNsecs
+		    && size == other.size
+		    && inode == other.inode;
+	}
+
+	bool operator<(const CacheValidationKey& other) const noexcept
+	{
+		if (appId != other.appId) return appId < other.appId;
+		if (mtimeSecs != other.mtimeSecs) return mtimeSecs < other.mtimeSecs;
+		if (mtimeNsecs != other.mtimeNsecs)
+			return mtimeNsecs < other.mtimeNsecs;
+		if (size != other.size) return size < other.size;
+		return inode < other.inode;
+	}
+};
 
 enum class CacheUse
 {
@@ -66,6 +101,20 @@ inline CacheUse chooseCacheUse(bool cacheValid, bool cacheFresh,
 	if (!cacheValid) return CacheUse::None;
 	if (cacheFresh) return CacheUse::Fresh;
 	return refreshUnavailable ? CacheUse::Fallback : CacheUse::None;
+}
+
+// Full validation is needed only on paths that can serve the buffer: a fresh
+// same-boot hit or an offline fallback.  A stale online buffer is going to be
+// refreshed and must not pay the YAML/SHA-1/VDF validation cost.
+inline bool shouldValidateCache(bool cacheFresh, bool refreshUnavailable)
+{
+	return cacheFresh || refreshUnavailable;
+}
+
+inline bool wireSizeMatches(unsigned long long actualSize,
+                            unsigned long long declaredSize)
+{
+	return declaredSize > 0 && actualSize == declaredSize;
 }
 
 // Decide whether an existing provisioned buffer can be reused (i.e. the

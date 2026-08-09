@@ -145,8 +145,7 @@ std::string Utils::getFileSHA256(const char *filePath)
 	std::ifstream fs(filePath, std::ios::binary);
 	if (!fs.is_open())
 	{
-		//TODO: Read more about error types in C++ :)
-		throw std::runtime_error("Unable to read file!");
+		return "";
 	}
 
 	Sha256Ctx ctx;

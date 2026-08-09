@@ -28,6 +28,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "../src/pattern_scan.hpp"
+
 using lm_address_t = uintptr_t;
 using lm_byte_t    = uint8_t;
 
@@ -132,6 +134,27 @@ int main()
 
     auto wb = patternToBytes("DE ? BE EF");     // wildcard still works
     CHECK(scan_fixed(wb, L.base, L.end) == L.base + 100, "wildcard match works");
+
+    printf("[4] optimized scan keeps first-match and duplicate-sweep contracts\n");
+    memcpy(L.p + 200, needle, 4);
+    auto optimizedFirst = MemHlp::scanPatternRange(nb, L.base, L.end, false);
+    CHECK(optimizedFirst.address == L.base + 100, "normal scan returns the first match");
+    CHECK(optimizedFirst.matches == 1, "normal scan stops after the first match");
+
+    auto optimizedFull = MemHlp::scanPatternRange(nb, L.base, L.end, true);
+    CHECK(optimizedFull.address == L.base + 200, "extended scan preserves the last resolved match");
+    CHECK(optimizedFull.matches == 2, "extended scan counts duplicate matches");
+
+    auto leadingWildcard = patternToBytes("? 11 22 33");
+    uint8_t wildcardNeedle[4] = { 0x44, 0x11, 0x22, 0x33 };
+    memcpy(L.p + 300, wildcardNeedle, 4);
+    memcpy(L.p + 400, wildcardNeedle, 4);
+    auto wildcardFirst = MemHlp::scanPatternRange(leadingWildcard, L.base, L.end, false);
+    CHECK(wildcardFirst.address == L.base + 300, "memchr anchor may follow a leading wildcard");
+
+    auto allWildcards = patternToBytes("? ? ?");
+    auto wildcardSweep = MemHlp::scanPatternRange(allWildcards, L.base, L.base + 3, false);
+    CHECK(wildcardSweep.address == L.base, "all-wildcard patterns use the safe fallback");
 
     printf(g_fail ? "\nFAILED (%d)\n" : "\nOK\n", g_fail);
     return g_fail ? 1 : 0;

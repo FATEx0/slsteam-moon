@@ -17,6 +17,7 @@
 //   g++ -std=c++20 -I include tools/test_dlcids.cpp -o /tmp/test_dlcids && /tmp/test_dlcids
 
 #include "../src/feats/dlcids.hpp"
+#include "../src/config_default.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -101,7 +102,105 @@ int main()
 		CHECK(has(dlc, 401920) && dlc.size() == 1, "keeps the real dlc only");
 	}
 
-	// 5) no DLC info -> empty, no crash.
+	// 5) The tagged variant keeps planner-critical depot tags separate from
+	// storefront-only extended.listofdlc entries, while preserving each
+	// source's deduplication and base-app filtering.
+	{
+		const std::string wire =
+			"\"appinfo\"\n{\n"
+			"\t\"extended\"\n\t{\n"
+			"\t\t\"listofdlc\"\t\t\"401920,570660,401920,250900\"\n"
+			"\t}\n"
+			"\t\"depots\"\n\t{\n"
+			"\t\t\"250905\"\n\t\t{\n"
+			"\t\t\t\"dlcappid\"\t\t\"1426300\"\n"
+			"\t\t}\n"
+			"\t\t\"250906\"\n\t\t{\n"
+			"\t\t\t\"dlcappid\"\t\t\"1426300\"\n"
+			"\t\t}\n"
+			"\t}\n"
+			"}\n";
+		const auto tagged =
+			AppInfoProvision::extractDlcAppIdsBySource(wire, 250900);
+		CHECK(tagged.advertised.size() == 2 &&
+		      has(tagged.advertised, 401920) &&
+		      has(tagged.advertised, 570660),
+		      "tagged: advertised ids stay in the advertised source");
+		CHECK(tagged.depotTagged.size() == 1 &&
+		      has(tagged.depotTagged, 1426300),
+		      "tagged: depot dlcappid ids stay planner-critical");
+		CHECK(!has(tagged.advertised, 250900) &&
+		      !has(tagged.depotTagged, 250900),
+		      "tagged: excludes the base appid from both sources");
+	}
+
+	// 6) Default injection keeps depot-tagged ids in package 0, admits only
+	// advertised ids with known content, and still records every DLC id for
+	// local legacy-key suppression.
+	{
+		AppInfoProvision::DlcAppIds sources;
+		sources.depotTagged = {100};
+		sources.advertised = {200, 300};
+		const std::unordered_set<uint32_t> content = {200};
+		const auto selected =
+			AppInfoProvision::selectDlcInjectionIds(sources, content, false);
+
+		CHECK(selected.package0.size() == 2 &&
+		      has(selected.package0, 100) && has(selected.package0, 200) &&
+		      !has(selected.package0, 300),
+		      "select: default package injection is tagged plus content-backed advertised");
+		CHECK(selected.appDlc.size() == 3 &&
+		      has(selected.appDlc, 100) && has(selected.appDlc, 200) &&
+		      has(selected.appDlc, 300),
+		      "select: app-local DLC coverage keeps all sources");
+	}
+
+	// 7) The explicit compatibility setting restores the previous behavior
+	// and sends every advertised id to package 0.
+	{
+		AppInfoProvision::DlcAppIds sources;
+		sources.depotTagged = {100};
+		sources.advertised = {200, 300};
+		const auto selected = AppInfoProvision::selectDlcInjectionIds(
+			sources, {}, true);
+		CHECK(selected.package0.size() == 3 &&
+		      has(selected.package0, 100) && has(selected.package0, 200) &&
+		      has(selected.package0, 300),
+		      "select: InjectAllAdvertisedDlc restores the merged package set");
+	}
+
+	// 8) `hasdepotsindlc` is the base-app marker for DLCs that ship their own
+	// depots; false and missing markers must not qualify advertised ids.
+	{
+		CHECK(AppInfoProvision::hasDepotsInDlc(
+		          "\"depots\"\n{\n\t\"hasdepotsindlc\"\t\"1\"\n}\n"),
+		      "content marker: hasdepotsindlc=1 is detected");
+		CHECK(!AppInfoProvision::hasDepotsInDlc(
+		          "\"depots\"\n{\n\t\"hasdepotsindlc\"\t\"0\"\n}\n"),
+		      "content marker: hasdepotsindlc=0 is rejected");
+		CHECK(!AppInfoProvision::hasDepotsInDlc("\"appinfo\"\n{\n}\n"),
+		      "content marker: missing hasdepotsindlc is rejected");
+	}
+
+	// 9) The artifact index accepts valid <depot>_<gid>.manifest names and
+	// rejects malformed or non-manifest entries.
+	{
+		uint32_t depotId = 0;
+		CHECK(AppInfoProvision::depotIdFromManifestName(
+		              "250905_123456.manifest", depotId) && depotId == 250905,
+		      "artifact: parses depot id from a manifest filename");
+		CHECK(!AppInfoProvision::depotIdFromManifestName(
+		              "250905.manifest", depotId),
+		      "artifact: rejects a manifest without gid separator");
+		CHECK(!AppInfoProvision::depotIdFromManifestName(
+		              "250905_bad.manifest", depotId),
+		      "artifact: rejects a non-numeric manifest gid");
+		CHECK(!AppInfoProvision::depotIdFromManifestName(
+		              "0_123456.manifest", depotId),
+		      "artifact: rejects depot id zero");
+	}
+
+	// 10) no DLC info -> empty, no crash.
 	{
 		const std::string wire =
 			"\"appinfo\"\n{\n\t\"appid\"\t\t\"285900\"\n\t\"depots\"\n\t{\n"
@@ -231,6 +330,14 @@ int main()
 		      "classify: a dlcappid-tagged depot resolves to the tag");
 		CHECK(AppInfoProvision::dlcAppIdForDepot(tagged, 250900, 250900) == 0,
 		      "classify: tagged form still protects the base app");
+	}
+
+	// 16) The shipped config opts out of injecting storefront-only DLC by
+	// default; users can opt back in without rebuilding.
+	{
+		const std::string defaults(defaultConfig);
+		CHECK(defaults.find("InjectAllAdvertisedDlc: no") != std::string::npos,
+		      "config: InjectAllAdvertisedDlc defaults to no");
 	}
 
 	if (g_failures == 0) { std::printf("\nALL PASS\n"); return 0; }

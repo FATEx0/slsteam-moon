@@ -8,15 +8,18 @@
 #include "../config.hpp"
 #include "../globals.hpp"
 #include "../log.hpp"
+#include "../thread_start.hpp"
 
 #include "../utils/ManifestFetch.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -32,6 +35,19 @@ namespace
 // Only ever flips false -> true.  The background worker runs for the rest
 // of the Steam session, so once it is up we never start a second one.
 std::atomic<bool> g_started{false};
+std::atomic<bool> g_stopRequested{false};
+std::mutex g_stopMu;
+std::condition_variable g_stopCv;
+
+template <typename Rep, typename Period>
+bool waitOrStop(std::chrono::duration<Rep, Period> delay)
+{
+	std::unique_lock<std::mutex> lock(g_stopMu);
+	return g_stopCv.wait_for(lock, delay, []
+	{
+		return g_stopRequested.load(std::memory_order_acquire);
+	});
+}
 
 std::string bufferPath(uint32_t appId)
 {
@@ -106,15 +122,8 @@ void runLoop()
 {
 	using namespace std::chrono_literals;
 
-	// Re-stage interval: short enough that a post-commit purge is healed
-	// before the next planning pass (Steam's own auto-retry is ~30s), yet
-	// not a busy loop.  A steady-state pass with everything already on disk
-	// is just stat() calls — ManifestFetch's (gid,depotId) dedup returns the
-	// cached success future after re-checking the file is still present, and
-	// only re-fetches a manifest Steam actually purged.
-	constexpr auto kPassInterval = 30s;
 	// Small gap between depots so a cold first pass doesn't fire every CDN
-	// request at once.  We block on our OWN thread, so this just paces us.
+	// request at once. We block on our OWN thread, so this just paces us.
 	constexpr auto kPerDepotGap = 200ms;
 
 	// This is our dedicated, session-long worker thread.  Suppress desktop
@@ -130,9 +139,15 @@ void runLoop()
 	// so we stop re-fetching (and re-logging) it every 30s forever.
 	constexpr int kMaxFails = 3;
 	FailureTracker failures(kMaxFails);
+	PassBackoff backoff;
 
 	for (;;)
 	{
+		if (g_stopRequested.load(std::memory_order_acquire))
+			return;
+		std::vector<DepotGid> targets;
+		bool newTarget = false;
+		bool hasEligibleTarget = false;
 		const auto added = g_config.addedAppIds.get();
 		if (!added.empty())
 		{
@@ -150,7 +165,7 @@ void runLoop()
 			const auto hasKey = [](uint32_t depotId) {
 				return !DepotKey::getCachedKey(depotId).key.empty();
 			};
-			auto targets = planStageTargets(buffers, hasKey);
+			targets = planStageTargets(buffers, hasKey);
 
 			// Workshop depots are NOT in the provisioned picsbuffer's
 			// `depots` block (the appid only appears as the value of
@@ -197,6 +212,7 @@ void runLoop()
 				// gone from the CDN even with a fresh code): stop retrying it
 				// for the rest of the session.
 				if (failures.isBlacklisted(depotId, gid)) continue;
+				hasEligibleTarget = true;
 
 				// Blocking await ON OUR DEDICATED THREAD serialises the
 				// fetches (no thread storm) and reuses ManifestFetch's
@@ -234,11 +250,20 @@ void runLoop()
 						    kMaxFails);
 					}
 				}
-				std::this_thread::sleep_for(kPerDepotGap);
+				if (waitOrStop(kPerDepotGap))
+					return;
 			}
 		}
 
-		std::this_thread::sleep_for(kPassInterval);
+		newTarget = backoff.observeTargets(targets);
+		const bool noOpPass = !targets.empty() && !hasEligibleTarget && !newTarget;
+		backoff.recordPass(noOpPass);
+		if (noOpPass && backoff.noOpPasses() == PassBackoff::kNoOpPassesBeforeBackoff)
+		{
+			g_pLog->debug("Prewarm: all targets blacklisted; backing off to 5 minutes\n");
+		}
+		if (waitOrStop(backoff.interval()))
+			return;
 	}
 }
 
@@ -260,12 +285,43 @@ void ensureStarted()
 		return;
 	}
 
+	g_stopRequested.store(false, std::memory_order_release);
 	g_pLog->info("Prewarm: starting background manifest pre-warm worker\n");
 
 	// Detached: lives for the Steam session.  MUST only be reached from a
 	// real Steam worker thread (the PICS recv path) — never the LD_AUDIT
 	// load()/setup() path, as that path must not spawn background threads.
-	std::thread(runLoop).detach();
+	// Keep the std::thread object owned by startDetached until detach succeeds;
+	// if it fails, request a prompt stop so the recovery join cannot hang on
+	// the session-long loop.
+	const bool started = ThreadStart::startDetached(
+		[]
+		{
+			ThreadStart::runGuarded(
+				[] { runLoop(); },
+				[]
+				{
+					g_pLog->warn("Prewarm: background worker failed unexpectedly; will retry\n");
+				},
+				[]
+				{
+					g_started.store(false, std::memory_order_release);
+				});
+		},
+		[]
+		{
+			g_stopRequested.store(false, std::memory_order_release);
+			g_started.store(false, std::memory_order_release);
+		},
+		[]
+		{
+			g_stopRequested.store(true, std::memory_order_release);
+			g_stopCv.notify_all();
+		});
+	if (!started)
+	{
+		g_pLog->warn("Prewarm: unable to start background worker; will retry\n");
+	}
 }
 
 } // namespace Prewarm

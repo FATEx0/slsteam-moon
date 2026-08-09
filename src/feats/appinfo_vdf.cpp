@@ -16,6 +16,7 @@
 #include "yaml-cpp/yaml.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -23,9 +24,9 @@
 #include <ios>
 #include <openssl/sha.h>
 #include <dlfcn.h>
-#include <regex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <ctime>
 #include <unistd.h>
 #include <unordered_map>
@@ -43,6 +44,24 @@ namespace
 
 constexpr uint32_t MAGIC_V41 = 0x07564429;
 constexpr uint32_t UNIVERSE_PUBLIC = 1;
+
+bool parsePicsBufferName(const std::string& name, uint32_t& appId)
+{
+	constexpr std::string_view prefix = "picsbuffer_";
+	constexpr std::string_view suffix = ".yaml";
+	if (name.size() <= prefix.size() + suffix.size()) return false;
+	if (name.compare(0, prefix.size(), prefix) != 0) return false;
+	if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+		return false;
+
+	const char* first = name.data() + prefix.size();
+	const char* last = name.data() + name.size() - suffix.size();
+	uint32_t parsed = 0;
+	const auto result = std::from_chars(first, last, parsed);
+	if (result.ec != std::errc{} || result.ptr != last) return false;
+	appId = parsed;
+	return true;
+}
 
 // KV1 binary node types.
 namespace KV
@@ -920,7 +939,7 @@ bool injectApp(const std::string& path,
 	ProcessLock::FileLock lock(appInfoLockPath(path));
 	if (!lock.acquired())
 	{
-		g_pLog->debug("AppInfoVdf: another writer owns %s; skipping app=%u\n",
+		g_pLog->info("AppInfoVdf: another writer owns %s; skipping app=%u\n",
 		              appInfoLockPath(path).c_str(), appid);
 		return false;
 	}
@@ -961,7 +980,7 @@ int injectAllCached(const std::string& path)
 	ProcessLock::FileLock lock(appInfoLockPath(path));
 	if (!lock.acquired())
 	{
-		g_pLog->debug("AppInfoVdf: another writer owns %s; skipping cache splice\n",
+		g_pLog->info("AppInfoVdf: another writer owns %s; skipping cache splice\n",
 		              appInfoLockPath(path).c_str());
 		return 0;
 	}
@@ -975,32 +994,56 @@ int injectAllCached(const std::string& path)
 		return 0;
 	}
 
-	const std::regex metaRe("picsbuffer_(\\d+)\\.yaml");
-	std::vector<std::filesystem::path> metadata;
+	const auto managed = g_config.managedAppIds.get();
+	const std::string quarantineSuffix =
+		".orphaned." +
+		std::to_string(static_cast<long long>(std::time(nullptr))) + "." +
+		std::to_string(static_cast<long long>(::getpid()));
+	for (const auto& record : SynthMark::quarantineOrphans(
+		cacheDir, managed, quarantineSuffix))
+	{
+		g_pLog->infoOnce("AppInfoVdf: quarantined orphan app cache %s -> %s\n",
+		                record.original.string().c_str(),
+		                record.quarantined.string().c_str());
+	}
+
+	struct CachedMetadata
+	{
+		std::filesystem::path path;
+		uint32_t appId = 0;
+	};
+	std::vector<CachedMetadata> metadata;
 	std::error_code iterError;
 	for (std::filesystem::directory_iterator it(cacheDir, iterError), end;
 	     it != end && !iterError; it.increment(iterError))
 	{
 		if (!it->is_regular_file()) continue;
 		const auto fname = it->path().filename().string();
-		std::smatch m;
-		if (std::regex_match(fname, m, metaRe)) metadata.push_back(it->path());
+		uint32_t expectedAppId = 0;
+		if (parsePicsBufferName(fname, expectedAppId))
+			metadata.push_back({it->path(), expectedAppId});
 	}
-	std::sort(metadata.begin(), metadata.end());
+	std::sort(metadata.begin(), metadata.end(),
+	          [](const CachedMetadata& a, const CachedMetadata& b) {
+			  return a.path < b.path;
+	          });
 
 	int injected = 0;
 	bool changed = false;
-	for (const auto& metaPath : metadata)
+	for (const auto& record : metadata)
 	{
+		const auto& metaPath = record.path;
 		const auto fname = metaPath.filename().string();
-		std::smatch m;
-		if (!std::regex_match(fname, m, metaRe)) continue;
+		const uint32_t expectedAppId = record.appId;
 
 		CachedBuffer cb;
 		std::string err;
-		uint32_t expectedAppId = 0;
-		try { expectedAppId = static_cast<uint32_t>(std::stoul(m[1].str())); }
-		catch (...) {}
+		if (managed.count(expectedAppId) == 0)
+		{
+			g_pLog->infoOnce("AppInfoVdf: skipping orphan cache app=%u (%s)\n",
+			                expectedAppId, fname.c_str());
+			continue;
+		}
 		if (!loadCachedBuffer(metaPath.string(), expectedAppId, cb, err))
 		{
 			g_pLog->debug("AppInfoVdf: skip %s: %s\n",

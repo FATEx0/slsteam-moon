@@ -74,6 +74,20 @@ inline bool keepDiscoveredMainApp(uint32_t appId, bool idIsAlsoManagedDepot)
 	return appId > 0;
 }
 
+// Return the ids present before a config reload but absent afterwards. A
+// sorted result keeps removal side effects deterministic even though the
+// config sets themselves are unordered.
+inline std::vector<uint32_t> removedAppIds(
+    const std::unordered_set<uint32_t>& before,
+    const std::unordered_set<uint32_t>& after)
+{
+	std::vector<uint32_t> removed;
+	for (const uint32_t appId : before)
+		if (!after.contains(appId)) removed.push_back(appId);
+	std::sort(removed.begin(), removed.end());
+	return removed;
+}
+
 struct InstalledApps
 {
 	std::unordered_set<uint32_t> all;

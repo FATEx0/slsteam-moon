@@ -35,6 +35,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -92,6 +93,60 @@ private:
 
 	int m_max;
 	std::unordered_map<uint64_t, int> m_fails;
+};
+
+class PassBackoff
+{
+public:
+	static constexpr int kNoOpPassesBeforeBackoff = 3;
+	static constexpr auto kBaseInterval = std::chrono::seconds(30);
+	static constexpr auto kBackoffInterval = std::chrono::minutes(5);
+
+	// Returns true when this pass contains a depot/gid that was not present in
+	// the previous pass. A new target must immediately restore the fast poll.
+	bool observeTargets(const std::vector<DepotGid>& targets)
+	{
+		std::unordered_set<uint64_t> current;
+		current.reserve(targets.size());
+		for (const auto& [depotId, gid] : targets)
+			current.insert(pack(depotId, gid));
+
+		bool newTarget = false;
+		for (const auto key : current)
+		{
+			if (!m_targets.count(key))
+			{
+				newTarget = true;
+				break;
+			}
+		}
+		m_targets = std::move(current);
+		return newTarget;
+	}
+
+	void recordPass(bool noOp)
+	{
+		if (noOp) ++m_noOpPasses;
+		else m_noOpPasses = 0;
+	}
+
+	std::chrono::seconds interval() const
+	{
+		return m_noOpPasses >= kNoOpPassesBeforeBackoff
+			? kBackoffInterval
+			: kBaseInterval;
+	}
+
+	int noOpPasses() const { return m_noOpPasses; }
+
+private:
+	static uint64_t pack(uint32_t depotId, uint64_t gid)
+	{
+		return gid ^ (static_cast<uint64_t>(depotId) * 0x9E3779B97F4A7C15ULL);
+	}
+
+	std::unordered_set<uint64_t> m_targets;
+	int m_noOpPasses = 0;
 };
 
 namespace detail

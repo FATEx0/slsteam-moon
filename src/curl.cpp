@@ -57,6 +57,8 @@ int Curl::getString(const char* url, std::string& out)
 	// (it aborts via __longjmp_chk when the signal lands on another
 	// thread's stack).  See ManifestFetch::httpGet for the full rationale.
 	p_curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	p_curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+	p_curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
 
 	auto res = p_curl_easy_perform(curl);
 
