@@ -649,6 +649,52 @@ fi
 : > "$GUARD_LAST" 2>/dev/null || true
 printf '%s' "$GUARD_CLIENT_CUR" > "$GUARD_CLIENT_LAST" 2>/dev/null || true
 
+# Signed pattern metadata preflight. The normal path is cache-only and performs
+# no network I/O: when both exact-module catalogs are already valid, Steam
+# launches immediately and a serialized remote revalidation runs in the
+# background. A new client build has no exact cache, so only that path waits for
+# the helper's bounded mirror deadline before continuing with the embedded
+# patterns if the network is unavailable.
+slsm_pattern_steam_root() {
+	for _slsm_root in "$HOME/.steam/steam" \
+	                  "$HOME/.steam/debian-installation" \
+	                  "$HOME/.local/share/Steam"; do
+		if [ -f "$_slsm_root/ubuntu12_32/steamclient.so" ] && \
+		   [ -f "$_slsm_root/ubuntu12_32/steamui.so" ]; then
+			printf '%s' "$_slsm_root"
+			return 0
+		fi
+	done
+	return 1
+}
+slsm_refresh_patterns() {
+	_slsm_helper="$SLSDIR/pattern-refresh"
+	[ -x "$_slsm_helper" ] || return 0
+	_slsm_root="$(slsm_pattern_steam_root)" || return 0
+	_slsm_config_root="${XDG_CONFIG_HOME:-$HOME/.config}"
+	case "$_slsm_config_root" in
+		/*) ;;
+		*) _slsm_config_root="$HOME/.config" ;;
+	esac
+	if env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH \
+	       "$_slsm_helper" --cache-only \
+	       --steam-root "$_slsm_root" --config-root "$_slsm_config_root" \
+	       >/dev/null 2>&1 < /dev/null; then
+		(
+			trap '' HUP
+			env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH \
+			    "$_slsm_helper" \
+			    --steam-root "$_slsm_root" --config-root "$_slsm_config_root"
+		) >/dev/null 2>&1 < /dev/null &
+	else
+		env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH \
+		    "$_slsm_helper" \
+		    --steam-root "$_slsm_root" --config-root "$_slsm_config_root" \
+		    >/dev/null 2>&1 < /dev/null || true
+	fi
+}
+slsm_refresh_patterns
+
 # CloudRedirect (optional): inject its 32-bit cloud-save hook via LD_PRELOAD.
 # Our bundled build is CloudRedirect 2.1.5 (correct save restore via
 # StripCasShaLeaf) with the steamclient.so wait extended 10s -> 120s so it

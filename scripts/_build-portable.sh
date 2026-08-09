@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Portable build implementation. Invoked by scripts/build.sh --portable.
-# Builds inside an Ubuntu 22.04 container so the resulting binary works
-# on any distro with glibc >= 2.34 (the version Ubuntu 22.04 ships with).
+# Builds inside an Ubuntu 22.04 container. The native helper is then checked
+# separately so it cannot require any glibc symbol newer than GLIBC_2.34.
 
 set -euo pipefail
 
@@ -47,4 +47,6 @@ echo "==> portable build (using $runtime, image slsteam-moon-builder)"
 	slsteam-moon-builder \
 	bash -c 'make clean && make'
 
-echo "==> built: bin/SLSsteam.so, bin/library-inject.so"
+scripts/check-pattern-refresh-abi.sh bin/pattern-refresh
+
+echo "==> built: bin/SLSsteam.so, bin/library-inject.so, bin/pattern-refresh"

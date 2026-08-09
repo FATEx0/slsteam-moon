@@ -1,8 +1,9 @@
 # Builder image for slsteam-moon's portable build.
 #
-# Ubuntu 22.04 -> glibc 2.34. Resulting binary works on any distro
-# with glibc >= 2.34: Ubuntu 22.04+, Debian 12+, Fedora 36+, modern
-# Mint/Pop!_OS/Zorin, etc.
+# Ubuntu 22.04 supplies the release toolchain. Its glibc is 2.35, while the
+# produced helper is policy-gated to require no symbols newer than GLIBC_2.34.
+# Resulting binaries target Ubuntu 22.04+, Debian 12+, Fedora 36+, and modern
+# Mint/Pop!_OS/Zorin releases.
 #
 # Used by scripts/build.sh --portable (which invokes
 # scripts/_build-portable.sh). Source is bind-mounted at run time;

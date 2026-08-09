@@ -72,6 +72,7 @@ if [ -n "${LD_AUDIT:-}" ]; then echo "injected" >> "$INVOCATIONS"; else echo "va
 if [ -n "${SLSM_TEST_EMIT_STDERR:-}" ]; then
   echo "steam-real-error: keep this diagnostic" >&2
 fi
+[ -n "${PATTERN_ORDER_LOG:-}" ] && echo "steam" >> "$PATTERN_ORDER_LOG"
 exit 0
 FS
 chmod +x "$FAKE_STEAM"
@@ -309,6 +310,68 @@ run_wrapper                                              # boot 3: one crash, cl
 [ "$(nth 3)" = "injected" ] && ok "unchanged client: single crash still injects (no fast latch)" || bad "boot 3 wrongly fell back: $(nth 3)"
 [ ! -f "$GUARD_DIR/safe_mode" ] && ok "unchanged client: no latch on a single crash" || bad "wrongly latched on one crash with unchanged client"
 [ "$(count)" = "1" ] && ok "unchanged client: fail count incremented to 1" || bad "unexpected count: $(count)"
+
+# --- signed pattern refresh stays outside the warm launch critical path -------
+PATTERN_HELPER="$SLSDIR/pattern-refresh"
+PATTERN_ORDER_LOG="$HOME_DIR/pattern-order.log"
+export PATTERN_ORDER_LOG
+cat > "$PATTERN_HELPER" <<'PH'
+#!/bin/sh
+case " $* " in
+	*" --cache-only "*)
+		echo "cache-only" >> "$PATTERN_ORDER_LOG"
+		[ "${SLSM_TEST_PATTERN_CACHE:-miss}" = hit ] && exit 0
+		exit 3
+		;;
+	*)
+		echo "remote-start" >> "$PATTERN_ORDER_LOG"
+		sleep "${SLSM_TEST_PATTERN_DELAY:-0}"
+		echo "remote-done" >> "$PATTERN_ORDER_LOG"
+		exit 0
+		;;
+esac
+PH
+chmod +x "$PATTERN_HELPER"
+mkdir -p "$HOME_DIR/.steam/steam/ubuntu12_32"
+printf 'client-pattern-fixture' > "$HOME_DIR/.steam/steam/ubuntu12_32/steamclient.so"
+printf 'ui-pattern-fixture' > "$HOME_DIR/.steam/steam/ubuntu12_32/steamui.so"
+
+reset_state
+: > "$PATTERN_ORDER_LOG"
+export SLSM_TEST_PATTERN_CACHE=hit SLSM_TEST_PATTERN_DELAY=2
+pattern_started="$(date +%s%N)"
+run_wrapper
+pattern_elapsed_ms=$(( ($(date +%s%N) - pattern_started) / 1000000 ))
+[ "$pattern_elapsed_ms" -lt 1000 ] \
+  && ok "warm signed cache does not wait for remote revalidation" \
+  || bad "warm signed cache delayed Steam by ${pattern_elapsed_ms}ms"
+[ "$(sed -n '1p' "$PATTERN_ORDER_LOG")" = "cache-only" ] \
+  && grep -q '^steam$' "$PATTERN_ORDER_LOG" \
+  && ! grep -q '^remote-done$' "$PATTERN_ORDER_LOG" \
+  && ok "warm cache launches Steam before background revalidation completes" \
+  || bad "warm cache launch order was: $(tr '\n' ' ' < "$PATTERN_ORDER_LOG")"
+for _wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+	grep -q '^remote-done$' "$PATTERN_ORDER_LOG" && break
+	sleep 0.1
+done
+grep -q '^remote-done$' "$PATTERN_ORDER_LOG" \
+  && ok "warm cache revalidates remotely in the background" \
+  || bad "background remote revalidation did not finish"
+
+reset_state
+: > "$PATTERN_ORDER_LOG"
+export SLSM_TEST_PATTERN_CACHE=miss SLSM_TEST_PATTERN_DELAY=0.3
+pattern_started="$(date +%s%N)"
+run_wrapper
+pattern_elapsed_ms=$(( ($(date +%s%N) - pattern_started) / 1000000 ))
+[ "$(tr '\n' ' ' < "$PATTERN_ORDER_LOG")" = "cache-only remote-start remote-done steam " ] \
+  && ok "cache miss finishes bounded remote refresh before Steam" \
+  || bad "cache miss launch order was: $(tr '\n' ' ' < "$PATTERN_ORDER_LOG")"
+[ "$pattern_elapsed_ms" -ge 250 ] && [ "$pattern_elapsed_ms" -lt 1500 ] \
+  && ok "cache miss waits only for the bounded remote refresh" \
+  || bad "cache miss wait was ${pattern_elapsed_ms}ms"
+unset SLSM_TEST_PATTERN_CACHE SLSM_TEST_PATTERN_DELAY PATTERN_ORDER_LOG
+rm -f "$PATTERN_HELPER"
 
 if [ "${SLSM_KEEP_TEST_TMP:-0}" = 1 ]; then
 	echo "test artifacts kept at $HOME_DIR"

@@ -12,6 +12,7 @@
 #     bin/
 #       SLSsteam.so
 #       library-inject.so
+#       pattern-refresh
 #     docs/
 #       LICENSE/                   (third-party + slsteam-moon licenses)
 #     res/
@@ -28,7 +29,8 @@
 #         Steamless.CLI.exe
 #         Plugins/*.dll
 #
-# Requires: bin/SLSsteam.so + bin/library-inject.so (run scripts/build.sh first).
+# Requires: bin/SLSsteam.so + bin/library-inject.so + bin/pattern-refresh
+# (run scripts/build.sh first).
 #
 # Usage:
 #   scripts/package.sh                      # version from res/version.txt
@@ -64,7 +66,7 @@ if [ -z "$VERSION" ]; then
 fi
 
 # Sanity-check the binaries are present and look right.
-for f in bin/SLSsteam.so bin/library-inject.so; do
+for f in bin/SLSsteam.so bin/library-inject.so bin/pattern-refresh; do
 	if [ ! -f "$f" ]; then
 		echo "missing $f" >&2
 		echo "build first:  scripts/build.sh   (or scripts/build.sh --host for dev)" >&2
@@ -73,10 +75,13 @@ for f in bin/SLSsteam.so bin/library-inject.so; do
 done
 
 # Empty/zero-byte binaries would silently produce a broken release zip.
-if [ ! -s bin/SLSsteam.so ] || [ ! -s bin/library-inject.so ]; then
+if [ ! -s bin/SLSsteam.so ] || [ ! -s bin/library-inject.so ] \
+   || [ ! -s bin/pattern-refresh ] || [ ! -x bin/pattern-refresh ]; then
 	echo "binaries in bin/ are empty -- rebuild before packaging" >&2
 	exit 1
 fi
+
+scripts/check-pattern-refresh-abi.sh bin/pattern-refresh
 
 PKG_DIR="dist/slsteam-moon-${VERSION}"
 ZIP_PATH="dist/slsteam-moon-linux-${VERSION}.zip"
@@ -87,6 +92,7 @@ mkdir -p "$PKG_DIR/bin" "$PKG_DIR/docs" "$PKG_DIR/res" "$PKG_DIR/tools"
 
 cp bin/SLSsteam.so       "$PKG_DIR/bin/"
 cp bin/library-inject.so "$PKG_DIR/bin/"
+cp bin/pattern-refresh   "$PKG_DIR/bin/"
 cp setup.sh              "$PKG_DIR/"
 cp res/config.yaml       "$PKG_DIR/res/"
 cp -r docs/LICENSE       "$PKG_DIR/docs/"

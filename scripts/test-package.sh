@@ -45,18 +45,44 @@ fi
 # Use throwaway stub .so files if a real build isn't present, so the test
 # stays fast and build-independent.  Restore the tree afterwards.
 STUBBED=()
-for f in bin/SLSsteam.so bin/library-inject.so; do
+for f in bin/SLSsteam.so bin/library-inject.so bin/pattern-refresh; do
     if [ ! -s "$f" ]; then
         mkdir -p bin
         printf 'stub' > "$f"
+        [ "$f" != bin/pattern-refresh ] || chmod +x "$f"
         STUBBED+=("$f")
     fi
 done
 
+ABI_TMP="$(mktemp -d)"
+ABI_READELF="$ABI_TMP/readelf"
+cat > "$ABI_READELF" <<'READELF'
+#!/bin/sh
+printf '  0x0010:   Name: GLIBC_%s  Flags: none  Version: 2\n' \
+    "${TEST_GLIBC_VERSION:-2.34}"
+READELF
+chmod +x "$ABI_READELF"
+export READELF="$ABI_READELF" TEST_GLIBC_VERSION=2.34
+
+if [ -x scripts/check-pattern-refresh-abi.sh ]; then
+    READELF="$ABI_READELF" TEST_GLIBC_VERSION=2.34 \
+        scripts/check-pattern-refresh-abi.sh bin/pattern-refresh >/dev/null 2>&1 \
+        && ok "ABI gate accepts GLIBC_2.34" \
+        || bad "ABI gate rejected GLIBC_2.34"
+    if READELF="$ABI_READELF" TEST_GLIBC_VERSION=2.35 \
+        scripts/check-pattern-refresh-abi.sh bin/pattern-refresh >/dev/null 2>&1; then
+        bad "ABI gate accepted GLIBC_2.35"
+    else
+        ok "ABI gate rejects symbols newer than GLIBC_2.34"
+    fi
+else
+    bad "scripts/check-pattern-refresh-abi.sh is missing"
+fi
+
 TEST_VERSION="selftest-$$"
 cleanup() {
     rm -rf "dist/slsteam-moon-${TEST_VERSION}" \
-           "dist/slsteam-moon-linux-${TEST_VERSION}.zip"
+           "dist/slsteam-moon-linux-${TEST_VERSION}.zip" "$ABI_TMP"
     for f in "${STUBBED[@]}"; do rm -f "$f"; done
 }
 trap cleanup EXIT
@@ -83,6 +109,9 @@ if scripts/package.sh --version "$TEST_VERSION" >/dev/null 2>&1; then
         echo "$listing" | grep -q "ensure-desktop-coverage.sh" \
             && ok "zip bundles desktop coverage CLI" \
             || bad "zip is missing desktop coverage CLI"
+        echo "$listing" | grep -q "bin/pattern-refresh" \
+            && ok "zip bundles signed pattern refresh helper" \
+            || bad "zip is missing signed pattern refresh helper"
     else
         bad "package.sh did not produce $ZIP"
     fi

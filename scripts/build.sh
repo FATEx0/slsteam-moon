@@ -13,6 +13,7 @@
 # Outputs:
 #   bin/SLSsteam.so
 #   bin/library-inject.so
+#   bin/pattern-refresh
 #
 # Usage:
 #   scripts/build.sh                 # defaults to --portable
