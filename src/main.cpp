@@ -8,6 +8,7 @@
 #include "globals.hpp"
 #include "hooks.hpp"
 #include "log.hpp"
+#include "bootprof.hpp"
 #include "ownerwork.hpp"
 #include "patterns.hpp"
 #include "runtime_attestation.hpp"
@@ -17,7 +18,9 @@
 #include "utils/process_lock.hpp"
 
 #include "feats/appinfo_provision.hpp"
+#include "feats/provision_schedule.hpp"
 #include "feats/appinfo_vdf.hpp"
+#include "feats/cmclient.hpp"
 #include "feats/apps.hpp"
 #include "feats/cefport.hpp"
 #include "feats/depotkey.hpp"
@@ -40,6 +43,7 @@
 #include <filesystem>
 
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -168,6 +172,7 @@ static void setup()
 		unload();
 		return;
 	}
+	BootProf::Span setupProfile(g_pLog.get(), "setup");
 
 	// Every auditor namespace gets its own copy of these statics. A secondary
 	// namespace may still dispatch an exec wrapper after the process-wide setup
@@ -236,6 +241,11 @@ static void setup()
 		return;
 	}
 
+	// This is the last safe setup-time window before Steam's ConfigStore
+	// writers become active. Keep the config.vdf mutation here; load() runs
+	// after preinit and must not publish a stale snapshot over Steam's state.
+	DepotKey::disableShaderCache();
+
 	g_auditDiagnosticsEnabled.store(g_config.extendedLogging.get(),
 	                               std::memory_order_release);
 
@@ -283,46 +293,64 @@ static void setup()
 		}
 	}
 
-	// Splice cached PICS buffers into appcache/appinfo.vdf before
-	// Steam opens the file.  Each buffer was captured during a
-	// previous session by `feats/pics.cpp::recvProductInfoResponse`.
-	// The cache must already exist on disk; first-run installs need
-	// a Steam restart so the buffers can be picked up.
+	// Splice cached PICS buffers into appcache/appinfo.vdf before Steam
+	// opens the file. CM refreshes for already-provisioned apps are not on
+	// this path when AsyncProvision is enabled; PICS recv starts that worker
+	// from a real Steam worker thread. A missing cache pair is the exception:
+	// provision it synchronously here before the splice so the first restart
+	// sees the appinfo entry in Steam's initial in-memory cache.
 	{
-		const char* home = std::getenv("HOME");
-		if (home)
-		{
-			static const char* steamRoots[] = {
-				"/.steam/steam",
-				"/.steam/debian-installation",
-				"/.local/share/Steam",
-			};
-			for (const char* suffix : steamRoots)
-			{
-				const auto candidate = std::string(home) + suffix +
-				    "/appcache/appinfo.vdf";
-				if (std::filesystem::exists(candidate))
-				{
-					// We need DepotKey/ManifestId catalogues populated
-					// from the user's Lua plugin BEFORE provisioning,
-					// because AppInfoProvision drops depots without a
-					// cached key (and pins manifest GIDs from the
-					// catalogue).  Both importers are idempotent — a
-					// second call from DepotKey::onStartup() / setup()
-					// after Hooks are installed is a no-op.
-					DepotKey::importLuaScripts();
-					ManifestId::importLuaScripts();
+		const bool asyncProvision = AppInfoProvision::asyncProvisioningEnabled();
+		const bool warmCurl = AppInfoProvision::shouldWarmCurlBeforePics(
+		    !g_config.managedAppIds.get().empty());
 
-					// First, fetch fresh PICS-equivalent buffers for
-					// any AdditionalApps whose entry in appinfo.vdf
-					// is missing depots (cold-start case).
-					// Writes to <config>/cache/picsbuffer_*.{bin,yaml},
-					// which the splice below then picks up.
-					AppInfoProvision::provisionAllAddedApps(candidate);
-					AppInfoVdf::injectAllCached(candidate);
-					break;
-				}
+		// Loading libcurl's TLS dependency tree from the first PICS worker
+		// callback can crash the 32-bit Steam client. Warm it up here while
+		// setup() still owns the safe preinit call stack; the callback then
+		// only reuses already-resolved function pointers. This intentionally
+		// does not depend on appinfo.vdf being discoverable: the PICS callback
+		// can still run and must never be the first libcurl loader.
+		if (warmCurl && !CmClient::prepareForThreadedFetch())
+		{
+			g_pLog->warn("CmClient: unable to preload libcurl before PICS worker\n");
+		}
+
+		// Runtime provisioning defers Proton mappings because Steam's live
+		// ConfigStore writers do not participate in our advisory lock. Apply
+		// the pending set now, while setup() still owns the preinit window.
+		AppInfoProvision::flushPendingProtonMappings();
+
+		const auto candidate = AppInfoVdf::findExistingPath();
+		if (!candidate.empty())
+		{
+			const auto preinitAction =
+			    AppInfoProvision::preinitProvisionAction(asyncProvision);
+			std::unordered_set<uint32_t> coldFallbackApps;
+			if (preinitAction ==
+			    AppInfoProvision::PreinitProvisionAction::SynchronousProvision)
+			{
+				// The kill-switch restores the former synchronous behavior for
+				// field rollback: refresh every managed app before the splice.
+				DepotKey::importLuaScripts();
+				ManifestId::importLuaScripts();
+				BootProf::Span provisionProfile(g_pLog.get(), "provision.sync_preinit");
+				AppInfoProvision::provisionAllAddedApps(candidate);
 			}
+			else
+			{
+				// Async mode still keeps the genuine first-run path synchronous,
+				// but only for apps without a complete validated cache pair. This
+				// is deliberately before the appinfo splice: writing the pair from
+				// PICS after Steam has loaded appinfo would require a second restart.
+				DepotKey::importLuaScripts();
+				ManifestId::importLuaScripts();
+				BootProf::Span provisionProfile(g_pLog.get(), "provision.cold_preinit");
+				AppInfoProvision::provisionColdStartApps(
+				    candidate, nullptr, true, &coldFallbackApps);
+			}
+
+			BootProf::Span spliceProfile(g_pLog.get(), "appinfo.splice_preinit");
+			AppInfoVdf::injectAllCached(candidate, coldFallbackApps);
 		}
 	}
 
@@ -516,11 +544,14 @@ static void load()
 		}
 	}
 
-	if (!Patterns::init())
 	{
-		g_pLog->warn("Failed to find all patterns! Aborting...");
-		g_pLog->notifyUser(UserMsg::InitializationFailed);
-		return;
+		BootProf::Span patternProfile(g_pLog.get(), "pattern_scan");
+		if (!Patterns::init())
+		{
+			g_pLog->warn("Failed to find all patterns! Aborting...");
+			g_pLog->notifyUser(UserMsg::InitializationFailed);
+			return;
+		}
 	}
 
 	if (!Hooks::setup())
@@ -570,15 +601,19 @@ static void load()
 	// Import Lua scripts and provision manifest files.  Must run
 	// AFTER setup so g_config.getDir() is valid and AFTER hooks so
 	// g_pLog is alive.
-	DepotKey::onStartup();
-	ManifestId::importLuaScripts();
+	{
+		BootProf::Span importProfile(g_pLog.get(), "lua_imports");
+		DepotKey::onStartup();
+		ManifestId::importLuaScripts();
+	}
 
 	// Re-inject AdditionalApps into package 0 in case Steam already
 	// loaded it before our hook was placed.  No-op when the
 	// LoadPackage detour has already seeded the same ids.
 	{
+		std::lock_guard<std::mutex> passLock(
+		    AppInfoProvision::provisioningPassMutex());
 		const auto added = g_config.addedAppIds.get();
-		std::vector<uint32_t> ids(added.begin(), added.end());
 
 		// Collect DLC ids from each managed app's provisioned appinfo.
 		// Depot-tagged ids are planner-critical; advertised-only ids enter
@@ -589,12 +624,21 @@ static void load()
 		// Register the planner subset with PackagePatch so the LoadPackage
 		// detour keeps re-injecting it across package-0 reloads, then do the
 		// one-shot manual inject for the case Steam already loaded package 0.
-		const auto dlcIds = AppInfoProvision::collectDlcAppIdsForAddedApps();
+		bool dlcCollectionComplete = false;
+		const auto dlcIds = AppInfoProvision::collectDlcAppIdsForAddedApps(
+		    &dlcCollectionComplete);
 		// Only planner-relevant DLC ids enter PackagePatch.  The broader
-		// appDlc set still feeds launch-time legacy-CD-key suppression.
-		PackagePatch::setExtraAppIds(dlcIds.package0);
-		Apps::setAddedAppDlcIds(dlcIds.appDlc);
-		ids.insert(ids.end(), dlcIds.package0.begin(), dlcIds.package0.end());
+		// appDlc set still feeds launch-time legacy-CD-key suppression. Keep
+		// the previous state if a concurrent cache writer prevented a
+		// consistent collection snapshot.
+		if (dlcCollectionComplete)
+		{
+			PackagePatch::setExtraAppIds(dlcIds.package0);
+			Apps::setAddedAppDlcIds(dlcIds.appDlc);
+		}
+		const auto ids = AppInfoProvision::mergePackage0AppIds(
+		    added, dlcCollectionComplete ? dlcIds.package0
+	                                 : std::vector<uint32_t>{});
 
 		if (!ids.empty())
 		{

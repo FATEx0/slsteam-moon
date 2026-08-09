@@ -38,6 +38,8 @@
 
 static_assert(std::is_same_v<decltype(&AppInfoProvision::forgetApp),
                              bool (*)(uint32_t)>);
+static_assert(std::is_same_v<decltype(&AppInfoProvision::forgetManagedSourceApp),
+                             bool (*)(uint32_t)>);
 
 static int g_failures = 0;
 #define CHECK(cond, msg)                                                     \
@@ -341,6 +343,26 @@ int main()
 	for (const auto& record : forgotten)
 		forgottenRestored = SynthMark::restoreQuarantined(record) && forgottenRestored;
 	CHECK(forgottenRestored, "explicitly quarantined artifacts can be restored");
+
+	// Managed-source removal invalidates appinfo artifacts but retains ticket
+	// state and synthetic-PICS protection for a compatibility-active app so a
+	// later process can reload it without clobbering the live appinfo entry.
+	auto managedOnly = SynthMark::quarantineAppArtifacts(
+		quarantineDir.string(), forgottenApp, std::vector<uint32_t>{987654},
+		".managed-source", /*includeTicketArtifacts=*/false,
+		/*includeSyntheticMarker=*/false);
+	CHECK(managedOnly.size() == forgottenFiles.size() - 3,
+	      "managed-only cleanup excludes ownership tickets and synthetic marker");
+	CHECK(fs::exists(quarantineDir / "synthetic_321"),
+	      "managed-only cleanup retains synthetic-PICS protection marker");
+	CHECK(fs::exists(quarantineDir / "ticket_321.yaml") &&
+	      fs::exists(quarantineDir / "encryptedTicket_321.yaml"),
+	      "managed-only cleanup retains ticket artifacts in place");
+	bool managedOnlyRestored = true;
+	for (const auto& record : managedOnly)
+		managedOnlyRestored = SynthMark::restoreQuarantined(record) && managedOnlyRestored;
+	CHECK(managedOnlyRestored,
+	      "managed-only quarantined artifacts can be restored");
 
 	// Exhaust every no-clobber retry destination for one artifact. A cleanup
 	// caller must be able to distinguish this partial move from success.

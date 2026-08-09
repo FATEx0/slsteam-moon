@@ -46,7 +46,7 @@ ifeq ($(shell type mold &> /dev/null && echo "found"),found)
 	LDFLAGS += -fuse-ld=mold
 endif
 
-.PHONY: all build rebuild clean install release test-cmwire test-pattern-catalog test-pattern-cache test-pattern-refresh test-process-lock test-atomic-file test-appinfo-transaction test-audit-symbols test-audit-policy test-memhlp-target test-memhlp-prologue test-memhlp-pic test-utils-sha test-provision-cache test-runtime-dependencies test-thread-start test-steamstub-warmup test-boundedexecutor test-steamless-prewarm test-depotkey-scope test-curl-timeout test-manifest-index test-prewarm-backoff
+.PHONY: all build rebuild clean install release test-cmwire test-cmclient-loader test-dlcids test-config-path test-config-discovery test-synthmark test-pattern-catalog test-pattern-cache test-pattern-refresh test-process-lock test-atomic-file test-cache-pair test-appinfo-transaction test-audit-symbols test-audit-policy test-memhlp-target test-memhlp-prologue test-memhlp-pic test-utils-sha test-provision-cache test-pending-proton test-provision-schedule test-provision-pass test-runtime-dependencies test-thread-start test-steamstub-warmup test-boundedexecutor test-steamless-prewarm test-depotkey-scope test-curl-timeout test-manifest-index test-prewarm-backoff
 .NOTPARALLEL: clean rebuild
 
 all: build
@@ -122,6 +122,32 @@ test-cmwire: obj/sdk/protobufs/steammessages_base.pb.o \
 		-lpthread -o /tmp/test_cmwire
 	/tmp/test_cmwire
 
+test-cmclient-loader:
+	$(CXX) -std=c++20 -ffunction-sections -fdata-sections -I include -I src \
+		tools/test_cmclient_loader.cpp src/feats/cmclient.cpp \
+		-Wl,--gc-sections -ldl -pthread -o /tmp/test_cmclient_loader
+	/tmp/test_cmclient_loader
+
+test-dlcids:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I include \
+		tools/test_dlcids.cpp -o /tmp/test_dlcids
+	/tmp/test_dlcids
+
+test-config-path:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_config_path.cpp -o /tmp/test_config_path
+	/tmp/test_config_path
+
+test-config-discovery:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src -I include \
+		tools/test_config_discovery.cpp -o /tmp/test_config_discovery
+	/tmp/test_config_discovery
+
+test-synthmark:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src -I include \
+		tools/test_synthmark.cpp -o /tmp/test_synthmark
+	/tmp/test_synthmark
+
 test-pattern-catalog:
 	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
 		tools/test_pattern_catalog.cpp src/pattern_catalog.cpp \
@@ -181,6 +207,22 @@ test-provision-cache:
 		tools/test_provision_cache.cpp -o /tmp/test_provision_cache
 	/tmp/test_provision_cache
 
+test-pending-proton:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I include \
+		tools/test_pending_proton.cpp -o /tmp/test_pending_proton
+	/tmp/test_pending_proton
+
+test-provision-schedule:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_provision_schedule.cpp -o /tmp/test_provision_schedule
+	/tmp/test_provision_schedule
+
+test-provision-pass:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_provision_pass.cpp -pthread \
+		-o /tmp/test_provision_pass
+	/tmp/test_provision_pass
+
 test-runtime-dependencies:
 	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -ffunction-sections -fdata-sections -I src \
 		-c src/runtime_dependencies.cpp -o /tmp/runtime_dependencies.o
@@ -229,9 +271,14 @@ test-process-lock:
 	/tmp/test_process_lock
 
 test-atomic-file:
-	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -DATOMIC_FILE_TESTING -I src \
 		tools/test_atomic_file.cpp -o /tmp/test_atomic_file
 	/tmp/test_atomic_file
+
+test-cache-pair:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_cache_pair.cpp -o /tmp/test_cache_pair
+	/tmp/test_cache_pair
 
 # Non-LTO 32-bit object so the host linker can link the transaction test
 # without choking on LTO bytecode from a different toolchain version.

@@ -681,6 +681,10 @@ bool runSession(const Endpoint& ep, const std::vector<uint32_t>& appids,
 
 } // namespace
 
+bool prepareForThreadedFetch()
+{
+	return loadCurl();
+}
 
 FetchResult fetchProductInfoDetailed(
     const std::vector<uint32_t>& appids,

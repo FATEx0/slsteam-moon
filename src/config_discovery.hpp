@@ -88,6 +88,30 @@ inline std::vector<uint32_t> removedAppIds(
 	return removed;
 }
 
+struct ReloadRemovals
+{
+	std::vector<uint32_t> managed;
+	std::vector<uint32_t> active;
+	std::vector<uint32_t> managedAdded;
+};
+
+// Classify a config reload by source eligibility and active compatibility
+// membership separately. An id can leave managed sources while remaining
+// active through an installed legacy/Accela compatibility entry; that case
+// must invalidate app-scoped cache state without revoking ownership state.
+inline ReloadRemovals classifyReloadRemovals(
+    const std::unordered_set<uint32_t>& beforeManaged,
+    const std::unordered_set<uint32_t>& afterManaged,
+    const std::unordered_set<uint32_t>& beforeActive,
+    const std::unordered_set<uint32_t>& afterActive)
+{
+	return ReloadRemovals{
+	    .managed = removedAppIds(beforeManaged, afterManaged),
+	    .active = removedAppIds(beforeActive, afterActive),
+	    .managedAdded = removedAppIds(afterManaged, beforeManaged),
+	};
+}
+
 struct InstalledApps
 {
 	std::unordered_set<uint32_t> all;

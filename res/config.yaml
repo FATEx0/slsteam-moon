@@ -109,6 +109,10 @@ InjectAllAdvertisedDlc: no
 # cached signature is rechecked before an address is accepted.
 PatternCache: yes
 
+# Refresh existing appinfo buffers from the PICS worker after Steam starts.
+# Apps without a complete cache still use the synchronous PICS fallback.
+AsyncProvision: yes
+
 #Changes your account's E-Mail clientsided. Leave blank to disable
 FakeEmail: ""
 

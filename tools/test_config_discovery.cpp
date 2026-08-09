@@ -35,6 +35,7 @@ int main()
 {
 	using ConfigDiscovery::appIdFromScriptName;
 	using ConfigDiscovery::classifyAppIds;
+	using ConfigDiscovery::classifyReloadRemovals;
 	using ConfigDiscovery::keepDiscoveredMainApp;
 	using ConfigDiscovery::scanInstalledApps;
 	using ConfigDiscovery::steamAppsRootsFor;
@@ -95,6 +96,51 @@ int main()
 		      "stale legacy id is discarded");
 		CHECK(!ids.managed.contains(200) && !ids.managed.contains(300),
 		      "compatibility ids cannot reach appinfo providers");
+	}
+
+	// --- Reload removal classification ------------------------------------
+	// Removing a managed source must invalidate its cache even when the
+	// installed compatibility set keeps the id active. Removing an active
+	// compatibility entry must still revoke ticket/package ownership.
+	{
+		const std::unordered_set<uint32_t> beforeManaged{100, 101};
+		const std::unordered_set<uint32_t> afterManaged{101};
+		const std::unordered_set<uint32_t> beforeActive{100, 101, 200};
+		const std::unordered_set<uint32_t> afterActive{100, 101, 200};
+		const auto removals = classifyReloadRemovals(
+		    beforeManaged, afterManaged, beforeActive, afterActive);
+
+		CHECK(removals.managed == std::vector<uint32_t>{100},
+		      "managed-source removal is reported independently");
+		CHECK(removals.active.empty(),
+		      "compatibility-active id is not reported as active removal");
+	}
+	{
+		const std::unordered_set<uint32_t> beforeManaged{100, 101};
+		const std::unordered_set<uint32_t> afterManaged{100, 101};
+		const std::unordered_set<uint32_t> beforeActive{100, 101, 200};
+		const std::unordered_set<uint32_t> afterActive{100, 101};
+		const auto removals = classifyReloadRemovals(
+		    beforeManaged, afterManaged, beforeActive, afterActive);
+
+		CHECK(removals.managed.empty(),
+		      "active-only compatibility removal has no managed removal");
+		CHECK(removals.active == std::vector<uint32_t>{200},
+		      "active compatibility removal is reported for ownership cleanup");
+	}
+
+	// Managed-source additions must also be visible when the app remains
+	// active through compatibility state across the reload.
+	{
+		const std::unordered_set<uint32_t> beforeManaged{100};
+		const std::unordered_set<uint32_t> afterManaged{100, 200};
+		const std::unordered_set<uint32_t> beforeActive{100, 200};
+		const std::unordered_set<uint32_t> afterActive{100, 200};
+		const auto changes = classifyReloadRemovals(
+		    beforeManaged, afterManaged, beforeActive, afterActive);
+
+		CHECK(changes.managedAdded == std::vector<uint32_t>{200},
+		      "managed-source addition is reported independently");
 	}
 
 	// --- On-disk Accela discovery ----------------------------------------

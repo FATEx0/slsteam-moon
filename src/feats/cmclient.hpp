@@ -41,6 +41,11 @@ enum class FetchResult
 	Failed,
 };
 
+// Load libcurl while setup() is still on the safe preinit call stack. The
+// first CM fetch may run from a Steam worker callback, where loading libcurl's
+// TLS dependency tree can crash the 32-bit client.
+bool prepareForThreadedFetch();
+
 // Detailed form used by startup provisioning so a directory/DNS failure can
 // open its fleet-wide network circuit instead of entering per-app fallbacks.
 FetchResult fetchProductInfoDetailed(

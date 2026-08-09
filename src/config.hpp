@@ -89,6 +89,9 @@ public:
 	MTVariable<int32_t> fakeWalletBalance;
 	MTVariable<unsigned int> logLevel;
 	MTVariable<bool> patternCache;
+	// Move refreshes for existing provisioned buffers off la_preinit. A
+	// missing buffer still takes the synchronous PICS fallback.
+	MTVariable<bool> asyncProvision;
 	MTVariable<bool> extendedLogging;
 
 	//Using incomplete class to avoid runtime linking errors

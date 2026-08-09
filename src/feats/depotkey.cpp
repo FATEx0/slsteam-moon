@@ -4,9 +4,12 @@
 #include "depotkey_scope.hpp"
 #include "depotkey_import.hpp"
 #include "depotkey_index.hpp"
+#include "appinfo_provision.hpp"
 
 #include "../config.hpp"
 #include "../globals.hpp"
+#include "../utils/atomic_file.hpp"
+#include "../utils/process_lock.hpp"
 
 #include "../sdk/CProtoBufMsgBase.hpp"
 #include "../sdk/EResult.hpp"
@@ -372,6 +375,26 @@ void disableShaderCache()
 	const auto path = root + "/config/config.vdf";
 	if (!std::filesystem::exists(path)) return;
 
+	const auto configLockPath = AppInfoProvision::cacheLockPath();
+	const auto lockParent = std::filesystem::path(configLockPath).parent_path();
+	std::error_code lockDirError;
+	std::filesystem::create_directories(lockParent, lockDirError);
+	if (lockDirError && !std::filesystem::exists(lockParent))
+	{
+		g_pLog->debug("DepotKey: cannot create config.vdf lock directory: %s\n",
+		              lockDirError.message().c_str());
+		return;
+	}
+	ProcessLock::FileLock configLock(configLockPath, false);
+	if (!configLock.acquired())
+	{
+		g_pLog->debug("DepotKey: config.vdf writer lock is busy\n");
+		return;
+	}
+
+	AtomicFile::FileIdentity expected{};
+	if (!AtomicFile::readIdentity(path, expected)) return;
+
 	std::string content;
 	{
 		std::ifstream ifs(path);
@@ -397,10 +420,13 @@ void disableShaderCache()
 		"\n\t\t\t\t\t\t\"DisableShaderCache\"\t\t\"1\"";
 	content.insert(brace + 1, insertion);
 
+	std::string writeError;
+	if (!AtomicFile::writeIfUnchanged(path, expected, content, writeError))
 	{
-		std::ofstream ofs(path, std::ios::trunc);
-		if (!ofs.is_open()) return;
-		ofs << content;
+		g_pLog->debug(
+		    "DepotKey: config.vdf changed before conditional publish: %s\n",
+		    writeError.c_str());
+		return;
 	}
 	g_pLog->infoOnce("DepotKey: injected DisableShaderCache=1 into config.vdf "
 	             "(AdditionalApps present)\n");
@@ -413,7 +439,6 @@ void onStartup()
 	g_startupDone = true;
 	importLuaScripts();
 	provisionManifests();
-	disableShaderCache();
 }
 
 

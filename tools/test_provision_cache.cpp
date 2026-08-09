@@ -40,10 +40,18 @@ int main()
 	using AppInfoProvision::cache::CacheUse;
 	using AppInfoProvision::cache::CacheRecordFacts;
 	using AppInfoProvision::cache::CacheValidationKey;
+	using AppInfoProvision::cache::cachePublicationAllowed;
 	using AppInfoProvision::cache::chooseCacheUse;
+	using AppInfoProvision::cache::protonPublicationAllowed;
+	using AppInfoProvision::cache::syntheticMarkerConsistent;
+	using AppInfoProvision::cache::syntheticMarkerPublicationConsistent;
+	using AppInfoProvision::cache::syntheticMarkerStateConsistent;
+	using AppInfoProvision::cache::retainedSyntheticMarkerProtectionAllowed;
 	using AppInfoProvision::cache::isBufferReusable;
 	using AppInfoProvision::cache::isCacheRecordValid;
 	using AppInfoProvision::cache::shouldValidateCache;
+	using AppInfoProvision::cache::shouldPreserveCacheFromRawPics;
+	using AppInfoProvision::cache::shouldPreserveSyntheticMarker;
 	using AppInfoProvision::cache::wireSizeMatches;
 
 	const CacheValidationKey fileIdentity{
@@ -135,6 +143,100 @@ int main()
 	      "matching metadata wire size passes the cheap gate");
 	CHECK(!wireSizeMatches(8191, 8192),
 	      "truncated buffer fails the cheap wire-size gate");
+
+	// Pairs written before provenance metadata was introduced are ambiguous:
+	// preserve them from raw PICS replacement until a provider refresh writes
+	// the explicit marker.
+	CHECK(shouldPreserveCacheFromRawPics(/*hasMarker=*/false,
+	                                     /*normalized=*/false),
+	      "legacy cache is protected from raw PICS replacement");
+	CHECK(shouldPreserveCacheFromRawPics(/*hasMarker=*/true,
+	                                     /*normalized=*/true),
+	      "normalized cache is protected from raw PICS replacement");
+	CHECK(!shouldPreserveCacheFromRawPics(/*hasMarker=*/true,
+	                                      /*normalized=*/false),
+	      "explicit raw cache remains replaceable by a newer PICS response");
+	CHECK(cachePublicationAllowed(/*managed=*/true,
+	                              /*expectedGeneration=*/7,
+	                              /*currentGeneration=*/7),
+	      "current managed generation may publish a cache pair");
+	CHECK(!cachePublicationAllowed(/*managed=*/true,
+	                               /*expectedGeneration=*/7,
+	                               /*currentGeneration=*/8),
+	      "removed and re-added app rejects an old cache publication");
+	CHECK(!cachePublicationAllowed(/*managed=*/false,
+	                               /*expectedGeneration=*/7,
+	                               /*currentGeneration=*/7),
+	      "removed app cannot publish even when generations match");
+	CHECK(protonPublicationAllowed(/*managed=*/true,
+	                              /*expectedGeneration=*/7,
+	                              /*currentGeneration=*/7),
+	      "current managed generation may mark Proton as needed");
+	CHECK(!protonPublicationAllowed(/*managed=*/true,
+	                               /*expectedGeneration=*/7,
+	                               /*currentGeneration=*/8),
+	      "removed and re-added app rejects an old Proton mark");
+	CHECK(!protonPublicationAllowed(/*managed=*/false,
+	                               /*expectedGeneration=*/7,
+	                               /*currentGeneration=*/7),
+	      "removed app cannot leave a Proton mark behind");
+	CHECK(syntheticMarkerConsistent(/*synthetic=*/false,
+	                                /*markerPresent=*/false),
+	      "a normal cache pair without a marker is consistent");
+	CHECK(syntheticMarkerConsistent(/*synthetic=*/true,
+	                                /*markerPresent=*/true),
+	      "a synthetic cache pair with its marker is consistent");
+	CHECK(!syntheticMarkerConsistent(/*synthetic=*/false,
+	                                 /*markerPresent=*/true),
+	      "a normal cache pair with a stale marker is rejected");
+	CHECK(!syntheticMarkerConsistent(/*synthetic=*/true,
+	                                 /*markerPresent=*/false),
+	      "a synthetic cache pair without a marker is inconsistent");
+	CHECK(syntheticMarkerPublicationConsistent(
+	          /*synthetic=*/false, /*operationSucceeded=*/true,
+	          /*markerPresent=*/false),
+	      "successful normal-marker removal publishes a marker-free pair");
+	CHECK(!syntheticMarkerPublicationConsistent(
+	           /*synthetic=*/false, /*operationSucceeded=*/false,
+	           /*markerPresent=*/false),
+	      "failed normal-marker removal rejects the cache publication");
+	CHECK(!syntheticMarkerPublicationConsistent(
+	           /*synthetic=*/true, /*operationSucceeded=*/true,
+	           /*markerPresent=*/false),
+	      "a synthetic publication whose marker vanished is rejected");
+	CHECK(syntheticMarkerStateConsistent(/*hasSyntheticMetadata=*/false,
+	                                     /*synthetic=*/false,
+	                                     /*markerPresent=*/false),
+	      "legacy metadata without a marker is treated as normal");
+	CHECK(syntheticMarkerStateConsistent(/*hasSyntheticMetadata=*/false,
+	                                     /*synthetic=*/false,
+	                                     /*markerPresent=*/true),
+	      "legacy metadata with its historical synthetic marker remains readable");
+	CHECK(syntheticMarkerStateConsistent(/*hasSyntheticMetadata=*/true,
+	                                     /*synthetic=*/true,
+	                                     /*markerPresent=*/true),
+	      "explicit synthetic metadata still requires its marker");
+	CHECK(retainedSyntheticMarkerProtectionAllowed(
+	          /*markerPresent=*/true, /*metadataPresent=*/false,
+	          /*activeCompatibility=*/true),
+	      "a retained marker protects an active compatibility app after restart");
+	CHECK(!retainedSyntheticMarkerProtectionAllowed(
+	           /*markerPresent=*/true, /*metadataPresent=*/false,
+	           /*activeCompatibility=*/false),
+	      "a retained marker does not protect an inactive app");
+	CHECK(!retainedSyntheticMarkerProtectionAllowed(
+	           /*markerPresent=*/true, /*metadataPresent=*/true,
+	           /*activeCompatibility=*/true),
+	      "a marker beside metadata is not the retained-marker state");
+	CHECK(shouldPreserveSyntheticMarker(/*retainCompatibility=*/true,
+	                                    /*isSynthetic=*/true),
+	      "managed-only cleanup preserves a confirmed synthetic marker");
+	CHECK(!shouldPreserveSyntheticMarker(/*retainCompatibility=*/true,
+	                                     /*isSynthetic=*/false),
+	      "managed-only cleanup removes a stale normal marker");
+	CHECK(!shouldPreserveSyntheticMarker(/*retainCompatibility=*/false,
+	                                     /*isSynthetic=*/true),
+	      "full cleanup removes even a confirmed synthetic marker");
 
 	const CacheRecordFacts validRecord{
 	    .requestedAppId = 420530,

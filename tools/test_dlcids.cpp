@@ -332,6 +332,17 @@ int main()
 		      "classify: tagged form still protects the base app");
 	}
 
+	// 17) A late cold-provisioning pass must be able to merge newly discovered
+	// DLC ids with the already managed app ids without duplicates.
+	{
+		const std::unordered_set<uint32_t> base = {100, 200};
+		const std::vector<uint32_t> extra = {200, 300, 300, 0};
+		const auto merged = AppInfoProvision::mergePackage0AppIds(base, extra);
+		CHECK(merged.size() == 3 && has(merged, 100) && has(merged, 200) &&
+		      has(merged, 300),
+		      "package0 merge: late DLC ids join managed apps once");
+	}
+
 	// 16) The shipped config opts out of injecting storefront-only DLC by
 	// default; users can opt back in without rebuilding.
 	{

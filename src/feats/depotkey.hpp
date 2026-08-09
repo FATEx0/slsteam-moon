@@ -84,6 +84,10 @@ namespace DepotKey
 	// One-shot startup orchestration: importer + provisioner.
 	void onStartup();
 
+	// Apply the config.vdf shader-cache setting during setup preinit, before
+	// Steam's ConfigStore writers can publish a competing snapshot.
+	void disableShaderCache();
+
 	// Hook callbacks — called from hooks.cpp inside the existing
 	// CProtoBufMsgBase_Send / _InitFromPacket detours.
 	void recvMsg(CProtoBufMsgBase* msg);

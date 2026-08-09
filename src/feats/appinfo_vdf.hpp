@@ -51,12 +51,17 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "synthmark.hpp"
 
 namespace AppInfoVdf
 {
+	// Return the first existing Steam appinfo.vdf path from the supported
+	// installation roots, or an empty string when Steam is not bootstrapped.
+	std::string findExistingPath();
+
 	// Append (or replace, by appid) one entry into the on-disk
 	// appinfo.vdf at `path`.  `wireBuffer` is the v39-inline binary VDF
 	// from the PICS response.  `sha` is the 20-byte sha from the same
@@ -75,5 +80,13 @@ namespace AppInfoVdf
 	// `<config>/cache/picsbuffer_*.{bin,yaml}` and inject each one into
 	// the appinfo.vdf at `path`.  Returns the number of entries
 	// successfully injected (or unchanged-already-present).
-	int injectAllCached(const std::string& path);
+	int injectAllCached(
+	    const std::string& path,
+	    const std::unordered_set<uint32_t>& explicitFallbackApps);
+
+	inline int injectAllCached(const std::string& path)
+	{
+		static const std::unordered_set<uint32_t> noFallback;
+		return injectAllCached(path, noFallback);
+	}
 }

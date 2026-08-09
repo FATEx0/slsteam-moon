@@ -68,6 +68,86 @@ enum class CacheUse
 	Fallback,
 };
 
+// A metadata record written before the provenance marker was introduced is
+// ambiguous: it may be a provider-normalized pair or a raw PICS pair. Keep
+// it authoritative against raw replacement until a provider refresh writes
+// an explicit marker. Explicit raw records remain replaceable.
+inline bool shouldPreserveCacheFromRawPics(bool hasNormalizedMarker,
+                                           bool normalized)
+{
+	return !hasNormalizedMarker || normalized;
+}
+
+// Permit a cache publication only when the caller still represents the
+// managed app generation that started the work. A matching generation is
+// required even when the app is managed again after a removal.
+inline bool cachePublicationAllowed(bool managed,
+                                    std::uint64_t expectedGeneration,
+                                    std::uint64_t currentGeneration)
+{
+	return managed && expectedGeneration == currentGeneration;
+}
+
+inline bool protonPublicationAllowed(bool managed,
+                                      std::uint64_t expectedGeneration,
+                                      std::uint64_t currentGeneration)
+{
+	return cachePublicationAllowed(managed, expectedGeneration,
+	                               currentGeneration);
+}
+
+// A cache pair and its provenance marker are one logical publication. A
+// reader must reject either half of an interrupted transition: a synthetic
+// pair without its marker, or a normal pair retaining an old marker.
+inline bool syntheticMarkerConsistent(bool synthetic, bool markerPresent)
+{
+	return synthetic == markerPresent;
+}
+
+// Publication-side form of the same invariant: the marker write must have
+// succeeded AND the resulting on-disk marker must match the pair's provenance.
+// Either failure leaves an interrupted transition, so the caller restores the
+// previous pair and marker instead of publishing half of one.
+inline bool syntheticMarkerPublicationConsistent(bool synthetic,
+                                                 bool operationSucceeded,
+                                                 bool markerPresent)
+{
+	return operationSucceeded && syntheticMarkerConsistent(synthetic, markerPresent);
+}
+
+// Metadata written before the explicit provenance field existed is still
+// readable: back then `synthetic_<appid>` itself was the persisted provenance
+// bit, so a legacy pair is valid with or without that marker. Explicit records
+// must agree with their marker.
+inline bool syntheticMarkerStateConsistent(bool hasSyntheticMetadata,
+                                            bool synthetic,
+                                            bool markerPresent)
+{
+	// Legacy normal (no marker) and legacy synthetic (marker present) pairs
+	// are both valid, so provenance cannot be inferred and is not required.
+	if (!hasSyntheticMetadata) return true;
+	return syntheticMarkerConsistent(synthetic, markerPresent);
+}
+
+// A managed-source removal may retain only the synthetic marker when the app
+// remains active through compatibility ownership. That marker is a durable
+// PICS-protection state, not a readable cache pair; it must remain effective
+// after a process restart while the metadata file is absent.
+inline bool retainedSyntheticMarkerProtectionAllowed(
+    bool markerPresent, bool metadataPresent, bool activeCompatibility)
+{
+	return markerPresent && !metadataPresent && activeCompatibility;
+}
+
+// Preserve the PICS protection marker only while compatibility ownership is
+// retained and the pair is known to be synthetic. An explicit normal pair
+// with a stale marker must not be promoted into synthetic state.
+inline bool shouldPreserveSyntheticMarker(bool retainCompatibility,
+                                           bool isSynthetic)
+{
+	return retainCompatibility && isSynthetic;
+}
+
 struct CacheRecordFacts
 {
 	unsigned int requestedAppId = 0;

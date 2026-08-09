@@ -2,29 +2,39 @@
 #include "pics.hpp"
 
 #include "appinfo_provision.hpp"
+#include "provision_cache.hpp"
+#include "appinfo_vdf.hpp"
 #include "depotkey.hpp"
 #include "manifeststore.hpp"
 #include "prewarm.hpp"
+#include "synthmark.hpp"
+#include "apps.hpp"
+#include "packagepatch.hpp"
 
 #include "../config.hpp"
 #include "../globals.hpp"
 #include "../log.hpp"
+#include "../bootprof.hpp"
+#include "../ownerwork.hpp"
 #include "../sdk/CProtoBufMsgBase.hpp"
 #include "../update.hpp"
 
 #include "../utils/ManifestFetch.hpp"
-#include "../utils/atomic_file.hpp"
+#include "../utils/process_lock.hpp"
 
 #include "base64/base64.hpp"
 #include "yaml-cpp/emitter.h"
 #include "yaml-cpp/yaml.h"
 
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -61,9 +71,86 @@ std::string getMetaPath(uint32_t appId)
 	return ss.str();
 }
 
+// A provider-normalized pair, or a legacy pair with no provenance marker,
+// remains authoritative only while its metadata still describes the complete
+// binary. Legacy pairs are deliberately preserved until a provider refresh
+// rewrites them with an explicit marker; otherwise a raw PICS response could
+// silently replace a previously normalized cache.
+// This also prevents a failed metadata publication from leaving an old
+// normalized=true marker that suppresses raw PICS recovery for a newly
+// replaced or truncated buffer.
+bool hasNormalizedCache(uint32_t appId)
+{
+	try
+	{
+		const auto metadata = YAML::LoadFile(getMetaPath(appId));
+		if (metadata["appid"].as<uint32_t>() != appId)
+			return false;
+		if (!AppInfoProvision::cacheMarkerAllowsRead(appId))
+			return false;
+		const auto normalizedField = metadata["normalized"];
+		const bool hasNormalizedMarker = normalizedField.IsDefined();
+		const bool normalized = hasNormalizedMarker &&
+		                        normalizedField.as<bool>();
+		if (!AppInfoProvision::cache::shouldPreserveCacheFromRawPics(
+		        hasNormalizedMarker, normalized))
+			return false;
+
+		const auto declaredSize = metadata["wire_size"].as<std::size_t>();
+		const auto declaredSha = std::string(
+			base64::from_base64(metadata["sha_b64"].as<std::string>()));
+		constexpr std::size_t kSha1Size = 20;
+		if (declaredSha.size() != kSha1Size)
+			return false;
+
+		std::ifstream ifs(getBufferPath(appId),
+		                  std::ios::binary | std::ios::ate);
+		if (!ifs.is_open()) return false;
+		const std::streamsize rawSize = ifs.tellg();
+		if (rawSize <= 0 || rawSize > (16LL << 20) ||
+		    declaredSize != static_cast<std::size_t>(rawSize))
+			return false;
+		std::string wire(static_cast<std::size_t>(rawSize), '\0');
+		ifs.seekg(0, std::ios::beg);
+		if (!ifs.read(wire.data(), rawSize)) return false;
+
+		std::uint8_t digest[kSha1Size]{};
+		AppInfoProvision::sha1Bytes(wire.data(), wire.size(), digest);
+		return std::memcmp(declaredSha.data(), digest, kSha1Size) == 0;
+	}
+	catch (...)
+	{
+		return false;
+	}
+}
+
 bool persistAppBuffer(uint32_t appId, uint32_t changeNumber,
                       const std::string& sha, const std::string& buffer)
 {
+	const auto publication =
+		AppInfoProvision::snapshotCachePublication(appId);
+	if (!publication.managed)
+	{
+		g_pLog->debug("PICS: ignoring stale response for removed app=%u\n", appId);
+		return false;
+	}
+	(void)getCacheDir();
+	std::lock_guard<std::mutex> publicationLock(
+	    AppInfoProvision::cachePublicationMutex());
+	ProcessLock::FileLock cacheLock(AppInfoProvision::cacheLockPath(), false);
+	if (!cacheLock.acquired())
+	{
+		g_pLog->info("PICS: unable to lock cache pair for app=%u\n", appId);
+		return false;
+	}
+	if (!AppInfoProvision::cache::cachePublicationAllowed(
+	        publication.managed, publication.generation,
+	        AppInfoProvision::cachePublicationGenerationLocked(appId)))
+	{
+		g_pLog->debug(
+		    "PICS: rejecting stale cache publication for app=%u\n", appId);
+		return false;
+	}
 	if (buffer.empty()) return false;
 	if (sha.size() != 20)
 	{
@@ -71,39 +158,37 @@ bool persistAppBuffer(uint32_t appId, uint32_t changeNumber,
 		              appId, sha.size());
 		return false;
 	}
-
-	const auto bufPath = getBufferPath(appId);
-	const auto metaPath = getMetaPath(appId);
-
-	// Do not trust a matching change number/size alone: a torn or externally
-	// modified buffer can have both and would otherwise keep poisoning the next
-	// appinfo splice.  AtomicFile publishes the blob before its metadata, so a
-	// reader either sees the previous complete pair or rejects the new pair.
-	std::string writeError;
-	if (!AtomicFile::write(bufPath, buffer, writeError))
+	if (hasNormalizedCache(appId))
 	{
-		g_pLog->debug("PICS: cannot atomically write %s: %s\n",
-		              bufPath.c_str(), writeError.c_str());
+		g_pLog->debug(
+		    "PICS: retaining normalized or legacy cache for app=%u\n", appId);
 		return false;
 	}
 
-	{
-		YAML::Emitter em;
-		em << YAML::BeginMap;
-		em << YAML::Key << "appid"          << YAML::Value << appId;
-		em << YAML::Key << "change_number"  << YAML::Value << changeNumber;
-		em << YAML::Key << "wire_size"      << YAML::Value << buffer.size();
-		em << YAML::Key << "sha_b64"        << YAML::Value << base64::to_base64(sha);
-		em << YAML::EndMap;
+	const auto bufPath = getBufferPath(appId);
 
-		const std::string metadata(em.c_str(), em.size());
-		if (!AtomicFile::write(metaPath, metadata, writeError))
-		{
-			g_pLog->debug("PICS: cannot atomically write %s: %s\n",
-			              metaPath.c_str(), writeError.c_str());
-			return false;
-		}
+	YAML::Emitter em;
+	em << YAML::BeginMap;
+	em << YAML::Key << "appid"          << YAML::Value << appId;
+	em << YAML::Key << "change_number"  << YAML::Value << changeNumber;
+	em << YAML::Key << "wire_size"      << YAML::Value << buffer.size();
+	em << YAML::Key << "sha_b64"        << YAML::Value << base64::to_base64(sha);
+	em << YAML::Key << "normalized"     << YAML::Value << false;
+	em << YAML::Key << "synthetic"      << YAML::Value << false;
+	em << YAML::EndMap;
+	const std::string metadata(em.c_str(), em.size());
+	const bool markerBefore = SynthMark::isMarked(getCacheDir(), appId);
+	std::string writeError;
+	if (!AppInfoProvision::publishCachePairLocked(
+	        appId, buffer, metadata, /*synthetic=*/false, markerBefore,
+	        writeError))
+	{
+		g_pLog->debug(
+		    "PICS: unable to publish cache pair for app=%u: %s\n",
+		    appId, writeError.c_str());
+		return false;
 	}
+	AppInfoProvision::clearCacheReadInvalidation(appId);
 
 	g_pLog->debug("PICS: cached app=%u change=%u buffer=%zu bytes -> %s\n",
 	              appId, changeNumber, buffer.size(), bufPath.c_str());
@@ -121,20 +206,14 @@ std::vector<std::pair<uint32_t, uint64_t>> extractDepotsAndGids(const std::strin
 // Read a previously-persisted product-info buffer from our cache.
 // Used to recover the depot/gid list for AdditionalApps whose live CM
 // product-info response carries an empty buffer (see the staging
-// fallback in recvProductInfoResponse).  AppInfoProvision and
-// persistAppBuffer both write to this same `picsbuffer_<appid>.bin`
-// path, so whichever ran last is what we read.
+// fallback in recvProductInfoResponse). AppInfoProvision and
+// persistAppBuffer share this `picsbuffer_<appid>.bin` path; provider-
+// normalized pairs are marked in metadata and remain authoritative over
+// raw responses.
 std::string readCachedBuffer(uint32_t appId)
 {
-	const auto path = getBufferPath(appId);
-	std::ifstream ifs(path, std::ios::binary | std::ios::ate);
-	if (!ifs.is_open()) return {};
-	const std::streamsize sz = ifs.tellg();
-	if (sz <= 0 || sz > (8LL << 20)) return {};
 	std::string out;
-	out.resize(static_cast<std::size_t>(sz));
-	ifs.seekg(0);
-	if (!ifs.read(out.data(), sz)) return {};
+	if (!AppInfoProvision::readValidatedCacheBuffer(appId, out)) return {};
 	return out;
 }
 
@@ -171,6 +250,34 @@ void cleanShaderHitCache(uint32_t appId)
 	}
 }
 
+void refreshDlcInjectionAfterColdProvision()
+{
+	std::lock_guard<std::mutex> passLock(
+	    AppInfoProvision::provisioningPassMutex());
+	bool complete = false;
+	const auto dlcIds = AppInfoProvision::collectDlcAppIdsForAddedApps(&complete);
+	if (!complete)
+	{
+		g_pLog->debug(
+		    "PICS: DLC cache snapshot incomplete; retaining existing "
+		    "DLC/package-0 injection\n");
+		return;
+	}
+	PackagePatch::setExtraAppIds(dlcIds.package0);
+	Apps::setAddedAppDlcIds(dlcIds.appDlc);
+
+	const auto added = g_config.addedAppIds.get();
+	const auto ids = AppInfoProvision::mergePackage0AppIds(
+	    added, dlcIds.package0);
+	if (ids.empty()) return;
+
+	const auto mode = OwnerWork::submitHotAdd(ids);
+	g_pLog->debug(
+	    "PICS: refreshed DLC/package-0 injection after cold provisioning "
+	    "(package0 DLC=%zu, mode=%s)\n",
+	    dlcIds.package0.size(), OwnerWork::modeName(mode));
+}
+
 } // namespace
 
 void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
@@ -193,6 +300,28 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	    "PICS: manifest staging mode=%s\n",
 	    legacyStaging ? "legacy synchronous + prewarm"
 	                  : "event-driven Steam install plan");
+
+	// A genuinely missing provisioned buffer is the one case that remains
+	// synchronous. During the normal startup pass it is handled before
+	// appinfo.vdf is spliced; this callback-side path remains for a late
+	// hot-add or an interrupted/invalid publication. It runs on this real
+	// Steam worker thread and persists a complete cache pair for the next
+	// setup pass. Never rewrite Steam's live appinfo file from this callback:
+	// its ConfigStore writers do not share our lock and the current process
+	// has already loaded its in-memory map.
+	const std::string appinfoVdfPath = AppInfoVdf::findExistingPath();
+	std::unordered_set<uint32_t> coldSanitizedApps;
+	std::unordered_set<uint32_t> coldFallbackApps;
+	int coldProvisioned = 0;
+	{
+		BootProf::Span profile(g_pLog.get(), "provision.cold_sync");
+		coldProvisioned = AppInfoProvision::provisionColdStartApps(
+		    appinfoVdfPath, &coldSanitizedApps, false, &coldFallbackApps);
+	}
+	if (coldProvisioned > 0)
+	{
+		refreshDlcInjectionAfterColdProvision();
+	}
 
 	// Rollback-only collection for the old architecture. In normal operation
 	// PICS still persists and supplies product info, but performs no manifest
@@ -245,11 +374,21 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 			// instead — ManifestCode's GetManifestRequestCode /
 			// BYldRequestDepotManifest hooks redirect the actual
 			// manifest request to the pinned gid — so dropping the
-			// product-info rewrite loses nothing.  We persist the
-			// pristine, server-validated buffer (verbatim sha) so the
-			// appinfo.vdf warm-cache splice stays consistent too.
-			persistAppBuffer(app->appid(), app->change_number(),
-			                 app->sha(), app->buffer());
+			// product-info rewrite loses nothing.  A successful cold pass already
+			// wrote the normalized provider buffer. Keep this callback's raw
+			// response from overwriting that sanitized pair; a later refresh can
+			// replace it through the same normalization path.
+			if (coldSanitizedApps.count(app->appid()) == 0)
+			{
+				persistAppBuffer(app->appid(), app->change_number(),
+				                 app->sha(), app->buffer());
+			}
+			else
+			{
+				g_pLog->debug(
+				    "PICS: retaining normalized cold cache for app=%u\n",
+				    app->appid());
+			}
 
 			cleanShaderHitCache(app->appid());
 		}
@@ -422,6 +561,11 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 		}
 		g_pLog->debug("PICS: unknown_appids=[%s]\n", ss.str().c_str());
 	}
+
+	// Existing buffers are refreshed asynchronously from this sanctioned PICS
+	// worker-thread entry point. The worker never runs from setup()/load(); its
+	// output is consumed by AppInfoVdf::injectAllCached on the next Steam start.
+	AppInfoProvision::refreshInBackground(appinfoVdfPath);
 
 	// Refresh the safe-mode-hash cache (updates.yaml) off the boot path.
 	// init() served it from disk synchronously so Steam's launch never

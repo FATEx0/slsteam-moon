@@ -3,6 +3,7 @@
 // See appinfo_vdf.hpp for design notes and file format.
 
 #include "appinfo_vdf.hpp"
+#include "appinfo_provision.hpp"
 
 #include "../config.hpp"
 #include "../globals.hpp"
@@ -13,12 +14,15 @@
 #include "base64/base64.hpp"
 #include "prewarm.hpp"
 #include "provision_cache.hpp"
+#include "provision_schedule.hpp"
+#include "synthmark.hpp"
 #include "yaml-cpp/yaml.h"
 
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <ios>
@@ -27,6 +31,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
 #include <ctime>
 #include <unistd.h>
 #include <unordered_map>
@@ -61,6 +66,34 @@ bool parsePicsBufferName(const std::string& name, uint32_t& appId)
 	if (result.ec != std::errc{} || result.ptr != last) return false;
 	appId = parsed;
 	return true;
+}
+
+long long provisionTtlSecsForSplice()
+{
+	if (const char* ov = std::getenv("SLSSTEAM_PROVISION_TTL"); ov && *ov)
+	{
+		try { return std::stoll(ov); } catch (...) {}
+	}
+	return 300;
+}
+
+bool shouldSkipStaleCacheForSplice(const std::string& cacheDir,
+                                    uint32_t appId,
+                                    bool explicitFallback)
+{
+	const bool asyncEnabled = AppInfoProvision::asyncProvisionEnabled(
+		g_config.asyncProvision.get(), std::getenv("SLSSTEAM_ASYNC_PROVISION"));
+	if (!AppInfoProvision::shouldSkipStaleAsyncSplice(
+			asyncEnabled, explicitFallback))
+		return false;
+
+	const auto bufferPath = cacheDir + "/picsbuffer_" +
+	                        std::to_string(appId) + ".bin";
+	struct stat st{};
+	if (::stat(bufferPath.c_str(), &st) != 0) return false;
+	return !AppInfoProvision::cache::isBufferReusable(
+		st.st_size > 0, static_cast<long long>(st.st_mtime),
+		static_cast<long long>(std::time(nullptr)), provisionTtlSecsForSplice());
 }
 
 // KV1 binary node types.
@@ -748,12 +781,30 @@ bool loadCachedBuffer(const std::string& metaPath, uint32_t expectedAppId,
 {
 	try
 	{
+		if (!AppInfoProvision::cacheMarkerAllowsRead(expectedAppId))
+		{
+			err = "cache read invalidated or synthetic marker state is inconsistent";
+			return false;
+		}
 		auto node = YAML::LoadFile(metaPath);
 		out.appid         = node["appid"].as<uint32_t>();
 		out.change_number = node["change_number"].as<uint32_t>();
 		out.sha           = std::string(
 		    base64::from_base64(node["sha_b64"].as<std::string>()));
 		const auto wireSize = node["wire_size"].as<size_t>();
+		const bool markerPresent = SynthMark::isMarked(
+		    std::filesystem::path(metaPath).parent_path().string(), expectedAppId);
+		const YAML::Node syntheticNode = node["synthetic"];
+		const bool hasSyntheticMetadata = syntheticNode.IsDefined();
+		const bool synthetic = hasSyntheticMetadata
+		    ? syntheticNode.as<bool>()
+		    : false;
+		if (!AppInfoProvision::cache::syntheticMarkerStateConsistent(
+		        hasSyntheticMetadata, synthetic, markerPresent))
+		{
+			err = "synthetic marker state is inconsistent";
+			return false;
+		}
 
 		std::string bufPath = metaPath;
 		const auto pos = bufPath.rfind(".yaml");
@@ -930,6 +981,23 @@ bool publishChecked(const std::string& path, const AppInfoFile& file,
 // Public API
 // ---------------------------------------------------------------------------
 
+std::string findExistingPath()
+{
+	const char* home = std::getenv("HOME");
+	if (!home) return {};
+	static const char* suffixes[] = {
+		"/.steam/steam/appcache/appinfo.vdf",
+		"/.steam/debian-installation/appcache/appinfo.vdf",
+		"/.local/share/Steam/appcache/appinfo.vdf",
+	};
+	for (const char* suffix : suffixes)
+	{
+		const std::string candidate = std::string(home) + suffix;
+		if (std::filesystem::exists(candidate)) return candidate;
+	}
+	return {};
+}
+
 bool injectApp(const std::string& path,
                uint32_t appid,
                uint32_t changeNumber,
@@ -972,7 +1040,9 @@ bool injectApp(const std::string& path,
 	return true;
 }
 
-int injectAllCached(const std::string& path)
+int injectAllCached(
+	const std::string& path,
+	const std::unordered_set<uint32_t>& explicitFallbackApps)
 {
 	const auto cacheDir = g_config.getDir() + "/cache";
 	if (!std::filesystem::exists(cacheDir)) return 0;
@@ -982,6 +1052,13 @@ int injectAllCached(const std::string& path)
 	{
 		g_pLog->info("AppInfoVdf: another writer owns %s; skipping cache splice\n",
 		              appInfoLockPath(path).c_str());
+		return 0;
+	}
+
+	ProcessLock::FileLock cacheLock(AppInfoProvision::cacheLockPath(), false);
+	if (!cacheLock.acquired())
+	{
+		g_pLog->info("AppInfoVdf: unable to lock provision cache; skipping cache splice\n");
 		return 0;
 	}
 
@@ -995,12 +1072,13 @@ int injectAllCached(const std::string& path)
 	}
 
 	const auto managed = g_config.managedAppIds.get();
+	const auto active = g_config.addedAppIds.get();
 	const std::string quarantineSuffix =
 		".orphaned." +
 		std::to_string(static_cast<long long>(std::time(nullptr))) + "." +
 		std::to_string(static_cast<long long>(::getpid()));
 	for (const auto& record : SynthMark::quarantineOrphans(
-		cacheDir, managed, quarantineSuffix))
+		cacheDir, active, quarantineSuffix))
 	{
 		g_pLog->infoOnce("AppInfoVdf: quarantined orphan app cache %s -> %s\n",
 		                record.original.string().c_str(),
@@ -1042,6 +1120,15 @@ int injectAllCached(const std::string& path)
 		{
 			g_pLog->infoOnce("AppInfoVdf: skipping orphan cache app=%u (%s)\n",
 			                expectedAppId, fname.c_str());
+			continue;
+		}
+		const bool explicitFallback =
+			explicitFallbackApps.count(expectedAppId) != 0;
+		if (shouldSkipStaleCacheForSplice(
+				cacheDir, expectedAppId, explicitFallback))
+		{
+			g_pLog->debug("AppInfoVdf: skipping stale async cache app=%u (%s)\n",
+			              expectedAppId, fname.c_str());
 			continue;
 		}
 		if (!loadCachedBuffer(metaPath.string(), expectedAppId, cb, err))

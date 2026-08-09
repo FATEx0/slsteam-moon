@@ -264,7 +264,9 @@ namespace SynthMark
 
 	inline std::vector<std::string> appArtifactNames(
 	    std::uint32_t appId,
-	    const std::vector<std::uint32_t>& relatedDepotIds)
+	    const std::vector<std::uint32_t>& relatedDepotIds,
+	    bool includeTicketArtifacts = true,
+	    bool includeSyntheticMarker = true)
 	{
 		std::vector<std::string> names;
 		if (appId == 0) return names;
@@ -275,9 +277,13 @@ namespace SynthMark
 		const std::string id = std::to_string(appId);
 		add("picsbuffer_" + id + ".bin");
 		add("picsbuffer_" + id + ".yaml");
-		add("synthetic_" + id);
-		add("ticket_" + id + ".yaml");
-		add("encryptedTicket_" + id + ".yaml");
+		if (includeSyntheticMarker)
+			add("synthetic_" + id);
+		if (includeTicketArtifacts)
+		{
+			add("ticket_" + id + ".yaml");
+			add("encryptedTicket_" + id + ".yaml");
+		}
 		for (const std::uint32_t depotId : relatedDepotIds)
 		{
 			if (depotId != 0)
@@ -378,9 +384,10 @@ namespace SynthMark
 		std::filesystem::path quarantined;
 	};
 
-	// Rename known per-app cache artifacts for apps no longer managed.  The
-	// caller supplies a unique suffix (for example, ".orphaned.<timestamp>")
-	// so the original path can be restored without deleting any data.
+	// Rename known per-app cache artifacts for apps no longer active. The
+	// caller supplies active compatibility ids as well as managed sources so a
+	// live app's retained synthetic-PICS marker is not quarantined early. A
+	// unique suffix lets the original path be restored without deleting data.
 	inline std::vector<QuarantineRecord> quarantineOrphans(
 	    const std::string& dir,
 	    const std::unordered_set<std::uint32_t>& managedAppIds,
@@ -421,12 +428,15 @@ namespace SynthMark
 		const std::string& dir,
 		std::uint32_t appId,
 		const std::vector<std::uint32_t>& relatedDepotIds,
-		const std::string& suffix)
+		const std::string& suffix,
+		bool includeTicketArtifacts = true,
+		bool includeSyntheticMarker = true)
 	{
 		std::vector<QuarantineRecord> out;
 		if (appId == 0 || suffix.empty()) return out;
-
-		for (const auto& name : detail::appArtifactNames(appId, relatedDepotIds))
+		for (const auto& name : detail::appArtifactNames(
+				appId, relatedDepotIds, includeTicketArtifacts,
+				includeSyntheticMarker))
 		{
 			const auto original = std::filesystem::path(dir) / name;
 			std::error_code ec;
@@ -457,10 +467,14 @@ namespace SynthMark
 	inline bool hasAppArtifacts(
 		const std::string& dir,
 		std::uint32_t appId,
-		const std::vector<std::uint32_t>& relatedDepotIds)
+		const std::vector<std::uint32_t>& relatedDepotIds,
+		bool includeTicketArtifacts = true,
+		bool includeSyntheticMarker = true)
 	{
 		if (appId == 0) return false;
-		for (const auto& name : detail::appArtifactNames(appId, relatedDepotIds))
+		for (const auto& name : detail::appArtifactNames(
+				appId, relatedDepotIds, includeTicketArtifacts,
+				includeSyntheticMarker))
 		{
 			std::error_code ec;
 			const bool regular = std::filesystem::is_regular_file(

@@ -2,6 +2,8 @@
 
 #include "prewarm.hpp"
 
+#include "appinfo_provision.hpp"
+
 #include "depotkey.hpp"
 #include "manifeststore.hpp"
 
@@ -11,7 +13,6 @@
 #include "../thread_start.hpp"
 
 #include "../utils/ManifestFetch.hpp"
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -20,7 +21,6 @@
 #include <fstream>
 #include <ios>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -47,13 +47,6 @@ bool waitOrStop(std::chrono::duration<Rep, Period> delay)
 	{
 		return g_stopRequested.load(std::memory_order_acquire);
 	});
-}
-
-std::string bufferPath(uint32_t appId)
-{
-	std::stringstream ss;
-	ss << g_config.getDir() << "/cache/picsbuffer_" << appId << ".bin";
-	return ss.str();
 }
 
 // Resolve the Steam root (same candidate list ManifestFetch uses) so we
@@ -106,15 +99,8 @@ std::string readWorkshopAcf(const std::string& steamRoot, uint32_t appId)
 // for synchronous install staging.
 std::string readBuffer(uint32_t appId)
 {
-	const auto path = bufferPath(appId);
-	std::ifstream ifs(path, std::ios::binary | std::ios::ate);
-	if (!ifs.is_open()) return {};
-	const std::streamsize sz = ifs.tellg();
-	if (sz <= 0 || sz > (64LL << 20)) return {};
 	std::string out;
-	out.resize(static_cast<std::size_t>(sz));
-	ifs.seekg(0);
-	if (!ifs.read(out.data(), sz)) return {};
+	if (!AppInfoProvision::readValidatedCacheBuffer(appId, out)) return {};
 	return out;
 }
 

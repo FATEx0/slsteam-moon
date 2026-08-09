@@ -1,4 +1,5 @@
 #include "config.hpp"
+#include "config_path.hpp"
 
 #include "afftrace.hpp"
 #include "confload.hpp"
@@ -9,6 +10,7 @@
 #include "yaml-cpp/yaml.h"
 
 #include "feats/appinfo_provision.hpp"
+#include "feats/appinfo_vdf.hpp"
 #include "feats/depotkey.hpp"
 #include "config_discovery.hpp"
 #include "feats/manifestid.hpp"
@@ -83,19 +85,8 @@ namespace
 
 std::string CConfig::getDir()
 {
-	char pathBuf[255];
-	const char* configDir = getenv("XDG_CONFIG_HOME"); //Most users should have this set iirc
-	if (configDir != NULL)
-	{
-		sprintf(pathBuf, "%s/SLSsteam", configDir);
-	}
-	else
-	{
-		const char* home = getenv("HOME");
-		sprintf(pathBuf, "%s/.config/SLSsteam", home);
-	}
-
-	return std::string(pathBuf);
+	return ConfigPath::slsteamConfigDir(
+	    std::getenv("XDG_CONFIG_HOME"), std::getenv("HOME"));
 }
 
 std::string CConfig::getPath()
@@ -247,24 +238,49 @@ static void onFileChange()
 	// (see ownerwork.hpp).
 	auto watchSpan = AffTrace::watchSpan(AffTrace::Src::Config);
 
-	// Snapshot the AdditionalApps set BEFORE reloading so we can tell whether
-	// the change added any new games.
+	// Snapshot the active and managed sets BEFORE reloading so source removal
+	// can be distinguished from removal of an active compatibility entry.
 	const auto before = g_config.addedAppIds.get();
+	const auto beforeManaged = g_config.managedAppIds.get();
 
 	g_config.loadSettings();
 
 	const auto after = g_config.addedAppIds.get();
+	const auto afterManaged = g_config.managedAppIds.get();
+	const auto removals = ConfigDiscovery::classifyReloadRemovals(
+	    beforeManaged, afterManaged, before, after);
+	const bool hasManagedSourceAddition = !removals.managedAdded.empty();
 
-	// Removed apps are tombstoned before native cache quarantine. This ordering
-	// prevents a concurrent ticket load/save from repopulating state while the
-	// app's on-disk artifacts are being moved.
-	for (const uint32_t appId : ConfigDiscovery::removedAppIds(before, after))
+	// Active removals revoke ownership/package state and invalidate the
+	// app-scoped cache. A managed-source removal that remains active through
+	// compatibility state invalidates only the cache; ownership is retained.
+	for (const uint32_t appId : removals.active)
 	{
 		const bool ticketsForgotten = Ticket::forgetApp(appId);
 		const bool cacheForgotten = AppInfoProvision::forgetApp(appId);
 		g_pLog->info("Config watcher: removed app=%u cache=%s tickets=%s\n",
 		             appId, cacheForgotten ? "cleared" : "partial",
 		             ticketsForgotten ? "cleared" : "rejected");
+	}
+
+	for (const uint32_t appId : removals.managed)
+	{
+		bool alsoActiveRemoved = false;
+		for (const uint32_t activeId : removals.active)
+		{
+			if (activeId == appId)
+			{
+				alsoActiveRemoved = true;
+				break;
+			}
+		}
+		if (alsoActiveRemoved) continue;
+
+		const bool cacheForgotten =
+			AppInfoProvision::forgetManagedSourceApp(appId);
+		g_pLog->info("Config watcher: removed managed source app=%u cache=%s "
+		             "tickets=retained\n",
+		             appId, cacheForgotten ? "cleared" : "partial");
 	}
 
 	// Re-scan manifest pins for every watcher event, not only when the app-id
@@ -285,7 +301,7 @@ static void onFileChange()
 		}
 	}
 
-	if (hasNewApp)
+	if (hasNewApp || hasManagedSourceAddition)
 	{
 		// Local (non-Steam) work stays on this thread, unchanged and in the
 		// same order as before.
@@ -301,6 +317,20 @@ static void onFileChange()
 
 		g_pLog->info("Config watcher: hot-add detected, package 0 injection + "
 		             "license broadcast dispatched %s\n", OwnerWork::modeName(mode));
+	}
+	if (hasManagedSourceAddition)
+	{
+		// The managed-only removal deliberately quarantines appinfo cache while
+		// preserving compatibility ownership. Rebuild that cache asynchronously
+		// for the next restart; never splice Steam's live appinfo from this
+		// watcher thread.
+		const auto appinfoPath = AppInfoVdf::findExistingPath();
+		if (!appinfoPath.empty())
+		{
+			AppInfoProvision::refreshInBackground(appinfoPath);
+			g_pLog->info("Config watcher: managed-source refresh requested for "
+			             "the next appinfo splice\n");
+		}
 	}
 }
 
@@ -427,6 +457,7 @@ bool CConfig::loadSettings()
 	achievementOwnerId = getSetting<uint64_t>(node, "AchievementOwnerId", 76561198028121353ULL);
 	extendedLogging = getSetting<bool>(node, "ExtendedLogging", false);
 	patternCache = getSetting<bool>(node, "PatternCache", true);
+	asyncProvision = getSetting<bool>(node, "AsyncProvision", true);
 	logLevel = getSetting<unsigned int>(node, "LogLevel", 2);
 
 	//TODO: Create smart logging function to log them automatically via getSetting
@@ -436,13 +467,14 @@ bool CConfig::loadSettings()
 		"Notifications=%i WarnHashMissmatch=%i NotifyInit=%i API=%i "
 		"FakeEmail=%s FakeWalletBalance=%i DisableCloud=%i "
 		"InjectAllAdvertisedDlc=%i Achievements=%i PatternCache=%i "
-		"ExtendedLogging=%i LogLevel=%u\n",
+		"AsyncProvision=%i ExtendedLogging=%i LogLevel=%u\n",
 		disableFamilyLock.get(), disableParentalRestrictions.get(),
 		useWhiteList.get(), automaticFilter.get(), playNotOwnedGames.get(),
 		safeMode.get(), notifications.get(), warnHashMissmatch.get(),
 		notifyInit.get(), api.get(), fakeEmail.get().c_str(),
 		fakeWalletBalance.get(), disableCloud.get(), injectAllAdvertisedDlc.get(),
-		achievements.get(), patternCache.get(), extendedLogging.get(), logLevel.get());
+		achievements.get(), patternCache.get(), asyncProvision.get(),
+		extendedLogging.get(), logLevel.get());
 
 	appIds = getList<uint32_t>(node, "AppIds");
 

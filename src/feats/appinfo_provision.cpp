@@ -15,17 +15,24 @@
 #include "manifeststore_io.hpp"
 #include "manifestsynth.hpp"
 #include "provision_cache.hpp"
+#include "cache_pair.hpp"
 #include "provision_network.hpp"
+#include "provision_schedule.hpp"
+#include "pending_proton.hpp"
+#include "provision_pass.hpp"
 #include "synthmark.hpp"
 #include "usabledepot.hpp"
 
 #include "../config.hpp"
 #include "../globals.hpp"
 #include "../log.hpp"
+#include "../bootprof.hpp"
+#include "../thread_start.hpp"
 #include "../cainfo.hpp"
 
 #include "../utils/ManifestFetch.hpp"
 #include "../utils/atomic_file.hpp"
+#include "../utils/process_lock.hpp"
 
 #include "base64/base64.hpp"
 #include "yaml-cpp/yaml.h"
@@ -36,7 +43,9 @@
 #include <curl/curl.h>
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <chrono>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -53,6 +62,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <unordered_map>
 #include <unistd.h>
 #include <unordered_set>
 #include <vector>
@@ -69,6 +79,10 @@ namespace
 // treating the title as "no applicable platform" (which surfaces as the
 // install committing 0 bytes / "0 mounted depots").
 std::set<uint32_t> g_needProton;
+// Config watcher removals can race a nonblocking cache lock. Keep a
+// retryable in-memory tombstone so the next cache publication removes the
+// corresponding pending Proton mapping instead of leaving stale state.
+std::set<uint32_t> g_pendingProtonRemovals;
 
 struct CacheValidationResult
 {
@@ -78,6 +92,67 @@ struct CacheValidationResult
 
 std::mutex g_cacheValidationMu;
 std::map<cache::CacheValidationKey, CacheValidationResult> g_cacheValidationMemo;
+std::mutex g_provisionPassMu;
+std::mutex g_cachePublicationMu;
+std::mutex g_cacheReadInvalidationMu;
+std::unordered_set<uint32_t> g_cacheReadInvalidated;
+std::unordered_map<uint32_t, std::uint64_t> g_cachePublicationGenerations;
+std::mutex g_refreshScheduleMu;
+bool g_refreshInFlight = false;
+bool g_refreshPending = false;
+std::string g_refreshPendingPath;
+std::uint64_t g_refreshWorkerToken = 0;
+std::mutex g_coldRetryMu;
+std::chrono::steady_clock::time_point g_coldRetryAfter{};
+unsigned int g_coldRetryFailures = 0;
+
+void markProtonNeeded(uint32_t appId,
+                      const CachePublicationToken& publication)
+{
+	std::lock_guard<std::mutex> passLock(g_provisionPassMu);
+	if (!publication.managed ||
+	    g_config.managedAppIds.get().count(appId) == 0)
+		return;
+
+	std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+	if (!cache::protonPublicationAllowed(
+	        publication.managed, publication.generation,
+	        cachePublicationGenerationLocked(appId)))
+	{
+		g_pLog->debug(
+		    "AppInfoProvision: rejecting stale Proton mark for app=%u\n",
+		    appId);
+		return;
+	}
+	g_pendingProtonRemovals.erase(appId);
+	g_needProton.insert(appId);
+}
+
+bool coldRetryBlocked()
+{
+	std::lock_guard<std::mutex> lock(g_coldRetryMu);
+	return g_coldRetryAfter != std::chrono::steady_clock::time_point{} &&
+	       std::chrono::steady_clock::now() < g_coldRetryAfter;
+}
+
+void noteColdRetryOutcome(bool unresolved)
+{
+	std::lock_guard<std::mutex> lock(g_coldRetryMu);
+	if (!unresolved)
+	{
+		g_coldRetryAfter = {};
+		g_coldRetryFailures = 0;
+		return;
+	}
+
+	++g_coldRetryFailures;
+	const unsigned int exponent =
+		g_coldRetryFailures > 4 ? 4 : g_coldRetryFailures - 1;
+	const unsigned int delaySeconds = std::min(60u, 5u << exponent);
+	g_coldRetryAfter = std::chrono::steady_clock::now() +
+	                   std::chrono::seconds(delaySeconds);
+}
+
 
 
 // ---------------------------------------------------------------------------
@@ -344,7 +419,8 @@ void emitNode(std::string& out, const YAML::Node& node, int depth)
 //     "windows") rather than a phantom native binary.
 //
 // Mutates `body` in place.  `appId` is for log lines only.
-void pruneUnsupportedDepots(YAML::Node& body, uint32_t appId)
+void pruneUnsupportedDepots(YAML::Node& body, uint32_t appId,
+                             const CachePublicationToken& publication)
 {
 	if (!body.IsMap()) return;
 	YAML::Node depots = body["depots"];
@@ -501,7 +577,7 @@ void pruneUnsupportedDepots(YAML::Node& body, uint32_t appId)
 		// it for Proton when no surviving depot targets Linux.
 		if (!survivingOs.empty() && !survivingOs.count("linux"))
 		{
-			g_needProton.insert(appId);
+			markProtonNeeded(appId, publication);
 		}
 		return;
 	}
@@ -517,7 +593,7 @@ void pruneUnsupportedDepots(YAML::Node& body, uint32_t appId)
 	// and windows+macos apps.)
 	if (!survivingOs.empty() && !survivingOs.count("linux"))
 	{
-		g_needProton.insert(appId);
+		markProtonNeeded(appId, publication);
 	}
 
 	// NOTE: we intentionally do NOT narrow common.oslist.  Leaving the
@@ -615,14 +691,9 @@ int synthesizeDepotsFromStore(YAML::Node& body, uint32_t appId)
 			             appId, le, summary.c_str());
 		}
 
-		// Mark the app synthetic so the outgoing-PICS hook strips it from
-		// Steam's product-info requests.  Without this, Steam's runtime
-		// RequestAppInfoUpdate returns an EMPTY buffer (token denied) and
-		// clobbers these synthesized depots in memory -> install dialog drops
-		// to 0 B / "Invalid install path".  Persisted: the surviving setup()
-		// pass may hit the provisioning cache and skip synthesis, but the
-		// marker from the cold pass remains.
-		SynthMark::mark(getCacheDir(), appId);
+		// The synthetic marker is published together with the validated cache
+		// pair by persistBuffer. Keeping it out of this render phase prevents
+		// stale work from recreating the marker after a managed-source removal.
 	}
 	return n;
 }
@@ -678,9 +749,11 @@ bool isDlcApp(const YAML::Node& body)
 	return value == "dlc";
 }
 
-SourceResult renderAppinfoBuffer(const YAML::Node& appNode, uint32_t appId,
-                                 std::string& wireOut)
+SourceResult renderAppinfoBuffer(
+    const YAML::Node& appNode, uint32_t appId, std::string& wireOut,
+    const CachePublicationToken& publication, bool* synthesizedOut)
 {
+	if (synthesizedOut) *synthesizedOut = false;
 	if (!appNode.IsMap()) return SourceResult::InvalidResponse;
 
 	// Drop SteamCMD synthetic envelope fields ("_change_number", "_sha",
@@ -710,6 +783,7 @@ SourceResult renderAppinfoBuffer(const YAML::Node& appNode, uint32_t appId,
 		const int n = synthesizeDepotsFromStore(body, appId);
 		if (n > 0)
 		{
+			if (synthesizedOut) *synthesizedOut = true;
 			g_pLog->info("AppInfoProvision: app=%u synthesized %d depot(s) from "
 			             "stored manifests (product-info had none)\n", appId, n);
 			hadConcreteContent = hasUsableContentDepot(body);
@@ -720,7 +794,7 @@ SourceResult renderAppinfoBuffer(const YAML::Node& appNode, uint32_t appId,
 	// Done here (post-envelope-strip, pre-emit) so the output Steam
 	// reads is consistent and the change is invisible to Steam beyond
 	// "the user only owns the windows depot".
-	pruneUnsupportedDepots(body, appId);
+	pruneUnsupportedDepots(body, appId, publication);
 	const SourceResult contentResult = classifyContentResult(
 	    hadConcreteContent, hasUsableContentDepot(body), isDlcApp(body));
 	if (contentResult != SourceResult::Success)
@@ -777,6 +851,114 @@ std::string getMetaPath(uint32_t appId)
 	return getCacheDir() + "/picsbuffer_" + std::to_string(appId) + ".yaml";
 }
 
+std::string pendingProtonPath()
+{
+	return getCacheDir() + "/proton-mappings.pending";
+}
+
+enum class PendingProtonFileStatus
+{
+	Missing,
+	Valid,
+	Invalid,
+};
+
+struct PendingProtonFile
+{
+	PendingProtonFileStatus status = PendingProtonFileStatus::Invalid;
+	std::set<uint32_t> ids;
+};
+
+// Read the pending mapping file while the caller holds cacheLock. Missing is
+// a normal first-run state; every other open/read/parse failure is invalid and
+// must leave the existing file and any in-memory removals untouched.
+PendingProtonFile readPendingProtonFileLocked()
+{
+	const auto path = pendingProtonPath();
+	std::ifstream ifs(path);
+	if (!ifs.is_open())
+	{
+		std::error_code ec;
+		const bool exists = std::filesystem::exists(path, ec);
+		if (!exists && !ec)
+			return {PendingProtonFileStatus::Missing, {}};
+		return {PendingProtonFileStatus::Invalid, {}};
+	}
+
+	std::set<uint32_t> ids;
+	std::string token;
+	while (ifs >> token)
+	{
+		const auto parsed = parsePendingProtonText(token);
+		if (parsed.status != PendingProtonParseStatus::Valid ||
+		    parsed.ids.size() != 1)
+		{
+			return {PendingProtonFileStatus::Invalid, {}};
+		}
+		ids.insert(*parsed.ids.begin());
+	}
+	if (ifs.bad() || !ifs.eof())
+		return {PendingProtonFileStatus::Invalid, {}};
+	return {PendingProtonFileStatus::Valid, std::move(ids)};
+}
+
+// Runtime PICS provisioning must not replace Steam's live config.vdf. Keep
+// the ids in a small cache record for the next preinit pass instead.
+void persistPendingProtonMappings(bool waitForLock)
+{
+	if (g_needProton.empty() && g_pendingProtonRemovals.empty()) return;
+	(void)getCacheDir();
+	ProcessLock::FileLock cacheLock(cacheLockPath(), !waitForLock);
+	if (!cacheLock.acquired()) return;
+
+	const auto existing = readPendingProtonFileLocked();
+	if (existing.status == PendingProtonFileStatus::Invalid)
+	{
+		if (g_pLog)
+			g_pLog->debug("AppInfoProvision: preserving invalid or unreadable pending Proton file\n");
+		return;
+	}
+
+	std::set<uint32_t> pending;
+	const auto managed = g_config.managedAppIds.get();
+	for (uint32_t appId : existing.ids)
+	{
+		if (managed.count(appId) != 0)
+			pending.insert(appId);
+	}
+	for (uint32_t appId : g_needProton)
+	{
+		if (managed.count(appId) != 0)
+			pending.insert(appId);
+	}
+	for (uint32_t appId : g_pendingProtonRemovals)
+		pending.erase(appId);
+
+	bool persisted = false;
+	std::string error;
+	if (pending.empty())
+	{
+		std::error_code ec;
+		std::filesystem::remove(pendingProtonPath(), ec);
+		persisted = !ec;
+	}
+	else
+	{
+		std::string content;
+		for (uint32_t appId : pending)
+			content += std::to_string(appId) + "\n";
+		persisted = AtomicFile::write(pendingProtonPath(), content, error);
+	}
+	if (!persisted)
+	{
+		if (g_pLog)
+			g_pLog->debug("AppInfoProvision: cannot persist pending Proton mappings: %s\n",
+			              error.empty() ? "remove failed" : error.c_str());
+		return;
+	}
+	g_pendingProtonRemovals.clear();
+}
+
 // Return the full identity of `appId`'s on-disk provisioned buffer, and
 // whether it exists and is non-empty.  Used by provisionApp's short-lived
 // cache to skip the network fetch during the setup() re-exec storm of a
@@ -797,6 +979,14 @@ bool statBuffer(uint32_t appId, cache::CacheValidationKey& identityOut)
 	return true;
 }
 
+bool hasBufferOnDisk(uint32_t appId)
+{
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired()) return false;
+	cache::CacheValidationKey identity{};
+	return statBuffer(appId, identity);
+}
+
 // Freshness window for the provisioning cache, in seconds.  Short by
 // design: it must cover Steam's setup() re-exec storm within one boot
 // (so the 8-app fleet is fetched once, not once per pass) without
@@ -813,40 +1003,58 @@ long long provisionTtlSecs()
 }
 
 bool persistBuffer(uint32_t appId, uint32_t changeNumber,
-                   const std::string& sha20, const std::string& wire)
+                   const std::string& sha20, const std::string& wire,
+                   const CachePublicationToken& publication,
+                   bool markSynthetic)
 {
+	(void)getCacheDir();
+	std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired())
+	{
+		g_pLog->info("AppInfoProvision: unable to lock cache pair for app=%u\n", appId);
+		return false;
+	}
+	if (!cache::cachePublicationAllowed(
+	        publication.managed, publication.generation,
+	        cachePublicationGenerationLocked(appId)))
+	{
+		g_pLog->debug(
+		    "AppInfoProvision: rejecting stale cache publication for app=%u\n",
+		    appId);
+		return false;
+	}
+
 	if (sha20.size() != 20)
 	{
 		g_pLog->debug("AppInfoProvision: refuse to persist app=%u, sha size %zu\n",
 		              appId, sha20.size());
 		return false;
 	}
-	const auto bufPath  = getBufferPath(appId);
-	const auto metaPath = getMetaPath(appId);
-
+	YAML::Emitter em;
+	em << YAML::BeginMap;
+	em << YAML::Key << "appid"         << YAML::Value << appId;
+	em << YAML::Key << "change_number" << YAML::Value << changeNumber;
+	em << YAML::Key << "wire_size"     << YAML::Value << wire.size();
+	em << YAML::Key << "sha_b64"       << YAML::Value << base64::to_base64(sha20);
+	em << YAML::Key << "normalized"    << YAML::Value << true;
+	em << YAML::Key << "synthetic"     << YAML::Value << markSynthetic;
+	em << YAML::EndMap;
+	const std::string metadata(em.c_str(), em.size());
+	// The marker is published inside the same locked transaction as the pair,
+	// so the generation gate above already covers it: nothing can change the
+	// generation while this thread holds the publication mutex and cache lock.
+	const bool markerBefore = SynthMark::isMarked(getCacheDir(), appId);
 	std::string writeError;
-	if (!AtomicFile::write(bufPath, wire, writeError))
+	if (!publishCachePairLocked(appId, wire, metadata, markSynthetic,
+	                            markerBefore, writeError))
 	{
-		g_pLog->debug("AppInfoProvision: cannot atomically write %s: %s\n",
-		              bufPath.c_str(), writeError.c_str());
+		g_pLog->debug(
+		    "AppInfoProvision: unable to publish cache pair for app=%u: %s\n",
+		    appId, writeError.c_str());
 		return false;
 	}
-	{
-		YAML::Emitter em;
-		em << YAML::BeginMap;
-		em << YAML::Key << "appid"         << YAML::Value << appId;
-		em << YAML::Key << "change_number" << YAML::Value << changeNumber;
-		em << YAML::Key << "wire_size"     << YAML::Value << wire.size();
-		em << YAML::Key << "sha_b64"       << YAML::Value << base64::to_base64(sha20);
-		em << YAML::EndMap;
-		const std::string metadata(em.c_str(), em.size());
-		if (!AtomicFile::write(metaPath, metadata, writeError))
-		{
-			g_pLog->debug("AppInfoProvision: cannot atomically write %s: %s\n",
-			              metaPath.c_str(), writeError.c_str());
-			return false;
-		}
-	}
+	clearCacheReadInvalidation(appId);
 	return true;
 }
 
@@ -917,7 +1125,7 @@ bool hasDepotsForApp(const std::string& appinfoVdfPath, uint32_t appId)
 // SHA-1 helper (libcrypto via dlsym, same pattern as appinfo_vdf.cpp).
 // ---------------------------------------------------------------------------
 
-void sha1Bytes(const void* data, std::size_t n, std::uint8_t out[20])
+void sha1BytesInternal(const void* data, std::size_t n, std::uint8_t out[20])
 {
 	static unsigned char* (*p_SHA1)(const unsigned char*, size_t, unsigned char*) = nullptr;
 	if (!p_SHA1)
@@ -1042,18 +1250,34 @@ std::unordered_set<uint32_t> collectValidManifestDepotIds()
 // choice.  Each entry uses the user's default Steam Play tool (the "0" key
 // of CompatToolMapping); Proton Experimental is only the fallback when no
 // default is configured.
-void injectProtonMappings()
+bool injectProtonMappings()
 {
-	if (g_needProton.empty()) return;
+	if (g_needProton.empty()) return true;
 	const auto root = steamRootForConfig();
-	if (root.empty()) return;
+	if (root.empty()) return false;
 	const auto path = root + "/config/config.vdf";
-	if (!std::filesystem::exists(path)) return;
+	if (!std::filesystem::exists(path)) return false;
+
+	// This function is restricted to setup()'s preinit window. Runtime PICS
+	// workers persist a pending set instead; Steam's ConfigStore writers do
+	// not participate in our advisory lock, so a stat-then-rename check here
+	// would still be a TOCTOU race against Steam.
+	(void)getCacheDir();
+	const auto configLockPath = cacheLockPath();
+	ProcessLock::FileLock configLock(configLockPath, false);
+	if (!configLock.acquired())
+	{
+		g_pLog->debug("AppInfoProvision: config.vdf writer lock is busy\n");
+		return false;
+	}
+
+	AtomicFile::FileIdentity expected{};
+	if (!AtomicFile::readIdentity(path, expected)) return false;
 
 	std::string content;
 	{
 		std::ifstream ifs(path);
-		if (!ifs.is_open()) return;
+		if (!ifs.is_open()) return false;
 		std::stringstream ss; ss << ifs.rdbuf();
 		content = ss.str();
 	}
@@ -1071,16 +1295,16 @@ void injectProtonMappings()
 		// Insert a fresh CompatToolMapping block right after the
 		// "Steam" object's opening brace.
 		const auto steamPos = content.find("\"Steam\"");
-		if (steamPos == std::string::npos) return;
+		if (steamPos == std::string::npos) return false;
 		const auto steamBrace = content.find('{', steamPos);
-		if (steamBrace == std::string::npos) return;
+		if (steamBrace == std::string::npos) return false;
 		const std::string block =
 			"\n\t\t\t\t\t\"CompatToolMapping\"\n\t\t\t\t\t{\n\t\t\t\t\t}";
 		content.insert(steamBrace + 1, block);
 		mapPos = content.find("\"CompatToolMapping\"");
 		mapBrace = content.find('{', mapPos);
 	}
-	if (mapBrace == std::string::npos) return;
+	if (mapBrace == std::string::npos) return false;
 
 	// Honour the user's default Steam Play compatibility tool (Settings ->
 	// Compatibility -> Default compatibility tool), stored as the special
@@ -1111,15 +1335,19 @@ void injectProtonMappings()
 		++added;
 	}
 
-	if (added == 0) return;
+	if (added == 0) return true;
 
+	std::string writeError;
+	if (!AtomicFile::writeIfUnchanged(path, expected, content, writeError))
 	{
-		std::ofstream ofs(path, std::ios::trunc);
-		if (!ofs.is_open()) return;
-		ofs << content;
+		g_pLog->debug(
+		    "AppInfoProvision: config.vdf changed before conditional publish: %s\n",
+		    writeError.c_str());
+		return false;
 	}
 	g_pLog->infoOnce("AppInfoProvision: injected %d Proton CompatToolMapping entr%s (tool=%s) into config.vdf\n",
 	             added, added == 1 ? "y" : "ies", toolName.c_str());
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,10 +1480,16 @@ private:
 	const char* end_;
 };
 
-bool hasValidatedCachedBuffer(uint32_t appId, std::string& diag)
+bool readValidatedCacheBufferLocked(uint32_t appId, std::string& wireOut,
+                                    std::string& diag)
 {
 	try
 	{
+		if (!cacheMarkerAllowsRead(appId))
+		{
+			diag = "synthetic marker state is inconsistent";
+			return false;
+		}
 		const YAML::Node meta = YAML::LoadFile(getMetaPath(appId));
 		const uint32_t metadataAppId = meta["appid"].as<uint32_t>();
 		const size_t declaredSize = meta["wire_size"].as<size_t>();
@@ -1279,7 +1513,7 @@ bool hasValidatedCachedBuffer(uint32_t appId, std::string& diag)
 		}
 
 		std::uint8_t digestBytes[20]{};
-		sha1Bytes(wire.data(), wire.size(), digestBytes);
+		sha1BytesInternal(wire.data(), wire.size(), digestBytes);
 		const std::string actualSha(
 		    reinterpret_cast<const char*>(digestBytes), sizeof(digestBytes));
 
@@ -1301,6 +1535,7 @@ bool hasValidatedCachedBuffer(uint32_t appId, std::string& diag)
 			diag = "metadata, SHA-1, or depot validation failed";
 			return false;
 		}
+		wireOut = std::move(wire);
 		return true;
 	}
 	catch (const std::exception& e)
@@ -1308,6 +1543,12 @@ bool hasValidatedCachedBuffer(uint32_t appId, std::string& diag)
 		diag = e.what();
 		return false;
 	}
+}
+
+bool hasValidatedCachedBuffer(uint32_t appId, std::string& diag)
+{
+	std::string wire;
+	return readValidatedCacheBufferLocked(appId, wire, diag);
 }
 
 bool cachedWireSizeMatches(uint32_t appId, long long actualSize)
@@ -1328,6 +1569,9 @@ bool cachedWireSizeMatches(uint32_t appId, long long actualSize)
 
 cache::CacheUse cacheUseForApp(uint32_t appId, bool refreshUnavailable)
 {
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired()) return cache::CacheUse::None;
+
 	cache::CacheValidationKey key{};
 	const bool present = statBuffer(appId, key);
 	if (!present) return cache::CacheUse::None;
@@ -1364,6 +1608,11 @@ cache::CacheUse cacheUseForApp(uint32_t appId, bool refreshUnavailable)
 			g_cacheValidationMemo.emplace(key, result);
 		}
 	}
+	if (result.valid && !cacheMarkerAllowsRead(appId))
+	{
+		result.valid = false;
+		result.diag = "synthetic marker is missing";
+	}
 	if (!result.valid)
 	{
 		g_pLog->info("AppInfoProvision: app=%u cached buffer rejected (%s)\n",
@@ -1372,14 +1621,42 @@ cache::CacheUse cacheUseForApp(uint32_t appId, bool refreshUnavailable)
 	return cache::chooseCacheUse(result.valid, fresh, refreshUnavailable);
 }
 
+// A warm cache is a complete, validated pair.  statBuffer() alone is not
+// enough: persistBuffer() publishes the binary before its YAML metadata, so
+// an interrupted metadata write must remain a cold-start case rather than
+// silently deferring the first usable buffer to the next Steam restart.
+bool hasReadyCacheOnDisk(uint32_t appId)
+{
+	const bool bufferExists = hasBufferOnDisk(appId);
+	bool metadataExists = false;
+	{
+		ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+		if (!cacheLock.acquired()) return false;
+		struct stat st{};
+		metadataExists = stat(getMetaPath(appId).c_str(), &st) == 0 &&
+		                 st.st_size > 0;
+	}
+	if (!bufferExists || !metadataExists) return false;
+
+	// Only a complete, fresh record is warm for startup. A stale record may
+	// be used as an offline fallback after a provider failure, but it must not
+	// be spliced into async startup before the live refresh has run.
+	const bool recordFresh =
+	    cacheUseForApp(appId, false) == cache::CacheUse::Fresh;
+	return cachePairReady(bufferExists, metadataExists, recordFresh);
+}
+
 // Render+prune+sha+persist a parsed appinfo node (shared tail used by
 // both the CM and steamcmd paths). `changeNumber` is the PICS/JSON change
 // number for the meta record.
 SourceResult renderAndPersist(uint32_t appId, const YAML::Node& appNode,
-                              uint32_t changeNumber)
+                              uint32_t changeNumber,
+                              const CachePublicationToken& publication)
 {
 	std::string wire;
-	const SourceResult renderResult = renderAppinfoBuffer(appNode, appId, wire);
+	bool synthesized = false;
+	const SourceResult renderResult = renderAppinfoBuffer(
+	    appNode, appId, wire, publication, &synthesized);
 	if (renderResult != SourceResult::Success)
 	{
 		const char* reason = "invalid response";
@@ -1401,11 +1678,12 @@ SourceResult renderAndPersist(uint32_t appId, const YAML::Node& appNode,
 	std::string sha20;
 	{
 		std::uint8_t tmp[20];
-		sha1Bytes(wire.data(), wire.size(), tmp);
+		sha1BytesInternal(wire.data(), wire.size(), tmp);
 		sha20.assign(reinterpret_cast<const char*>(tmp), 20);
 	}
 
-	if (!persistBuffer(appId, changeNumber, sha20, wire))
+	if (!persistBuffer(appId, changeNumber, sha20, wire, publication,
+	                   synthesized))
 	{
 		g_pLog->info("AppInfoProvision: app=%u failed to persist buffer to cache\n", appId);
 		return SourceResult::LocalFailure;
@@ -1419,7 +1697,8 @@ SourceResult renderAndPersist(uint32_t appId, const YAML::Node& appNode,
 // Provision one app from a native-CM wire buffer. Mirrors the steamcmd
 // path's tail but skips the JSON parse — the CM buffer is already wire VDF.
 SourceResult provisionAppFromCmBuffer(uint32_t appId, const std::string& cmWire,
-                                      uint32_t changeNumber)
+                                      uint32_t changeNumber,
+                                      const CachePublicationToken& publication)
 {
 	if (cmWire.empty()) return SourceResult::InvalidResponse;
 	CmVdfReader reader(cmWire.data(), cmWire.data() + cmWire.size());
@@ -1429,16 +1708,199 @@ SourceResult provisionAppFromCmBuffer(uint32_t appId, const std::string& cmWire,
 		g_pLog->info("AppInfoProvision: app=%u CM buffer parse failed, fallback\n", appId);
 		return SourceResult::InvalidResponse;
 	}
-	return renderAndPersist(appId, appNode, changeNumber);
+	return renderAndPersist(appId, appNode, changeNumber, publication);
 }
 
-// Batch map populated once per provisionAllAddedApps pass: appid -> CM
-// wire buffer, and appid -> change number.  Consumed by provisionApp.
-std::unordered_map<uint32_t, std::string> g_cmBuffers;
-std::unordered_map<uint32_t, uint32_t>    g_cmChanges;
+struct ProvisionPassContext
+{
+	std::unordered_map<uint32_t, std::string> cmBuffers;
+	std::unordered_map<uint32_t, uint32_t> cmChanges;
+	std::unordered_map<uint32_t, CachePublicationToken> cachePublications;
+};
 
+struct PendingProtonLoad
+{
+	bool lockAcquired = false;
+	PendingProtonFileStatus status = PendingProtonFileStatus::Invalid;
+	std::set<uint32_t> fileIds;
+	std::set<uint32_t> ids;
+};
+
+PendingProtonLoad loadPendingProtonMappings()
+{
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired()) return {};
+
+	const auto file = readPendingProtonFileLocked();
+	PendingProtonLoad result;
+	result.lockAcquired = true;
+	result.status = file.status;
+	result.fileIds = file.ids;
+	if (file.status != PendingProtonFileStatus::Valid) return result;
+
+	const auto managed = g_config.managedAppIds.get();
+	for (uint32_t appId : file.ids)
+	{
+		if (managed.count(appId) != 0)
+			result.ids.insert(appId);
+	}
+	return result;
+}
+
+bool removePendingProtonMappingLocked(uint32_t appId)
+{
+	const auto file = readPendingProtonFileLocked();
+	if (file.status == PendingProtonFileStatus::Missing) return true;
+	if (file.status != PendingProtonFileStatus::Valid)
+	{
+		if (g_pLog)
+			g_pLog->debug("AppInfoProvision: preserving invalid or unreadable pending Proton file while removing app=%u\n",
+		              appId);
+		return false;
+	}
+
+	std::set<uint32_t> pending = file.ids;
+	if (pending.erase(appId) == 0) return true;
+
+	if (pending.empty())
+	{
+		std::error_code ec;
+		std::filesystem::remove(pendingProtonPath(), ec);
+		return !ec;
+	}
+
+	std::string content;
+	for (uint32_t pendingAppId : pending)
+		content += std::to_string(pendingAppId) + "\n";
+	std::string error;
+	const bool removed = AtomicFile::write(pendingProtonPath(), content, error);
+	if (!removed && g_pLog)
+	{
+		g_pLog->debug("AppInfoProvision: cannot remove pending Proton mapping for app=%u: %s\n",
+		              appId, error.c_str());
+	}
+	return removed;
+}
+
+// Remove a successfully applied record only if no writer changed it after the
+// initial locked read. This closes the gap between load/apply and cleanup
+// without holding the cache lock across the config.vdf rewrite.
+bool clearPendingProtonMappingsIfUnchanged(
+    const std::set<uint32_t>& expectedFileIds)
+{
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired()) return false;
+
+	const auto current = readPendingProtonFileLocked();
+	if (current.status != PendingProtonFileStatus::Valid ||
+	    current.ids != expectedFileIds)
+	{
+		if (g_pLog)
+			g_pLog->debug(
+			    "AppInfoProvision: pending Proton file changed during flush; preserving it\n");
+		return false;
+	}
+
+	std::error_code ec;
+	std::filesystem::remove(pendingProtonPath(), ec);
+	return !ec;
+}
+
+bool isSynthesizedAppLocked(uint32_t appId)
+{
+	if (appId == 0) return false;
+	const bool active = g_config.isAddedAppId(appId);
+	bool invalidated = false;
+	{
+		std::lock_guard<std::mutex> invalidationLock(g_cacheReadInvalidationMu);
+		invalidated = g_cacheReadInvalidated.count(appId) != 0;
+	}
+	// Managed-source removal invalidates cache reads but may retain an active
+	// compatibility app. Keep the live appinfo protected while its marker is
+	// preserved; a later full removal clears both ownership and protection.
+	if (invalidated && !active) return false;
+	const bool markerPresent = SynthMark::isMarked(getCacheDir(), appId);
+	if (!markerPresent) return false;
+	try
+	{
+		const YAML::Node meta = YAML::LoadFile(getMetaPath(appId));
+		const YAML::Node syntheticNode = meta["synthetic"];
+		if (syntheticNode)
+			return syntheticNode.as<bool>();
+		// Before explicit provenance metadata existed, the persisted marker
+		// itself was the synthetic bit. Preserve that behavior for existing
+		// installations instead of requiring migration on first boot.
+		return true;
+	}
+	catch (...)
+	{
+		// Managed-source cleanup deliberately retains the marker after moving
+		// the cache pair. An active compatibility app must remain protected by
+		// that marker until a new publication or full removal reconciles it.
+		std::error_code metadataError;
+		const bool metadataPresent = std::filesystem::exists(
+		    getMetaPath(appId), metadataError);
+		return !metadataError &&
+		       cache::retainedSyntheticMarkerProtectionAllowed(
+		           markerPresent, metadataPresent, active);
+	}
+}
 
 } // namespace
+
+void sha1Bytes(const void* data, std::size_t size, std::uint8_t out[20])
+{
+	sha1BytesInternal(data, size, out);
+}
+
+bool publishCachePairLocked(uint32_t appId, const std::string& wire,
+                            const std::string& metadata, bool synthetic,
+                            bool markerBefore, std::string& error)
+{
+	const auto cacheDir = getCacheDir();
+	return CachePair::publish(
+		getBufferPath(appId), getMetaPath(appId), wire, metadata, synthetic,
+		markerBefore,
+		[&](bool desired) {
+			return desired ? SynthMark::mark(cacheDir, appId)
+			               : SynthMark::unmark(cacheDir, appId);
+		},
+		[&] { return SynthMark::isMarked(cacheDir, appId); }, error);
+}
+
+bool readValidatedCacheBuffer(uint32_t appId, std::string& buffer)
+{
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired()) return false;
+	std::string diag;
+	return readValidatedCacheBufferLocked(appId, buffer, diag);
+}
+
+std::mutex& cachePublicationMutex()
+{
+	return g_cachePublicationMu;
+}
+
+std::uint64_t cachePublicationGenerationLocked(uint32_t appId)
+{
+	const auto it = g_cachePublicationGenerations.find(appId);
+	return it == g_cachePublicationGenerations.end() ? 0 : it->second;
+}
+
+CachePublicationToken snapshotCachePublication(uint32_t appId)
+{
+	CachePublicationToken token;
+	std::lock_guard<std::mutex> passLock(g_provisionPassMu);
+	token.managed = g_config.managedAppIds.get().count(appId) != 0;
+	std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+	token.generation = cachePublicationGenerationLocked(appId);
+	return token;
+}
+
+std::mutex& provisioningPassMutex()
+{
+	return g_provisionPassMu;
+}
 
 
 // ---------------------------------------------------------------------------
@@ -1447,10 +1909,19 @@ std::unordered_map<uint32_t, uint32_t>    g_cmChanges;
 
 ProvisionOutcome provisionAppDetailed(uint32_t appId,
                                       const std::string& appinfoVdfPath,
-                                      ProvisionPassState& pass)
+                                      ProvisionPassState& pass,
+                                      ProvisionPassContext& context)
 {
 	(void)appinfoVdfPath;
 	if (appId == 0) return ProvisionOutcome::IncompleteContent;
+
+	auto publicationIt = context.cachePublications.find(appId);
+	if (publicationIt == context.cachePublications.end())
+	{
+		publicationIt = context.cachePublications.emplace(
+		    appId, snapshotCachePublication(appId)).first;
+	}
+	const CachePublicationToken publication = publicationIt->second;
 
 	// Short-lived on-disk cache to tame startup cost.  Steam re-execs
 	// setup() several times during a single cold boot (observed 4x on
@@ -1479,14 +1950,14 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 	// steamcmd.net HTTP chain below if this app wasn't in the batch (CM
 	// failed, or it was provisioned individually).
 	{
-		auto it = g_cmBuffers.find(appId);
-		if (it != g_cmBuffers.end())
+		auto it = context.cmBuffers.find(appId);
+		if (it != context.cmBuffers.end())
 		{
 			uint32_t cn = 0;
-			if (auto ci = g_cmChanges.find(appId); ci != g_cmChanges.end())
+			if (auto ci = context.cmChanges.find(appId); ci != context.cmChanges.end())
 				cn = ci->second;
 			const SourceResult cmResult =
-			    provisionAppFromCmBuffer(appId, it->second, cn);
+			    provisionAppFromCmBuffer(appId, it->second, cn, publication);
 			if (cmResult == SourceResult::Success)
 			{
 				g_pLog->info("AppInfoProvision: app=%u provisioned via CM\n", appId);
@@ -1594,7 +2065,9 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 	}
 
 	std::string wire;
-	const SourceResult renderResult = renderAppinfoBuffer(appNode, appId, wire);
+	bool synthesized = false;
+	const SourceResult renderResult = renderAppinfoBuffer(
+	    appNode, appId, wire, publication, &synthesized);
 	if (renderResult != SourceResult::Success)
 	{
 		const char* reason = "invalid response";
@@ -1663,13 +2136,14 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 	std::string sha20;
 	{
 		std::uint8_t tmp[20];
-		sha1Bytes(wire.data(), wire.size(), tmp);
+		sha1BytesInternal(wire.data(), wire.size(), tmp);
 		sha20.assign(reinterpret_cast<const char*>(tmp), 20);
 	}
 
 	const uint32_t changeNumber = pickChangeNumber(appNode);
 
-	if (!persistBuffer(appId, changeNumber, sha20, wire))
+	if (!persistBuffer(appId, changeNumber, sha20, wire, publication,
+	                   synthesized))
 	{
 		g_pLog->info("AppInfoProvision: app=%u failed to persist buffer to cache\n", appId);
 		return ProvisionOutcome::LocalFailure;
@@ -1683,14 +2157,33 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 bool provisionApp(uint32_t appId, const std::string& appinfoVdfPath)
 {
 	ProvisionPassState pass;
-	return isProvisioned(provisionAppDetailed(appId, appinfoVdfPath, pass));
+	ProvisionPassContext context;
+	return isProvisioned(provisionAppDetailed(
+		appId, appinfoVdfPath, pass, context));
 }
 
-int provisionAllAddedApps(const std::string& appinfoVdfPath)
+int provisionAppsPass(const std::string& appinfoVdfPath,
+                       const std::unordered_set<uint32_t>& added,
+                       bool onlyMissing, ProvisionPassContext& context,
+                       std::unordered_set<uint32_t>* fallbackApps)
 {
-	const auto added = g_config.managedAppIds.get();
 	if (added.empty()) return 0;
 
+	ProvisionPassCoordinator coordinator(g_provisionPassMu);
+	coordinator.snapshot([&] {
+		const auto managed = g_config.managedAppIds.get();
+		std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+		context.cachePublications.clear();
+		for (const uint32_t appId : added)
+		{
+			context.cachePublications.emplace(
+			    appId,
+			    CachePublicationToken{
+			        .managed = managed.count(appId) != 0,
+			        .generation = cachePublicationGenerationLocked(appId),
+			    });
+		}
+	});
 	// PRIMARY source: one batched anonymous-CM product-info request to
 	// Valve for the whole fleet (≈0.3s for dozens of apps; replaces the
 	// per-app steamcmd.net round-trips).  Best-effort: any miss falls
@@ -1698,8 +2191,6 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath)
 	// only those apps whose buffer is still fresh on disk (the cache TTL
 	// would short-circuit them anyway), so a warm relaunch makes no CM
 	// request at all.  Disable entirely via SLSSTEAM_DISABLE_CM=1.
-	g_cmBuffers.clear();
-	g_cmChanges.clear();
 	ProvisionPassState pass;
 	const bool cmDisabled = [] {
 		const char* v = std::getenv("SLSSTEAM_DISABLE_CM");
@@ -1710,19 +2201,27 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath)
 		std::vector<uint32_t> toFetch;
 		for (uint32_t appId : added)
 		{
-			if (cacheUseForApp(appId, false) != cache::CacheUse::Fresh)
+			if (onlyMissing)
+			{
+				if (!hasReadyCacheOnDisk(appId)) toFetch.push_back(appId);
+			}
+			else if (cacheUseForApp(appId, false) != cache::CacheUse::Fresh)
+			{
 				toFetch.push_back(appId);
+			}
 		}
 		if (!toFetch.empty())
 		{
 			g_pLog->info("AppInfoProvision: fetching %zu app(s) via native CM\n",
 			             toFetch.size());
-			const auto cmResult = CmClient::fetchProductInfoDetailed(
-			    toFetch, g_cmBuffers, &g_cmChanges);
+			const auto cmResult = coordinator.network([&] {
+				return CmClient::fetchProductInfoDetailed(
+				    toFetch, context.cmBuffers, &context.cmChanges);
+			});
 			if (cmResult != CmClient::FetchResult::Success)
 			{
-				g_cmBuffers.clear();
-				g_cmChanges.clear();
+				context.cmBuffers.clear();
+				context.cmChanges.clear();
 				pass.noteCmBatchFailure();
 				if (cmResult == CmClient::FetchResult::NetworkUnavailable)
 				{
@@ -1745,7 +2244,9 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath)
 	{
 		const uint32_t appId = *appIt++;
 		const ProvisionOutcome outcome =
-		    provisionAppDetailed(appId, appinfoVdfPath, pass);
+		    provisionAppDetailed(appId, appinfoVdfPath, pass, context);
+		if (fallbackApps && outcome == ProvisionOutcome::FallbackCache)
+			fallbackApps->insert(appId);
 		if (isProvisioned(outcome))
 		{
 			++provisioned;
@@ -1760,8 +2261,10 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath)
 			std::vector<uint32_t> remaining(appIt, added.end());
 			g_pLog->info("AppInfoProvision: provider reachable; retrying native CM "
 			             "for %zu remaining app(s)\n", remaining.size());
-			const auto recovery = CmClient::fetchProductInfoDetailed(
-			    remaining, g_cmBuffers, &g_cmChanges);
+			const auto recovery = coordinator.network([&] {
+				return CmClient::fetchProductInfoDetailed(
+				    remaining, context.cmBuffers, &context.cmChanges);
+			});
 			if (recovery == CmClient::FetchResult::Success)
 			{
 				g_pLog->info("AppInfoProvision: native CM recovered for remaining apps\n");
@@ -1804,25 +2307,341 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath)
 
 	// Drop the batch buffers; they can be large and are only needed for
 	// this pass.
-	g_cmBuffers.clear();
-	g_cmChanges.clear();
-
-	// Ensure windows-only AddedApps get a Proton CompatToolMapping so
-	// Steam will download + run them on Linux.  Safe no-op if none.
-	injectProtonMappings();
+	context.cmBuffers.clear();
+	context.cmChanges.clear();
 
 	return provisioned;
 }
 
-DlcInjectionIds collectDlcAppIdsForAddedApps()
+int provisionApps(const std::string& appinfoVdfPath,
+                  const std::unordered_set<uint32_t>& added,
+                  bool onlyMissing)
 {
+	if (added.empty()) return 0;
+
+	ProvisionPassCoordinator coordinator(g_provisionPassMu);
+	const auto addedSnapshot = coordinator.snapshot([&] { return added; });
+	if (addedSnapshot.empty()) return 0;
+
+	ProvisionPassContext context;
+	const int provisioned = provisionAppsPass(
+		appinfoVdfPath, addedSnapshot, onlyMissing, context, nullptr);
+	coordinator.commit([&] {
+		persistPendingProtonMappings(false);
+	});
+	return provisioned;
+}
+
+int provisionAllAddedApps(const std::string& appinfoVdfPath,
+                          bool allowConfigWrite)
+{
+	ProvisionPassCoordinator coordinator(g_provisionPassMu);
+	const auto added = coordinator.snapshot(
+		[] { return g_config.managedAppIds.get(); });
+	if (added.empty()) return 0;
+
+	ProvisionPassContext context;
+	const int provisioned = provisionAppsPass(
+		appinfoVdfPath, added, false, context, nullptr);
+	coordinator.commit([&] {
+		if (allowConfigWrite)
+		{
+			if (!injectProtonMappings())
+				persistPendingProtonMappings(true);
+		}
+		else
+		{
+			persistPendingProtonMappings(false);
+		}
+	});
+	return provisioned;
+}
+
+int provisionColdStartApps(const std::string& appinfoVdfPath,
+                           std::unordered_set<uint32_t>* sanitizedApps,
+                           bool allowConfigWrite,
+                           std::unordered_set<uint32_t>* fallbackApps)
+{
+	if (sanitizedApps) sanitizedApps->clear();
+	if (fallbackApps) fallbackApps->clear();
+
+	ProvisionPassCoordinator coordinator(g_provisionPassMu);
+	const auto managedApps = coordinator.snapshot(
+		[] { return g_config.managedAppIds.get(); });
+	std::unordered_set<uint32_t> cold;
+	for (const uint32_t appId : managedApps)
+	{
+		const bool cacheReady = hasReadyCacheOnDisk(appId);
+		if (shouldRunColdFallback(cacheReady))
+		{
+			cold.insert(appId);
+		}
+	}
+	if (cold.empty())
+	{
+		noteColdRetryOutcome(false);
+		return 0;
+	}
+	if (coldRetryBlocked())
+	{
+		g_pLog->debug(
+		    "AppInfoProvision: cold-start retry backoff active; skipping %zu app(s)\n",
+		    cold.size());
+		return 0;
+	}
+
+	g_pLog->info("AppInfoProvision: cold-start fallback for %zu app(s)\n",
+	             cold.size());
+	ProvisionPassContext context;
+	const int provisioned = provisionAppsPass(
+		appinfoVdfPath, cold, true, context, fallbackApps);
+	bool unresolved = false;
+	for (const uint32_t appId : cold)
+	{
+		const bool explicitFallback =
+			fallbackApps && fallbackApps->count(appId) != 0;
+		if (explicitFallback)
+		{
+			// Keep the explicit fallback allowlist separate from the PICS
+			// suppression set. A fallback may be an explicit raw cache
+			// (normalized=false), which must still be replaceable by a newer
+			// response. persistAppBuffer() applies the final provenance guard
+			// for normalized and legacy pairs.
+			if (sanitizedApps &&
+			    shouldMarkColdCacheSanitized(explicitFallback))
+				sanitizedApps->insert(appId);
+			continue;
+		}
+		if (!hasReadyCacheOnDisk(appId))
+		{
+			unresolved = true;
+			continue;
+		}
+		if (sanitizedApps &&
+		    shouldMarkColdCacheSanitized(explicitFallback))
+			sanitizedApps->insert(appId);
+	}
+	noteColdRetryOutcome(unresolved);
+	if (unresolved)
+	{
+		g_pLog->debug(
+		    "AppInfoProvision: cold-start fallback incomplete; subsequent PICS "
+		    "responses are temporarily rate-limited\n");
+	}
+
+	coordinator.commit([&] {
+		if (allowConfigWrite)
+		{
+			if (!injectProtonMappings())
+				persistPendingProtonMappings(true);
+		}
+		else
+		{
+			persistPendingProtonMappings(false);
+		}
+	});
+	return provisioned;
+}
+
+bool asyncProvisioningEnabled()
+{
+	return asyncProvisionEnabled(
+		g_config.asyncProvision.get(),
+		std::getenv("SLSSTEAM_ASYNC_PROVISION"));
+}
+
+void flushPendingProtonMappings()
+{
+	std::lock_guard<std::mutex> passLock(g_provisionPassMu);
+	const auto loaded = loadPendingProtonMappings();
+	if (!loaded.lockAcquired || loaded.status == PendingProtonFileStatus::Invalid)
+	{
+		// A lock/read/parse failure is not evidence that the file is empty.
+		// Leave both the on-disk mappings and any in-memory retry state intact.
+		return;
+	}
+	if (loaded.status == PendingProtonFileStatus::Missing)
+		return;
+	if (loaded.ids.empty())
+	{
+		// This also removes entries left behind by a previous config removal;
+		// the valid file was filtered against current management above.
+		(void)clearPendingProtonMappingsIfUnchanged(loaded.fileIds);
+		return;
+	}
+	g_needProton.insert(loaded.ids.begin(), loaded.ids.end());
+	if (injectProtonMappings())
+		(void)clearPendingProtonMappingsIfUnchanged(loaded.fileIds);
+}
+
+enum class RefreshWorkerStartResult
+{
+	Started,
+	NotStarted,
+	Uncertain,
+};
+
+void refreshWorkerStartFailed() noexcept
+{
+	if (g_pLog)
+		g_pLog->warn(
+		    "AppInfoProvision: unable to start async refresh worker; "
+		    "will retry on the next refresh request\n");
+}
+
+void resetRefreshAfterStartFailure(std::uint64_t token) noexcept
+{
+	std::lock_guard<std::mutex> lock(g_refreshScheduleMu);
+	if (g_refreshInFlight && g_refreshWorkerToken == token)
+		g_refreshInFlight = false;
+}
+
+void finishRefresh(const std::string& completedPath, std::uint64_t token);
+
+RefreshWorkerStartResult startRefreshWorker(
+    const std::string& appinfoVdfPath, std::uint64_t token)
+{
+	bool workerMayStillExist = false;
+	const bool started = ThreadStart::startDetached(
+		[path = appinfoVdfPath, token]
+		{
+			ThreadStart::runGuarded(
+				[path]
+				{
+					ScopedNotifySuppression suppression;
+					BootProf::Span profile(g_pLog.get(), "provision.async");
+					provisionAllAddedApps(path, false);
+				},
+				[]
+				{
+					if (g_pLog)
+						g_pLog->warn(
+						    "AppInfoProvision: async refresh worker failed; will retry\n");
+				},
+				[path, token] { finishRefresh(path, token); });
+		},
+		[] { refreshWorkerStartFailed(); },
+		ThreadStart::NoopDetachFailure{},
+		ThreadStart::StdThreadDetacher{},
+		ThreadStart::StdThreadJoiner{},
+		[&workerMayStillExist] {
+			workerMayStillExist = true;
+			refreshWorkerStartFailed();
+		});
+	if (started)
+		return RefreshWorkerStartResult::Started;
+	if (workerMayStillExist)
+		return RefreshWorkerStartResult::Uncertain;
+
+	resetRefreshAfterStartFailure(token);
+	return RefreshWorkerStartResult::NotStarted;
+}
+
+void retainRefreshAfterFailedStart(const std::string& appinfoVdfPath,
+                                   std::uint64_t token,
+                                   RefreshWorkerStartResult result)
+{
+	if (result != RefreshWorkerStartResult::NotStarted ||
+	    !shouldRequeueRefreshAfterStartFailure(/*workerMayStillExist=*/false))
+		return;
+
+	// A known construction failure cannot safely recurse into another thread
+	// attempt: persistent resource pressure would otherwise create an
+	// unbounded retry loop. Keep the request dormant until the next PICS or
+	// config-watcher refresh request reopens the gate.
+	std::lock_guard<std::mutex> lock(g_refreshScheduleMu);
+	if (g_refreshInFlight || g_refreshWorkerToken != token)
+		return;
+	g_refreshPending = true;
+	if (g_refreshPendingPath.empty())
+		g_refreshPendingPath = appinfoVdfPath;
+}
+
+void finishRefresh(const std::string& completedPath, std::uint64_t token)
+{
+	std::string nextPath;
+	std::uint64_t nextToken = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_refreshScheduleMu);
+		if (!g_refreshInFlight || g_refreshWorkerToken != token)
+			return;
+
+		const bool asyncEnabled = asyncProvisioningEnabled();
+		const bool hasManagedApps = !g_config.managedAppIds.get().empty();
+		if (!shouldRerunPendingRefresh(
+		        asyncEnabled, hasManagedApps, g_refreshPending))
+		{
+			g_refreshPending = false;
+			g_refreshPendingPath.clear();
+			g_refreshInFlight = false;
+			return;
+		}
+
+		nextPath = g_refreshPendingPath.empty()
+		               ? completedPath
+		               : g_refreshPendingPath;
+		g_refreshPending = false;
+		g_refreshPendingPath.clear();
+		// Keep the gate closed while handing the queued request to the next
+		// worker. A request arriving in this window queues behind that worker.
+		nextToken = ++g_refreshWorkerToken;
+	}
+
+	const auto startResult = startRefreshWorker(nextPath, nextToken);
+	retainRefreshAfterFailedStart(nextPath, nextToken, startResult);
+}
+
+void refreshInBackground(const std::string& appinfoVdfPath)
+{
+	std::uint64_t token = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_refreshScheduleMu);
+		const bool asyncEnabled = asyncProvisioningEnabled();
+		const bool hasManagedApps = !g_config.managedAppIds.get().empty();
+		const auto action = refreshScheduleAction(
+		    asyncEnabled, hasManagedApps, g_refreshInFlight);
+		if (action == RefreshScheduleAction::Ignore)
+			return;
+		if (action == RefreshScheduleAction::Queue)
+		{
+			g_refreshPending = true;
+			g_refreshPendingPath = appinfoVdfPath;
+			return;
+		}
+
+		g_refreshInFlight = true;
+		g_refreshPending = false;
+		g_refreshPendingPath.clear();
+		token = ++g_refreshWorkerToken;
+	}
+
+	const auto startResult = startRefreshWorker(appinfoVdfPath, token);
+	retainRefreshAfterFailedStart(appinfoVdfPath, token, startResult);
+}
+
+DlcInjectionIds collectDlcAppIdsForAddedApps(bool* complete)
+{
+	if (complete) *complete = false;
 	DlcAppIds sources;
 	std::unordered_set<uint32_t> taggedSeen;
 	std::unordered_set<uint32_t> advertisedSeen;
 	std::unordered_set<uint32_t> advertisedWithContent;
 
 	const auto added = g_config.managedAppIds.get();
-	if (added.empty()) return {};
+	if (added.empty())
+	{
+		if (complete) *complete = true;
+		return {};
+	}
+
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired())
+	{
+		if (g_pLog)
+			g_pLog->debug(
+			    "AppInfoProvision: DLC snapshot cache lock busy\n");
+		return {};
+	}
 
 	// Build this once: each advertised DLC is only a membership lookup after
 	// the two manifest directories have been scanned.
@@ -1830,19 +2649,59 @@ DlcInjectionIds collectDlcAppIdsForAddedApps()
 
 	for (uint32_t appId : added)
 	{
-		// Read the provisioned buffer we wrote in provisionApp().  Same
-		// on-disk path feats/pics.cpp reads for synchronous staging.
+		// Validate the complete cache pair, not just the current .bin size.
+		// A file can be truncated before this snapshot opens while remaining
+		// syntactically parseable; the metadata size and SHA-1 are authoritative.
+		std::string validationDiag;
+		if (!hasValidatedCachedBuffer(appId, validationDiag))
+		{
+			if (g_pLog)
+				g_pLog->debug(
+				    "AppInfoProvision: DLC snapshot rejected cache pair for app=%u: %s\n",
+				    appId, validationDiag.c_str());
+			return {};
+		}
+
 		const auto path = getBufferPath(appId);
 		std::ifstream ifs(path, std::ios::binary | std::ios::ate);
-		if (!ifs.is_open()) continue;
+		if (!ifs.is_open())
+		{
+			if (g_pLog)
+				g_pLog->debug(
+				    "AppInfoProvision: DLC snapshot missing buffer for app=%u\n",
+				    appId);
+			return {};
+		}
 
 		const std::streamsize sz = ifs.tellg();
-		if (sz <= 0 || sz > (64LL << 20)) continue;
+		if (sz <= 0 || sz > (64LL << 20))
+		{
+			if (g_pLog)
+				g_pLog->debug(
+				    "AppInfoProvision: DLC snapshot rejected buffer size for app=%u\n",
+				    appId);
+			return {};
+		}
 		std::string wire;
 		wire.resize(static_cast<std::size_t>(sz));
 		ifs.seekg(0);
+		if (!ifs)
+		{
+			if (g_pLog)
+				g_pLog->debug(
+				    "AppInfoProvision: DLC snapshot could not seek buffer for app=%u\n",
+				    appId);
+			return {};
+		}
 		ifs.read(wire.data(), sz);
-		if (!ifs) continue;
+		if (ifs.gcount() != sz || !ifs)
+		{
+			if (g_pLog)
+				g_pLog->debug(
+				    "AppInfoProvision: DLC snapshot read failed for app=%u\n",
+				    appId);
+			return {};
+		}
 
 		const auto grouped = extractDlcAppIdsBySource(wire, appId);
 		const bool baseHasDlcDepots = hasDepotsInDlc(wire);
@@ -1894,50 +2753,135 @@ DlcInjectionIds collectDlcAppIdsForAddedApps()
 			selected.appDlc.size(), added.size(), selected.package0.size(),
 			selected.appDlc.size(), ids.c_str());
 	}
+	if (complete) *complete = true;
 	return selected;
+}
+
+bool forgetAppImpl(uint32_t appId, bool preserveTicketArtifacts)
+{
+	if (appId == 0) return false;
+	// Serialize only the state transition with synchronous and async
+	// provisioning passes. Cache and manifest cleanup runs after the lock is
+	// released and is protected by its own file/catalog locks.
+	{
+		std::lock_guard<std::mutex> passLock(g_provisionPassMu);
+		std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+		++g_cachePublicationGenerations[appId];
+		{
+			std::lock_guard<std::mutex> invalidationLock(
+			    g_cacheReadInvalidationMu);
+			g_cacheReadInvalidated.insert(appId);
+		}
+		g_needProton.erase(appId);
+		g_pendingProtonRemovals.insert(appId);
+	}
+
+	const auto cacheDir = getCacheDir();
+	bool pendingMappingRemoved = false;
+	bool complete = false;
+	{
+		std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+		ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+		if (!cacheLock.acquired()) return false;
+		// Decide marker retention only after both publication and cache locks are
+		// held. A concurrent synthetic publication must be visible here before
+		// the cleanup chooses whether its protection marker is preserved.
+		const bool preserveSyntheticMarker =
+			cache::shouldPreserveSyntheticMarker(
+				preserveTicketArtifacts,
+				preserveTicketArtifacts && isSynthesizedAppLocked(appId));
+		pendingMappingRemoved = removePendingProtonMappingLocked(appId);
+
+		const auto relatedDepots = ManifestId::getExclusiveDepotsForApp(appId);
+		const std::string suffix =
+			".forgotten." +
+			std::to_string(static_cast<long long>(std::time(nullptr))) + "." +
+			std::to_string(static_cast<long long>(::getpid()));
+		const auto records = SynthMark::quarantineAppArtifacts(
+			cacheDir, appId, relatedDepots, suffix,
+			/*includeTicketArtifacts=*/!preserveTicketArtifacts,
+			/*includeSyntheticMarker=*/!preserveSyntheticMarker);
+		for (const auto& record : records)
+		{
+			g_pLog->infoOnce("AppInfoProvision: quarantined removed-app cache %s -> %s\n",
+			                record.original.string().c_str(),
+			                record.quarantined.string().c_str());
+		}
+		complete = !SynthMark::hasAppArtifacts(
+			cacheDir, appId, relatedDepots,
+			/*includeTicketArtifacts=*/!preserveTicketArtifacts,
+			/*includeSyntheticMarker=*/!preserveSyntheticMarker);
+		if (complete)
+		{
+			// Drop this app's relation only after every source artifact has been
+			// moved. A partial quarantine remains retryable with the same depot
+			// ownership information, while shared depots stay in the catalog.
+			ManifestId::forgetApp(appId);
+		}
+		if (!complete)
+		{
+			g_pLog->warn("AppInfoProvision: app=%u cleanup left one or more cache "
+			             "artifacts in place\n", appId);
+		}
+		g_pLog->infoOnce("AppInfoProvision: forgot app=%u (%zu cache artifact(s), %s)\n",
+		             appId, records.size(), complete ? "complete" : "partial");
+	}
+
+	if (pendingMappingRemoved)
+	{
+		std::lock_guard<std::mutex> passLock(g_provisionPassMu);
+		g_pendingProtonRemovals.erase(appId);
+	}
+	return complete;
 }
 
 bool forgetApp(uint32_t appId)
 {
-	if (appId == 0) return false;
+	return forgetAppImpl(appId, false);
+}
 
-	const auto cacheDir = getCacheDir();
-	const auto relatedDepots = ManifestId::getExclusiveDepotsForApp(appId);
-	const std::string suffix =
-		".forgotten." +
-		std::to_string(static_cast<long long>(std::time(nullptr))) + "." +
-		std::to_string(static_cast<long long>(::getpid()));
-	const auto records = SynthMark::quarantineAppArtifacts(
-		cacheDir, appId, relatedDepots, suffix);
-	for (const auto& record : records)
+bool forgetManagedSourceApp(uint32_t appId)
+{
+	return forgetAppImpl(appId, true);
+}
+
+void clearCacheReadInvalidation(uint32_t appId)
+{
+	if (appId == 0) return;
+	std::lock_guard<std::mutex> invalidationLock(g_cacheReadInvalidationMu);
+	g_cacheReadInvalidated.erase(appId);
+}
+
+bool cacheMarkerAllowsRead(uint32_t appId)
+{
+	if (appId == 0) return false;
 	{
-		g_pLog->infoOnce("AppInfoProvision: quarantined removed-app cache %s -> %s\n",
-		                record.original.string().c_str(),
-		                record.quarantined.string().c_str());
+		std::lock_guard<std::mutex> invalidationLock(g_cacheReadInvalidationMu);
+		if (g_cacheReadInvalidated.count(appId) != 0)
+			return false;
 	}
-	const bool complete = !SynthMark::hasAppArtifacts(
-		cacheDir, appId, relatedDepots);
-	if (complete)
+	try
 	{
-		// Drop this app's relation only after every source artifact has been
-		// moved. A partial quarantine remains retryable with the same depot
-		// ownership information, while shared depots stay in the catalog.
-		ManifestId::forgetApp(appId);
+		const YAML::Node meta = YAML::LoadFile(getMetaPath(appId));
+		const bool markerPresent = SynthMark::isMarked(getCacheDir(), appId);
+		const YAML::Node syntheticNode = meta["synthetic"];
+		const bool hasSyntheticMetadata = syntheticNode.IsDefined();
+		const bool synthetic = hasSyntheticMetadata
+		    ? syntheticNode.as<bool>()
+		    : false;
+		return cache::syntheticMarkerStateConsistent(
+		    hasSyntheticMetadata, synthetic, markerPresent);
 	}
-	if (!complete)
+	catch (...)
 	{
-		g_pLog->warn("AppInfoProvision: app=%u cleanup left one or more cache "
-		             "artifacts in place\n", appId);
+		return false;
 	}
-	g_pLog->infoOnce("AppInfoProvision: forgot app=%u (%zu cache artifact(s), %s)\n",
-	             appId, records.size(), complete ? "complete" : "partial");
-	return complete;
 }
 
 bool isSynthesizedApp(uint32_t appId)
 {
-	if (appId == 0) return false;
-	return SynthMark::isMarked(getCacheDir(), appId);
+	std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+	return isSynthesizedAppLocked(appId);
 }
 
 } // namespace AppInfoProvision

@@ -5,6 +5,7 @@
 #include "depotkey.hpp"
 #include "depotquarantine_store.hpp"
 #include "dlcids.hpp"
+#include "appinfo_provision.hpp"
 
 #include "../config.hpp"
 #include "../globals.hpp"
@@ -203,21 +204,9 @@ namespace
 	uint32_t dlcAppIdFromProvisionedAppinfo(uint32_t appId, uint32_t depotId)
 	{
 		if (!appId || !depotId) return 0;
-
-		std::ostringstream path;
-		path << g_config.getDir().c_str() << "/cache/picsbuffer_" << appId
-		     << ".bin";
-
-		std::error_code ec;
-		const auto file = path.str();
-		if (!std::filesystem::is_regular_file(file, ec)) return 0;
-
-		std::ifstream in(file, std::ios::in | std::ios::binary);
-		if (!in.is_open()) return 0;
-		std::ostringstream wire;
-		wire << in.rdbuf();
-
-		return AppInfoProvision::dlcAppIdForDepot(wire.str(), appId, depotId);
+		std::string wire;
+		if (!AppInfoProvision::readValidatedCacheBuffer(appId, wire)) return 0;
+		return AppInfoProvision::dlcAppIdForDepot(wire, appId, depotId);
 	}
 
 	void recordQuarantine(uint32_t appId, uint32_t depotId, uint32_t dlcAppId,
