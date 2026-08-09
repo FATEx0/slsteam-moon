@@ -116,9 +116,10 @@ static const IfaceCase kCases[] = {
 
 // Three non-root comparisons that identify IClientRemoteStorage's generated
 // dispatch tree across the old and new clients. Each id drifted by <= 3 while
-// the median/root changed completely.
+// the median/root changed completely; the literals below are the midpoints of
+// the 2026-07-21 and 2026-08-05 builds so one set resolves both unambiguously.
 static constexpr uint32_t kRemoteStorageFingerprint[] = {
-	0x5DB4729A, 0x7F3F5645, 0x84692E78,
+	0x5DB47296, 0x7F3F564A, 0x84692E73,
 };
 
 static void test_resolveConfident_pure()

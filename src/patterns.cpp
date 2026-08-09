@@ -342,15 +342,17 @@ static void autoResolveIpcFrameRoots()
 		const uint32_t seed = IpcFrame::parseTrailingRoot(p->pattern);
 		size_t idx = IpcFrame::resolveConfident(ctx.cands, seed, IpcFrame::kMaxRootDrift);
 
-		// The 2026-07-21 RemoteStorage tree kept its internal comparisons but
+		// The 2026-08-05 RemoteStorage tree kept its internal comparisons but
+		// drifted every message id (median/root moved ~9, siblings ~3-8) and
 		// selected a numerically distant median/root. Match three independent
-		// pivots and still require exactly one candidate; never widen the global
-		// numeric band and risk assigning an unrelated interface.
+		// pivots chosen mid-way between the 2026-07-21 and 2026-08-05 values so a
+		// single bounded literal set still resolves both builds; never widen the
+		// global numeric band and risk assigning an unrelated interface.
 		if (idx == SIZE_MAX && p == &Patterns::IClientRemoteStorage::RunIPCFrame)
 		{
 			static constexpr uint32_t fingerprint[] =
 			{
-				0x5DB4729A, 0x7F3F5645, 0x84692E78,
+				0x5DB47296, 0x7F3F564A, 0x84692E73,
 			};
 			size_t matches = 0;
 			for (size_t i = 0; i < ctx.cands.size(); ++i)
