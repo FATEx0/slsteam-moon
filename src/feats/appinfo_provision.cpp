@@ -97,6 +97,10 @@ std::mutex g_cachePublicationMu;
 std::mutex g_cacheReadInvalidationMu;
 std::unordered_set<uint32_t> g_cacheReadInvalidated;
 std::unordered_map<uint32_t, std::uint64_t> g_cachePublicationGenerations;
+// Apps whose last provisioning attempt ended in a result that can never
+// publish a cache pair, keyed by the generation that produced it. Guarded by
+// g_cachePublicationMu together with the generation map above.
+std::unordered_map<uint32_t, std::uint64_t> g_terminalProvisionResults;
 std::mutex g_refreshScheduleMu;
 bool g_refreshInFlight = false;
 bool g_refreshPending = false;
@@ -1646,6 +1650,32 @@ bool hasReadyCacheOnDisk(uint32_t appId)
 	return cachePairReady(bufferExists, metadataExists, recordFresh);
 }
 
+// Classify what is on disk for one app, separating "unusable" from "usable but
+// past the freshness window" so each caller can apply its own policy.
+CacheReadiness cacheReadinessOnDisk(uint32_t appId)
+{
+	const bool bufferExists = hasBufferOnDisk(appId);
+	bool metadataExists = false;
+	{
+		ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+		if (!cacheLock.acquired()) return CacheReadiness::Missing;
+		struct stat st{};
+		metadataExists = stat(getMetaPath(appId).c_str(), &st) == 0 &&
+		                 st.st_size > 0;
+	}
+	if (!bufferExists || !metadataExists) return CacheReadiness::Missing;
+
+	// `refreshUnavailable = true` asks the question this classification needs:
+	// is the pair itself valid? Fresh answers Fresh; a valid pair past the TTL
+	// answers Fallback, which is precisely the ValidStale case.
+	switch (cacheUseForApp(appId, true))
+	{
+		case cache::CacheUse::Fresh:    return CacheReadiness::Fresh;
+		case cache::CacheUse::Fallback: return CacheReadiness::ValidStale;
+		default:                        return CacheReadiness::Missing;
+	}
+}
+
 // Render+prune+sha+persist a parsed appinfo node (shared tail used by
 // both the CM and steamcmd paths). `changeNumber` is the PICS/JSON change
 // number for the meta record.
@@ -1887,6 +1917,30 @@ std::uint64_t cachePublicationGenerationLocked(uint32_t appId)
 	return it == g_cachePublicationGenerations.end() ? 0 : it->second;
 }
 
+// Remember that this app cannot produce a cache pair, so later passes skip it
+// instead of paying another CM round-trip for the same answer.
+void noteTerminalProvisionResult(uint32_t appId)
+{
+	std::lock_guard<std::mutex> lock(g_cachePublicationMu);
+	g_terminalProvisionResults[appId] = cachePublicationGenerationLocked(appId);
+}
+
+bool terminalProvisionResultKnown(uint32_t appId)
+{
+	std::lock_guard<std::mutex> lock(g_cachePublicationMu);
+	const auto it = g_terminalProvisionResults.find(appId);
+	return cache::terminalResultStillApplies(
+	    it != g_terminalProvisionResults.end(),
+	    it == g_terminalProvisionResults.end() ? 0 : it->second,
+	    cachePublicationGenerationLocked(appId));
+}
+
+void forgetTerminalProvisionResult(uint32_t appId)
+{
+	std::lock_guard<std::mutex> lock(g_cachePublicationMu);
+	g_terminalProvisionResults.erase(appId);
+}
+
 CachePublicationToken snapshotCachePublication(uint32_t appId)
 {
 	CachePublicationToken token;
@@ -1973,6 +2027,14 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 				        : cmResult == SourceResult::VirtualDlc
 				            ? "DLC has no usable content depots"
 				            : "local cache write failed");
+				// A content verdict is a property of the app, not of this
+				// attempt: repeating it costs a CM round-trip and returns the
+				// same answer. A local write failure is NOT terminal in that
+				// sense — the next pass may well succeed — so it stays
+				// retryable.
+				if (cmResult == SourceResult::NoUsableContent ||
+				    cmResult == SourceResult::VirtualDlc)
+					noteTerminalProvisionResult(appId);
 				if (cmResult == SourceResult::VirtualDlc)
 					return ProvisionOutcome::NotApplicable;
 				return cmResult == SourceResult::LocalFailure
@@ -2368,14 +2430,32 @@ int provisionColdStartApps(const std::string& appinfoVdfPath,
 	ProvisionPassCoordinator coordinator(g_provisionPassMu);
 	const auto managedApps = coordinator.snapshot(
 		[] { return g_config.managedAppIds.get(); });
+	// The preinit pass wants the live gid before the splice, so a stale pair is
+	// worth re-fetching there. The PICS callback runs on Steam's worker thread
+	// while the user is interacting, so it must only rescue a pair that is
+	// missing or invalid; refreshing stale pairs belongs to the async worker.
+	const bool requireFresh = allowConfigWrite;
 	std::unordered_set<uint32_t> cold;
+	std::size_t skippedTerminal = 0;
 	for (const uint32_t appId : managedApps)
 	{
-		const bool cacheReady = hasReadyCacheOnDisk(appId);
-		if (shouldRunColdFallback(cacheReady))
+		if (!coldFallbackNeeded(cacheReadinessOnDisk(appId), requireFresh))
+			continue;
+		// Apps with a terminal content verdict can never satisfy this loop, so
+		// including them would refetch the same answer on every pass and keep
+		// the pass permanently incomplete.
+		if (terminalProvisionResultKnown(appId))
 		{
-			cold.insert(appId);
+			++skippedTerminal;
+			continue;
 		}
+		cold.insert(appId);
+	}
+	if (skippedTerminal != 0)
+	{
+		g_pLog->debug(
+		    "AppInfoProvision: skipping %zu app(s) with a known terminal "
+		    "content result\n", skippedTerminal);
 	}
 	if (cold.empty())
 	{
@@ -2414,7 +2494,10 @@ int provisionColdStartApps(const std::string& appinfoVdfPath,
 		}
 		if (!hasReadyCacheOnDisk(appId))
 		{
-			unresolved = true;
+			// A terminal verdict is resolved, not pending: there is nothing a
+			// retry could produce. Counting it as unresolved armed the backoff
+			// forever and made every later PICS response repeat the pass.
+			if (!terminalProvisionResultKnown(appId)) unresolved = true;
 			continue;
 		}
 		if (sanitizedApps &&
@@ -2767,6 +2850,10 @@ bool forgetAppImpl(uint32_t appId, bool preserveTicketArtifacts)
 		std::lock_guard<std::mutex> passLock(g_provisionPassMu);
 		std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
 		++g_cachePublicationGenerations[appId];
+		// Bumping the generation already invalidates any terminal verdict for
+		// this id; drop the entry so the map cannot accumulate dead records.
+		// Erased inline because the publication mutex is already held here.
+		g_terminalProvisionResults.erase(appId);
 		{
 			std::lock_guard<std::mutex> invalidationLock(
 			    g_cacheReadInvalidationMu);

@@ -20,12 +20,13 @@ void check(bool condition, const char* message)
 
 int main()
 {
+    using AppInfoProvision::CacheReadiness;
     using AppInfoProvision::RefreshScheduleAction;
     using AppInfoProvision::cachePairReady;
+    using AppInfoProvision::coldFallbackNeeded;
     using AppInfoProvision::refreshScheduleAction;
     using AppInfoProvision::shouldRequeueRefreshAfterStartFailure;
     using AppInfoProvision::shouldRerunPendingRefresh;
-    using AppInfoProvision::shouldRunColdFallback;
     using AppInfoProvision::asyncProvisionEnabled;
     using AppInfoProvision::shouldWarmCurlBeforePics;
     using AppInfoProvision::shouldSkipStaleAsyncSplice;
@@ -40,18 +41,28 @@ int main()
               PreinitProvisionAction::SynchronousProvision,
           "disabled async mode keeps the full synchronous setup pass");
 
+    // The preinit pass re-fetches a stale pair on purpose (live gid before the
+    // splice); the PICS callback must not, or every response past the TTL
+    // re-provisions the whole fleet on Steam's worker thread.
+    check(coldFallbackNeeded(CacheReadiness::Missing, /*requireFresh=*/true),
+          "a missing pair is always a cold start");
+    check(coldFallbackNeeded(CacheReadiness::Missing, /*requireFresh=*/false),
+          "a missing pair is a cold start for the callback too");
+    check(coldFallbackNeeded(CacheReadiness::ValidStale, /*requireFresh=*/true),
+          "startup re-fetches a stale pair to pin the live gid");
+    check(!coldFallbackNeeded(CacheReadiness::ValidStale, /*requireFresh=*/false),
+          "a valid stale pair does not drag the callback into a full pass");
+    check(!coldFallbackNeeded(CacheReadiness::Fresh, /*requireFresh=*/true),
+          "a fresh pair is never a cold start");
+    check(!coldFallbackNeeded(CacheReadiness::Fresh, /*requireFresh=*/false),
+          "a fresh pair is never a cold start for the callback");
+
     check(cachePairReady(true, true, true),
           "only a complete and validated cache pair is ready");
     check(!cachePairReady(true, false, true),
           "a buffer without metadata is not a ready cache pair");
     check(!cachePairReady(true, true, false),
           "an invalid cache record is not a ready cache pair");
-    check(shouldRunColdFallback(false),
-          "cold fallback runs when the cache is not ready");
-    check(shouldRunColdFallback(false),
-          "cold fallback remains eligible while an active refresh may cover another app");
-    check(!shouldRunColdFallback(true),
-          "a ready cache never needs a cold fallback");
     check(refreshScheduleAction(true, true, false) ==
               RefreshScheduleAction::Start,
           "the first refresh request starts a worker");

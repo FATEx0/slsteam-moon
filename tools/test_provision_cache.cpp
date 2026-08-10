@@ -180,6 +180,22 @@ int main()
 	                               /*expectedGeneration=*/7,
 	                               /*currentGeneration=*/7),
 	      "removed app cannot leave a Proton mark behind");
+	// A terminal content verdict must be remembered so the app stops paying a
+	// CM round-trip per pass, and must expire when the generation changes so a
+	// removed-and-re-added app is retried once.
+	CHECK(AppInfoProvision::cache::terminalResultStillApplies(
+	          /*recorded=*/true, /*recordedGeneration=*/4,
+	          /*currentGeneration=*/4),
+	      "a terminal verdict from the current generation still applies");
+	CHECK(!AppInfoProvision::cache::terminalResultStillApplies(
+	          /*recorded=*/true, /*recordedGeneration=*/4,
+	          /*currentGeneration=*/5),
+	      "re-adding the app retries a previously terminal verdict");
+	CHECK(!AppInfoProvision::cache::terminalResultStillApplies(
+	          /*recorded=*/false, /*recordedGeneration=*/0,
+	          /*currentGeneration=*/0),
+	      "an app with no recorded verdict is never skipped");
+
 	CHECK(syntheticMarkerConsistent(/*synthetic=*/false,
 	                                /*markerPresent=*/false),
 	      "a normal cache pair without a marker is consistent");

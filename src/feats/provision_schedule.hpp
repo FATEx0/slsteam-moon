@@ -63,20 +63,41 @@ inline bool cachePairReady(bool bufferExists, bool metadataExists,
 	return bufferExists && metadataExists && recordValid;
 }
 
+// How much of a cache pair a caller found on disk.
+enum class CacheReadiness
+{
+	Missing,     // absent, incomplete, or failed validation
+	ValidStale,  // complete and validated, but older than the freshness window
+	Fresh,       // complete, validated and inside the freshness window
+};
+
+// Decide whether an app must take the SYNCHRONOUS provisioning path.
+//
+// The two callers want different things and conflating them was expensive:
+//
+//   * setup()/preinit (requireFresh = true) re-fetches a stale pair on purpose,
+//     because the live public gid must be current before appinfo.vdf is
+//     spliced; serving a cross-session buffer reintroduces the staged-gid vs
+//     requested-gid mismatch that broke first-attempt installs.
+//
+//   * the PICS callback (requireFresh = false) runs on Steam's own worker
+//     thread while the user is clicking. A valid pair already serves the app
+//     there, and refreshing a stale one is the async worker's job. Treating
+//     stale as cold made every response past the TTL re-provision the whole
+//     fleet inline — 101 apps, one CM batch, a full DLC recollection and a
+//     package-0 broadcast — which is exactly what froze the install dialog.
+inline bool coldFallbackNeeded(CacheReadiness readiness, bool requireFresh)
+{
+	if (readiness == CacheReadiness::Missing) return true;
+	return requireFresh && readiness != CacheReadiness::Fresh;
+}
+
 // PICS provisioning can be triggered for a game added after setup() as well
 // as for apps already managed at boot. Warm the loader unconditionally so a
 // later hot-add cannot become the first worker-thread dlopen.
 inline bool shouldWarmCurlBeforePics(bool /*hasManagedApps*/)
 {
 	return true;
-}
-
-// The pass mutex serializes cold provisioning with the sanctioned background
-// refresh. Do not suppress a missing app merely because some other refresh is
-// in flight: that worker may have snapshotted a different app set.
-inline bool shouldRunColdFallback(bool cacheReady)
-{
-	return !cacheReady;
 }
 
 // Resolve the config value and the optional field override. Invalid explicit

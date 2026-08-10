@@ -96,6 +96,21 @@ inline bool protonPublicationAllowed(bool managed,
 	                               currentGeneration);
 }
 
+// A terminal provisioning result — a DLC that carries only ownership metadata,
+// or concrete depots none of which are usable here — can never publish a cache
+// pair. Without remembering it, the app re-enters the cold set on every pass
+// and pays a fresh CM round-trip forever, which also keeps the pass permanently
+// "incomplete" and the retry backoff permanently armed.
+//
+// The memory is scoped to the publication generation so removing and re-adding
+// the app, or any other event that bumps the generation, retries it once.
+inline bool terminalResultStillApplies(bool recorded,
+                                       std::uint64_t recordedGeneration,
+                                       std::uint64_t currentGeneration)
+{
+	return recorded && recordedGeneration == currentGeneration;
+}
+
 // A cache pair and its provenance marker are one logical publication. A
 // reader must reject either half of an interrupted transition: a synthetic
 // pair without its marker, or a normal pair retaining an old marker.
