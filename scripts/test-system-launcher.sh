@@ -52,9 +52,14 @@ check "bin backup preserves its own original" "ORIG-BIN" \
   "$(sh "$(ls_backup_path "$TMP/usr/bin/steam")" | cut -d' ' -f1)"
 check "games backup preserves its own original" "ORIG-GAMES" \
   "$(sh "$(ls_backup_path "$TMP/usr/games/steam")" | cut -d' ' -f1)"
-check "shim passes original to wrapper" \
-  "WRAPPER bin=$(ls_backup_path "$TMP/usr/bin/steam") args=-silent" \
+# The wrapper is handed the `steam`-named alias for the captured original, never
+# the `.orig` path itself: Valve's launcher aborts under any other argv[0].
+# See scripts/test-launcher-basename.sh.
+check "shim passes a name-safe original to wrapper" \
+  "WRAPPER bin=$(ls_backup_alias_path "$TMP/usr/bin/steam") args=-silent" \
   "$(sh "$TMP/usr/bin/steam" -silent)"
+check "shim alias resolves to the captured original" "$(ls_backup_path "$TMP/usr/bin/steam")" \
+  "$(readlink -f "$(ls_backup_alias_path "$TMP/usr/bin/steam")")"
 
 ls_install_shims
 check "reinstall does not capture the shim" "ORIG-BIN" \
@@ -151,7 +156,7 @@ check "post-bootstrap shim is installed" "yes" \
 check "post-bootstrap backup captures the real launcher" "REAL-LAUNCHER" \
   "$(sh "$(ls_backup_path "$STUB_BIN/steam")" | cut -d' ' -f1)"
 check "post-bootstrap shim passes real launcher to wrapper" \
-  "WRAPPER-STUB bin=$(ls_backup_path "$STUB_BIN/steam") args=-silent" \
+  "WRAPPER-STUB bin=$(ls_backup_alias_path "$STUB_BIN/steam") args=-silent" \
   "$(sh "$STUB_BIN/steam" -silent)"
 
 # A backup must never alias the injected wrapper, and generated shims must
@@ -219,8 +224,10 @@ mv "$LEGACY_BACKUP_AWAY" "$LEGACY_BACKUP"
 mkdir -p "$LEGACY_HOME/.steam"
 ln -s "$STUB_ROOT" "$LEGACY_HOME/.steam/steam"
 check "existing shim uses wrapper after bootstrap" \
-  "WRAPPER-LEGACY bin=$LEGACY_BACKUP args=-silent" \
+  "WRAPPER-LEGACY bin=$(ls_alias_for_backup "$LEGACY_BACKUP") args=-silent" \
   "$(HOME="$LEGACY_HOME" sh "$LEGACY_BIN/steam" -silent)"
+check "existing shim heals its missing exec alias in place" "$LEGACY_BACKUP" \
+  "$(readlink -f "$(ls_alias_for_backup "$LEGACY_BACKUP")")"
 
 # A managed shim accidentally left in the backup tree is not a runnable
 # original, whether the wrapper is available or not.

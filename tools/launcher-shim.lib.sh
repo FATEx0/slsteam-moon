@@ -163,14 +163,75 @@ ls_legacy_backup_path() {
 	printf '%s/%s.orig\n' "${LS_BACKUP_ROOT%/}" "$(basename -- "$1")"
 }
 
+# Valve's distro launcher (bin_steam.sh, which /usr/bin/steam symlinks to on
+# Fedora/Nobara) derives its whole identity from its own argv[0]:
+#
+#     STEAMPACKAGE="${0##*/}"; case "$STEAMPACKAGE" in steam) ;; steambeta) ;;
+#         *) log "Unknown Steam package '$STEAMPACKAGE'"; exit 1 ;;
+#
+# So a captured original may never be executed as `steam.orig`: the launch dies
+# before Steam opens its logger, i.e. Steam silently does not start and nothing
+# is written to any log. Names Valve accepts, plus the name-agnostic data-dir
+# steam.sh.
+ls_name_is_launcher_safe() {
+	case "${1##*/}" in
+		steam|steambeta|bin_steam.sh|steam.sh) return 0 ;;
+	esac
+	return 1
+}
+
+# The `steam`-named alias that sits next to a captured original and points at
+# it. Executing the alias gives the captured launcher the argv[0] it requires
+# while `<name>.orig` stays the authoritative backup for restoration.
+ls_alias_for_backup() {
+	local backup="$1" dir
+	dir="$(dirname -- "$backup")"
+	printf '%s/steam\n' "${dir%/}"
+}
+
+ls_backup_alias_path() {
+	ls_alias_for_backup "$(ls_backup_path "$1")"
+}
+
+# Create/refresh the alias. Best-effort by design: when it cannot be created the
+# shim degrades to launching through the wrapper (or steam.sh) instead of
+# executing a launcher under a name it rejects.
+ls_refresh_backup_alias() {
+	local backup="$1" alias target
+	[ -f "$backup" ] || return 1
+	alias="$(ls_alias_for_backup "$backup")"
+	[ "$alias" != "$backup" ] || return 0
+	[ ! -d "$alias" ] || return 1
+	target="$(basename -- "$backup")"
+	if [ "$(readlink -- "$alias" 2>/dev/null || true)" != "$target" ]; then
+		ls_run_privileged ln -sfn -- "$target" "$alias" 2>/dev/null || return 1
+	fi
+	[ -x "$alias" ] || return 1
+	[ "$(readlink -f "$alias" 2>/dev/null || true)" = \
+	  "$(readlink -f "$backup" 2>/dev/null || true)" ]
+}
+
+# Drop the alias once its captured original is no longer needed. Only ever
+# removes a symlink, never a real file.
+ls_remove_backup_alias() {
+	local backup="$1" alias
+	alias="$(ls_alias_for_backup "$backup")"
+	[ "$alias" != "$backup" ] || return 0
+	[ -L "$alias" ] || return 0
+	ls_run_privileged rm -f -- "$alias" 2>/dev/null || true
+	return 0
+}
+
 ls_shim_content() {
-	local backup="$1"
+	local backup="$1" alias="${2:-}"
+	[ -n "$alias" ] || alias="$(ls_alias_for_backup "$backup")"
 	cat <<EOF
 #!/bin/sh
 $LS_TAG
 # Managed by slsteam-moon. Run the uninstaller to restore the package launcher.
 SLSM_WRAPPER="\${HOME}/.local/share/SLSsteam/path/steam"
 SLSM_ORIG="$backup"
+SLSM_ORIG_EXEC="$alias"
 SLSM_TAG="$LS_TAG"
 SLSM_BOOTSTRAP_ROOT=""
 SLSM_BOOTSTRAPPED=0
@@ -194,14 +255,39 @@ if [ -f "\$SLSM_ORIG" ] && [ -x "\$SLSM_ORIG" ]; then
 		SLSM_ORIG_USABLE=1
 	fi
 fi
+# Valve's launcher derives STEAMPACKAGE from its own argv[0] and aborts with
+# "Unknown Steam package" under any other name, so the captured original is
+# never executed as "*.orig": run it through its \`steam\`-named alias. The alias
+# lives in our own tree, so recreate it in place when an older install or a
+# partial restore left it missing. Only when no safe name can be obtained at all
+# is the captured launcher skipped in favour of steam.sh.
+SLSM_LAUNCH=""
+slsm_shim_alias_ready() {
+	[ -x "\$SLSM_ORIG_EXEC" ] || return 1
+	[ "\$(readlink -f "\$SLSM_ORIG_EXEC" 2>/dev/null || true)" = "\$SLSM_ORIG_REAL" ]
+}
+if [ "\$SLSM_ORIG_USABLE" = 1 ]; then
+	if ! slsm_shim_alias_ready; then
+		if [ ! -e "\$SLSM_ORIG_EXEC" ] || [ -L "\$SLSM_ORIG_EXEC" ]; then
+			ln -sfn -- "\${SLSM_ORIG##*/}" "\$SLSM_ORIG_EXEC" 2>/dev/null || true
+		fi
+	fi
+	if slsm_shim_alias_ready; then
+		SLSM_LAUNCH="\$SLSM_ORIG_EXEC"
+	else
+		case "\${SLSM_ORIG##*/}" in
+			steam|steambeta|bin_steam.sh|steam.sh) SLSM_LAUNCH="\$SLSM_ORIG" ;;
+		esac
+	fi
+fi
 if [ -x "\$SLSM_WRAPPER" ] && [ "\$SLSM_BOOTSTRAPPED" = 1 ]; then
-	if [ "\$SLSM_ORIG_USABLE" = 1 ]; then
-		export SLSM_STEAM_BIN="\$SLSM_ORIG"
+	if [ -n "\$SLSM_LAUNCH" ]; then
+		export SLSM_STEAM_BIN="\$SLSM_LAUNCH"
 	fi
 	exec "\$SLSM_WRAPPER" "\$@"
 fi
-if [ "\$SLSM_ORIG_USABLE" = 1 ]; then
-	exec "\$SLSM_ORIG" "\$@"
+if [ -n "\$SLSM_LAUNCH" ]; then
+	exec "\$SLSM_LAUNCH" "\$@"
 fi
 for _s in "\${HOME}/.local/share/Steam/steam.sh" \
           "\${HOME}/.steam/steam/steam.sh" \
@@ -273,6 +359,10 @@ ls_install_one_shim() {
 		fi
 		ls_run_privileged chmod 0755 "$backup" 2>/dev/null || return 1
 		ls_backup_is_usable "$backup" || return 1
+		# Best effort: without the alias the shim routes through the wrapper (or
+		# steam.sh) instead of executing the captured launcher under a name it
+		# would reject, so coverage survives an alias failure.
+		ls_refresh_backup_alias "$backup" || true
 		ls_write_shim "$launcher" "$backup"
 		return $?
 	fi
@@ -286,6 +376,7 @@ ls_install_one_shim() {
 	# executable even when a mirrored backup predates the current install.
 	ls_run_privileged chmod 0755 "$backup" 2>/dev/null || return 1
 	ls_backup_is_usable "$backup" || return 1
+	ls_refresh_backup_alias "$backup" || true
 	ls_write_shim "$launcher" "$backup"
 }
 
@@ -325,7 +416,10 @@ ls_restore_one() {
 	else
 		install -m 0755 "$backup" "$launcher" 2>/dev/null || return 1
 	fi
-	! ls_is_our_shim "$launcher"
+	ls_is_our_shim "$launcher" && return 1
+	# The launcher is genuine again; its exec alias has no purpose left.
+	ls_remove_backup_alias "$backup"
+	return 0
 }
 
 ls_restore_shims() {

@@ -434,6 +434,65 @@ case "$STEAM_BIN" in
 	*) STEAM_BIN="$(readlink -f "$STEAM_BIN" 2>/dev/null || echo "$STEAM_BIN")" ;;
 esac
 
+# Valve's distro launcher (bin_steam.sh, which /usr/bin/steam symlinks to on
+# Fedora/Nobara) takes its whole identity from its own argv[0]:
+#
+#     STEAMPACKAGE="${0##*/}" ... *) log "Unknown Steam package"; exit 1
+#
+# A captured original such as system-launcher-backup/usr/bin/steam.orig is
+# exactly that case, so exec'ing it aborts the launch before Steam opens its
+# logger: Steam silently never starts and no log is written anywhere. Never
+# exec a launcher under a name it can reject - route through a `steam`-named
+# alias for the same file. This also heals a shim written by an older release
+# that still hands over the `.orig` path directly.
+# SLSM_POLICY_BIN keeps the resolved path so the bootstrap guard below still
+# classifies the launcher by what was actually resolved, not by the alias.
+SLSM_POLICY_BIN="$STEAM_BIN"
+slsm_launcher_name_safe() {
+	case "${1##*/}" in
+		steam|steambeta|bin_steam.sh|steam.sh) return 0 ;;
+	esac
+	return 1
+}
+slsm_same_file() {
+	_slsm_a="$(readlink -f "$1" 2>/dev/null || true)"
+	_slsm_b="$(readlink -f "$2" 2>/dev/null || true)"
+	[ -n "$_slsm_a" ] && [ "$_slsm_a" = "$_slsm_b" ]
+}
+slsm_normalize_launcher() {
+	slsm_launcher_name_safe "$STEAM_BIN" && return 0
+	# 1) The alias the installer keeps next to the captured original.
+	_slsm_sibling="${STEAM_BIN%/*}/steam"
+	if [ -x "$_slsm_sibling" ] && slsm_same_file "$_slsm_sibling" "$STEAM_BIN"; then
+		STEAM_BIN="$_slsm_sibling"
+		return 0
+	fi
+	# 2) A private alias we own, created on demand.
+	_slsm_alias_dir="$SLSDIR/launcher-alias"
+	_slsm_alias="$_slsm_alias_dir/steam"
+	if mkdir -p "$_slsm_alias_dir" 2>/dev/null; then
+		if ! slsm_same_file "$_slsm_alias" "$STEAM_BIN"; then
+			[ -L "$_slsm_alias" ] || rm -f "$_slsm_alias" 2>/dev/null || true
+			ln -sfn "$STEAM_BIN" "$_slsm_alias" 2>/dev/null || true
+		fi
+		if [ -x "$_slsm_alias" ] && slsm_same_file "$_slsm_alias" "$STEAM_BIN"; then
+			STEAM_BIN="$_slsm_alias"
+			return 0
+		fi
+	fi
+	# 3) Nothing aliasable: the data-dir steam.sh ignores its own name.
+	for _slsm_c in "${HOME}/.local/share/Steam/steam.sh" \
+	               "${HOME}/.steam/steam/steam.sh" \
+	               "${HOME}/.steam/debian-installation/steam.sh"; do
+		if [ -x "$_slsm_c" ]; then
+			STEAM_BIN="$_slsm_c"
+			return 0
+		fi
+	done
+	return 1
+}
+slsm_normalize_launcher || true
+
 # Some Steam launchers (Nix's FHS/bwrap wrapper) replicate our cwd inside
 # their sandbox via --chdir. If we were started from a short-lived temp dir
 # (an installer extracting to $(mktemp -d) before running us), the sandbox's
@@ -454,12 +513,12 @@ slsm_exec_vanilla() {
 # system-launcher backup are shim-originated and still require bootstrap.
 slsm_bootstrap_guard() {
 	if [ "${SLSM_EXPLICIT_STEAM_BIN:-0}" = 1 ]; then
-		case "$STEAM_BIN" in
+		case "$SLSM_POLICY_BIN" in
 			"$SLSDIR/system-launcher-backup/"*) ;;
 			*) return 0 ;;
 		esac
 	else
-		case "$STEAM_BIN" in
+		case "$SLSM_POLICY_BIN" in
 			/usr/games/steam|/usr/bin/steam|/usr/local/bin/steam) ;;
 			*) return 0 ;;
 		esac
