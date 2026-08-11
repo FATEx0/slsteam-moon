@@ -544,10 +544,14 @@ fi
 # CRASHED AT STARTUP (Steam wrote an assert/crash minidump within the boot's
 # first few minutes) and, past a threshold, LATCHES into a safe mode that starts
 # Steam completely vanilla (no LD_AUDIT, no LD_PRELOAD, no sidecar) so the
-# session comes up. We deliberately key off the crash dump and NOT merely a
-# short-lived session: switching Game Mode <-> Desktop, a client self-update
-# restart, or a quick manual quit all end Steam fast but are NOT failures, and a
-# clean kill never writes a dump. As a fast path, a startup crash whose
+# session comes up. The latch is scoped to THAT SESSION: a relaunch loop lives
+# entirely inside one boot, so a boot is all the time pausing injection needs to
+# cover, and every new session re-arms it. (A latch that outlived the boot left
+# the user on a silently unhooked Steam - no plugin UI, no explanation - that
+# only a payload reinstall could undo.) We deliberately key off the crash dump
+# and NOT merely a short-lived session: switching Game Mode <-> Desktop, a client
+# self-update restart, or a quick manual quit all end Steam fast but are NOT
+# failures, and a clean kill never writes a dump. As a fast path, a startup crash whose
 # steamclient.so differs from the last cleanly-booted one latches on the FIRST
 # crash (a fresh client is the near-certain cause), so the user is not made to
 # loop MAX_FAILS times for a known-cause break; a crash on an UNCHANGED client
@@ -558,9 +562,11 @@ fi
 GUARD_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/slsteam-moon"
 mkdir -p "$GUARD_DIR" 2>/dev/null || true
 GUARD_LAST="$GUARD_DIR/last_launch"          # mtime = start of the most recent boot
+GUARD_GFX="$GUARD_DIR/last_launch_display"   # 1/0: did the most recent launch have a display
 GUARD_COUNT="$GUARD_DIR/boot_fail_count"
 GUARD_SAFE="$GUARD_DIR/safe_mode"            # present => stay vanilla
 GUARD_FP="$GUARD_DIR/safe_mode_fingerprint"  # payload id captured when latched
+GUARD_SESSION="$GUARD_DIR/session_id"        # session the latch and fail count belong to
 GUARD_CLIENT_LAST="$GUARD_DIR/last_client"   # steamclient.so id the most recent boot ran
 GUARD_CLIENT_GOOD="$GUARD_DIR/good_client"   # steamclient.so id of the last boot that started cleanly
 GUARD_LOG="$GUARD_DIR/guard.log"
@@ -585,6 +591,23 @@ guard_notify() {
 guard_read_int() {
 	_v="$(cat "$1" 2>/dev/null)"
 	case "$_v" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$_v" ;; esac
+}
+# Identify the machine's current session. The kernel's boot_id changes on every
+# boot; btime (boot epoch) is the fallback. Empty when neither is readable, in
+# which case the state simply never looks stale and the guard keeps its old
+# persistent behaviour instead of re-arming on every launch.
+guard_session_id() {
+	_sid="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+	[ -n "$_sid" ] || _sid="$(sed -n 's/^btime //p' /proc/stat 2>/dev/null || true)"
+	printf '%s' "$_sid"
+}
+# A launch with no display tells us nothing about the injected stack: Steam
+# cannot open a display, dies inside libX11 (XQueryExtension) and writes an
+# ordinary crash_*.dmp on its way out - vanilla Steam included. Scripted or
+# remote launches must not be able to latch recovery mode for a graphical
+# session that was never started.
+guard_has_display() {
+	[ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]
 }
 # Identify the Steam client library (size:mtime of the 32-bit steamclient.so we
 # hook). A client self-update rewrites it, changing this id - the signal that a
@@ -616,6 +639,7 @@ guard_fingerprint() {
 	done
 }
 GUARD_CUR_FP="$(guard_fingerprint)"
+[ -n "${SLSM_GUARD_SESSION_ID:-}" ] || SLSM_GUARD_SESSION_ID="$(guard_session_id)"
 
 # True when Steam wrote a FATAL crash minidump during the boot that started at
 # epoch $2 (marker file $1), within that boot's first STARTUP_SECS. This is the
@@ -642,7 +666,21 @@ guard_startup_crash() {
 	[ -n "$_hit" ]
 }
 
-# Already latched? Stay vanilla until the payload changes (user updated).
+# New session? Drop the recovery state and give injection a fresh try. The fail
+# count goes with it: crash dumps live in /tmp, so a previous boot's outcome is
+# not assessable here anyway, and counting across boots let unrelated launches
+# accumulate towards a latch the user never saw happen.
+GUARD_PREV_SESSION="$(cat "$GUARD_SESSION" 2>/dev/null || true)"
+if [ "$SLSM_GUARD_SESSION_ID" != "$GUARD_PREV_SESSION" ]; then
+	if [ -f "$GUARD_SAFE" ]; then
+		guard_log "new session -> clearing the recovery latch and retrying injection"
+	fi
+	rm -f "$GUARD_SAFE" "$GUARD_FP" "$GUARD_COUNT" "$GUARD_LAST" "$GUARD_GFX" 2>/dev/null || true
+	printf '%s' "$SLSM_GUARD_SESSION_ID" > "$GUARD_SESSION" 2>/dev/null || true
+fi
+
+# Already latched in this session? Stay vanilla until the payload changes (user
+# updated) or the session ends.
 if [ -f "$GUARD_SAFE" ]; then
 	if [ "$(cat "$GUARD_FP" 2>/dev/null)" = "$GUARD_CUR_FP" ]; then
 		guard_log "safe mode active -> launching Steam without injection"
@@ -659,7 +697,15 @@ fi
 GUARD_FAILS="$(guard_read_int "$GUARD_COUNT")"
 GUARD_CLIENT_CUR="$(guard_client_fp)"
 guard_client_changed=0
+guard_assessable=0
 if [ -f "$GUARD_LAST" ]; then
+	if [ "$(cat "$GUARD_GFX" 2>/dev/null)" = 0 ]; then
+		guard_log "previous launch had no display -> its outcome is not assessed"
+	else
+		guard_assessable=1
+	fi
+fi
+if [ "$guard_assessable" = 1 ]; then
 	_then="$(stat -c %Y "$GUARD_LAST" 2>/dev/null || stat -f %m "$GUARD_LAST" 2>/dev/null || echo 0)"
 	if guard_startup_crash "$GUARD_LAST" "$_then"; then
 		GUARD_FAILS=$(( GUARD_FAILS + 1 ))
@@ -697,15 +743,21 @@ if [ "$GUARD_FAILS" -ge "$SLSM_GUARD_MAX_FAILS" ] || { [ "$guard_client_changed"
 			rm -f "$_r/appcache/appinfo.vdf" 2>/dev/null && guard_log "removed $_r/appcache/appinfo.vdf"
 		fi
 	done
-	guard_notify "slsteam-moon is paused because Steam failed to start after a recent update. Steam is running normally - update the plugin from the LuaTools menu to re-enable it."
-	guard_log "recovery mode latched; Steam will launch unhooked until the payload is updated"
+	guard_notify "slsteam-moon paused itself for this session because Steam kept failing to start. Steam is running normally - injection is retried the next time you reboot, or right away if you update the plugin from the LuaTools menu."
+	guard_log "recovery mode latched for this session; Steam will launch unhooked until the next session or a payload update"
 	slsm_exec_vanilla "$@"
 fi
 
-# Mark the start of THIS boot for the next invocation's health check, and record
-# the client this boot is about to run so the next assessment can tell whether
-# the client changed across a crash.
+# Mark the start of THIS boot for the next invocation's health check, record
+# whether it can produce a meaningful verdict (a launch with no display cannot),
+# and record the client this boot is about to run so the next assessment can tell
+# whether the client changed across a crash.
 : > "$GUARD_LAST" 2>/dev/null || true
+if guard_has_display; then
+	printf 1 > "$GUARD_GFX" 2>/dev/null || true
+else
+	printf 0 > "$GUARD_GFX" 2>/dev/null || true
+fi
 printf '%s' "$GUARD_CLIENT_CUR" > "$GUARD_CLIENT_LAST" 2>/dev/null || true
 
 # Signed pattern metadata preflight. The normal path is cache-only and performs

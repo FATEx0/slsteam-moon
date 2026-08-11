@@ -85,6 +85,13 @@ export SLSM_GUARD_MAX_FAILS=3
 export SLSM_GUARD_STARTUP_SECS=180
 DUMPS="$HOME_DIR/dumps"; mkdir -p "$DUMPS"
 export SLSM_GUARD_DUMPS_DIR="$DUMPS"
+# Every case below simulates a DESKTOP launch, so the harness must look like one
+# to the guard: a launch with no display crashes inside libX11 on its own and is
+# deliberately not assessed (see the headless case at the end).
+export DISPLAY="${DISPLAY:-:0}"
+# Recovery state is scoped to the machine's session; pin it so the hand-crafted
+# fixtures below are not discarded as belonging to a previous one.
+export SLSM_GUARD_SESSION_ID=harness-session
 
 run_wrapper() {
 	if [ "${SLSM_TRACE_WRAPPER:-0}" = 1 ]; then
@@ -95,7 +102,13 @@ run_wrapper() {
 }
 count() { c="$(cat "$GUARD_DIR/boot_fail_count" 2>/dev/null)"; echo "${c:-x}"; }
 nth() { sed -n "${1}p" "$INVOCATIONS"; }
-reset_state() { rm -rf "$GUARD_DIR"; mkdir -p "$GUARD_DIR"; : > "$INVOCATIONS"; rm -f "$DUMPS"/*.dmp 2>/dev/null; }
+reset_state() {
+	rm -rf "$GUARD_DIR"; mkdir -p "$GUARD_DIR"
+	# Cases that hand-craft last_launch/boot_fail_count mean them as history from
+	# the CURRENT session, so stamp the session they belong to.
+	printf '%s' "$SLSM_GUARD_SESSION_ID" > "$GUARD_DIR/session_id"
+	: > "$INVOCATIONS"; rm -f "$DUMPS"/*.dmp 2>/dev/null
+}
 
 echo "== test-wrapper-guard =="
 
@@ -310,6 +323,65 @@ run_wrapper                                              # boot 3: one crash, cl
 [ "$(nth 3)" = "injected" ] && ok "unchanged client: single crash still injects (no fast latch)" || bad "boot 3 wrongly fell back: $(nth 3)"
 [ ! -f "$GUARD_DIR/safe_mode" ] && ok "unchanged client: no latch on a single crash" || bad "wrongly latched on one crash with unchanged client"
 [ "$(count)" = "1" ] && ok "unchanged client: fail count incremented to 1" || bad "unexpected count: $(count)"
+
+# --- SESSION SCOPE: the recovery latch must not outlive the session -----------
+# The latch exists to break a relaunch loop, and a relaunch loop happens entirely
+# inside one boot. Keeping it afterwards left the user on a silently unhooked
+# Steam that only a payload reinstall could undo: reboot, open Steam from the
+# desktop menu, no injection, no plugin UI, no explanation. A new session must
+# re-arm injection - if the incompatibility is real the loop simply re-latches
+# within seconds and the session still comes up.
+export SLSM_GUARD_SESSION_ID=session-A
+reset_state
+export SLSM_GUARD_MAX_FAILS=1
+run_wrapper                                              # launch 1: injects
+bs=$(( $(date +%s) - 30 )); touch -d "@$bs" "$GUARD_DIR/last_launch"; touch -d "@$(( bs + 12 ))" "$DUMPS/crash_sess.dmp"
+run_wrapper                                              # launch 2: crash -> latch
+export SLSM_GUARD_MAX_FAILS=3
+[ -f "$GUARD_DIR/safe_mode" ] && ok "session scope: latch created inside the session" || bad "could not create the session latch"
+run_wrapper
+[ "$(nth 3)" = "vanilla" ] && ok "session scope: latch holds for the rest of the session" || bad "latch did not hold in-session: $(nth 3)"
+export SLSM_GUARD_SESSION_ID=session-B
+run_wrapper
+[ "$(nth 4)" = "injected" ] && ok "session scope: a new session re-arms injection" || bad "new session stayed vanilla: $(nth 4)"
+[ ! -f "$GUARD_DIR/safe_mode" ] && ok "session scope: latch cleared on the new session" || bad "latch survived into the new session"
+[ "$(count)" = "0" ] && ok "session scope: fail count does not carry across sessions" || bad "fail count carried across sessions: $(count)"
+
+# --- UPGRADE: a latch written before session scoping existed must re-arm -------
+# Installs upgrading from the previous wrapper carry a latch with a still-valid
+# payload fingerprint and no session marker at all. That is the shape that left
+# users unhooked across reboots, so it must read as "belongs to a past session".
+export SLSM_GUARD_SESSION_ID=session-D
+reset_state
+export SLSM_GUARD_MAX_FAILS=1
+run_wrapper
+bs=$(( $(date +%s) - 30 )); touch -d "@$bs" "$GUARD_DIR/last_launch"; touch -d "@$(( bs + 12 ))" "$DUMPS/crash_upgrade.dmp"
+run_wrapper                                              # real latch, real fingerprint
+export SLSM_GUARD_MAX_FAILS=3
+rm -f "$GUARD_DIR/session_id"                            # pre-upgrade state layout
+run_wrapper
+[ "$(nth 3)" = "injected" ] && ok "upgrade: a latch with no session marker re-arms injection" || bad "pre-upgrade latch survived: $(nth 3)"
+[ ! -f "$GUARD_DIR/safe_mode" ] && ok "upgrade: pre-upgrade latch cleared" || bad "pre-upgrade latch still present"
+
+# --- a launch with NO DISPLAY says nothing about the injected stack -----------
+# Steam started without a display segfaults inside libX11 (XQueryExtension) and
+# writes a normal crash_*.dmp - vanilla Steam does it too, so it is not evidence
+# that injection broke anything. Counting it let scripted or remote launches
+# latch recovery mode for a graphical session that was never even started.
+export SLSM_GUARD_SESSION_ID=session-C
+reset_state
+export SLSM_GUARD_MAX_FAILS=1
+saved_display="$DISPLAY"; saved_wl="${WAYLAND_DISPLAY:-}"; unset DISPLAY WAYLAND_DISPLAY
+run_wrapper                                              # launch 1: headless
+bs=$(( $(date +%s) - 30 )); touch -d "@$bs" "$GUARD_DIR/last_launch"; touch -d "@$(( bs + 12 ))" "$DUMPS/crash_headless.dmp"
+export DISPLAY="$saved_display"
+[ -n "$saved_wl" ] && export WAYLAND_DISPLAY="$saved_wl"
+run_wrapper                                              # launch 2: desktop, assesses launch 1
+export SLSM_GUARD_MAX_FAILS=3
+[ "$(count)" = "0" ] && ok "crash from a launch with no display is not counted" || bad "headless crash was counted: $(count)"
+[ ! -f "$GUARD_DIR/safe_mode" ] && ok "no latch from a headless crash" || bad "latched on a headless crash"
+[ "$(nth 2)" = "injected" ] && ok "headless history does not fall back a desktop launch" || bad "desktop launch fell back: $(nth 2)"
+export SLSM_GUARD_SESSION_ID=harness-session
 
 # --- signed pattern refresh stays outside the warm launch critical path -------
 PATTERN_HELPER="$SLSDIR/pattern-refresh"
