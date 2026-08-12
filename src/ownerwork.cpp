@@ -10,6 +10,7 @@
 #include "log.hpp"
 #include "utils/ownerqueue.hpp"
 
+#include "feats/appinfostate.hpp"
 #include "feats/packagepatch.hpp"
 #include "sdk/IClientAppManager.hpp"
 
@@ -70,6 +71,7 @@ namespace
 			case OwnerQueue::Kind::InjectPackage0:    return AffTrace::Call::Package0Inject;
 			case OwnerQueue::Kind::ReconcileLicenses: return AffTrace::Call::LicenseReconcile;
 			case OwnerQueue::Kind::InstallApp:        return AffTrace::Call::InstallApp;
+			case OwnerQueue::Kind::SyncPackage0:     return AffTrace::Call::Package0Sync;
 		}
 		return AffTrace::Call::None;
 	}
@@ -103,6 +105,9 @@ namespace
 				break;
 			case OwnerQueue::Kind::ReconcileLicenses:
 				PackagePatch::forceReconcileLicenses();
+				break;
+			case OwnerQueue::Kind::SyncPackage0:
+				PackagePatch::synchronizePackage0(cmd.packageSnapshot());
 				break;
 			case OwnerQueue::Kind::InstallApp:
 				if (g_pClientAppManager == nullptr)
@@ -282,17 +287,22 @@ namespace OwnerWork
 
 	void drainOnOwnerFrame()
 	{
-		// One relaxed load in the overwhelmingly common "nothing pending"
-		// case, before any thread-id comparison.
-		if (queue().depthHint() == 0)
+		// Two lock-free hints in the overwhelmingly common idle case: queued
+		// commands and appinfo metadata completion share this owner boundary.
+		const std::size_t depthHint = queue().depthHint();
+		const bool resolvedHint = AppInfoState::resolvedDirtyHint();
+		if (depthHint == 0 && !resolvedHint)
 			return;
 		if (!OwnerQueue::shouldDrain(cachedTid(),
 		                            g_ownerTid.load(std::memory_order_relaxed),
-		                            t_draining, queue().depthHint()))
+		                            t_draining, depthHint == 0 ? 1 : depthHint))
 			return;
 
 		t_draining = true;
-		const std::size_t taken = queue().drain(runner(AffTrace::Mode::Queued));
+		const std::size_t taken = depthHint == 0
+			? 0 : queue().drain(runner(AffTrace::Mode::Queued));
+		if (AppInfoState::takeResolvedDirty())
+			PackagePatch::reprocessCurrentState();
 		t_draining = false;
 
 		if (taken != 0)
@@ -336,6 +346,11 @@ namespace OwnerWork
 		}
 		return submitBatch({ OwnerQueue::Command::injectPackage0(appIds),
 		                     OwnerQueue::Command::reconcileLicenses() });
+	}
+
+	Mode submitManagedState(const PackageSnapshot& snapshot)
+	{
+		return submitBatch({ OwnerQueue::Command::syncPackage0(snapshot) });
 	}
 
 	Mode submitInstallApp(std::uint32_t appId, std::uint32_t library)

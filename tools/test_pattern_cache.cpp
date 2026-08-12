@@ -43,6 +43,25 @@ namespace
 		bytes[100] = 0x8B;
 		bytes[101] = 0x45;
 		bytes[102] = 0x08;
+		bytes[120] = 0x55;
+		bytes[121] = 0x89;
+		bytes[122] = 0xE5;
+		bytes[123] = 0x57;
+		bytes[124] = 0x56;
+		bytes[125] = 0xE8;
+		bytes[126] = 0x11;
+		bytes[127] = 0x22;
+		bytes[128] = 0x33;
+		bytes[129] = 0x44;
+		bytes[160] = 0x55;
+		bytes[161] = 0x57;
+		bytes[162] = 0x56;
+		bytes[163] = 0x53;
+		bytes[164] = 0xE8;
+		bytes[165] = 0x11;
+		bytes[166] = 0x22;
+		bytes[167] = 0x33;
+		bytes[168] = 0x44;
 		return bytes;
 	}
 
@@ -109,8 +128,8 @@ int main()
 	const auto catalog = coldCatalog(bytes);
 	const PatternCache::CompiledLocator policy[] =
 	{
-		{"Patterns::First", true},
-		{"Patterns::Second", false},
+		{"Patterns::First", true, "55 89 E5", "None"},
+		{"Patterns::Second", false, "8B 45 ?", "None"},
 	};
 
 	expect(PatternCache::identityMatches(catalog.identity, expected),
@@ -190,6 +209,22 @@ int main()
 	}
 
 	{
+		const PatternCache::CompiledLocator signatureMismatch[] =
+		{
+			{"Patterns::First", true, "55 8B EC", "None"},
+			{"Patterns::Second", false, "8B 45 ?", "None"},
+		};
+		expect(!PatternCache::policyMatches(catalog, signatureMismatch),
+		       "compiled signature mismatch rejects the local cache policy");
+		const PatternCache::CompiledLocator followMismatch[] =
+		{
+			{"Patterns::First", true, "55 89 E5", "Relative"},
+			{"Patterns::Second", false, "8B 45 ?", "None"},
+		};
+		expect(!PatternCache::policyMatches(catalog, followMismatch),
+		       "compiled follow-mode mismatch rejects the local cache policy");
+	}
+	{
 		auto mutated = bytes;
 		mutated[101] = 0x46;
 		expect(!PatternCache::validate(catalog, expected, policy, mutated),
@@ -198,7 +233,7 @@ int main()
 	{
 		const PatternCache::CompiledLocator incomplete[] =
 		{
-			{"Patterns::First", true},
+			{"Patterns::First", true, "55 89 E5", "None"},
 		};
 		expect(!PatternCache::validate(catalog, expected, incomplete, bytes),
 		       "compiled policy mismatch rejects the cache");
@@ -208,18 +243,76 @@ int main()
 		incompleteCatalog.locators.pop_back();
 		const PatternCache::CompiledLocator required[] =
 		{
-			{"Patterns::First", true},
-			{"Patterns::Second", true},
+			{"Patterns::First", true, "55 89 E5", "None"},
+			{"Patterns::Second", true, "8B 45 ?", "None"},
 		};
 		expect(!PatternCache::policyMatches(incompleteCatalog, required),
 		       "a missing required locator rejects the complete cache policy");
 		const PatternCache::CompiledLocator optional[] =
 		{
-			{"Patterns::First", true},
-			{"Patterns::Second", false},
+			{"Patterns::First", true, "55 89 E5", "None"},
+			{"Patterns::Second", false, "8B 45 ?", "None"},
 		};
 		expect(PatternCache::policyMatches(incompleteCatalog, optional),
 		       "a missing optional locator may fall back without invalidating required hits");
+	}
+
+	{
+		PatternCache::Catalog clientHotReload
+		{
+			expected,
+			{
+				{"Patterns::CAppInfoCache::GetOrAddAppData", 40, 40,
+				 "55 89 E5", "None", false},
+				{"Patterns::CAppInfoCache::ThreadedReadFromDisk", 120, 120,
+				 "55 89 E5 57 56 E8 ? ? ? ?", "None", false},
+				{"Patterns::CAppInfoCache::SkipFlagReference", 100, 100,
+				 "8B 45 ?", "None", false},
+			},
+		};
+		const PatternCache::CompiledLocator clientPolicy[] =
+		{
+			{"Patterns::CAppInfoCache::GetOrAddAppData", false,
+			 "55 89 E5", "None"},
+			{"Patterns::CAppInfoCache::ThreadedReadFromDisk", false,
+			 "55 89 E5 57 56 E8 ? ? ? ?", "None"},
+			{"Patterns::CAppInfoCache::SkipFlagReference", false,
+			 "8B 45 ?", "None"},
+		};
+		expect(PatternCache::validate(
+			clientHotReload, expected, clientPolicy, bytes),
+			"exact local client cache accepts function and instruction locators");
+		expect(clientHotReload.entry(
+			"Patterns::CAppInfoCache::GetOrAddAppData") != nullptr &&
+			!clientHotReload.entry(
+				"Patterns::CAppInfoCache::GetOrAddAppData")->required,
+			"local client function preserves optionality");
+		expect(clientHotReload.entry(
+			"Patterns::CAppInfoCache::ThreadedReadFromDisk") != nullptr &&
+			!clientHotReload.entry(
+				"Patterns::CAppInfoCache::ThreadedReadFromDisk")->required,
+			"local live disk reload preserves optionality");
+
+		auto uiIdentity = expected;
+		uiIdentity.component = "steamui";
+		uiIdentity.moduleName = "steamui.so";
+		PatternCache::Catalog steamUi
+		{
+			uiIdentity,
+			{
+				{"Patterns::SteamUI::AppControllerRunFrame", 160, 160,
+				 "55 57 56 53 E8 ? ? ? ?", "None", false},
+			},
+		};
+		const PatternCache::CompiledLocator uiPolicy[] =
+		{
+			{"Patterns::SteamUI::AppControllerRunFrame", false,
+			 "55 57 56 53 E8 ? ? ? ?", "None"},
+		};
+		expect(PatternCache::validate(steamUi, uiIdentity, uiPolicy, bytes),
+		       "exact local SteamUI cache is independently valid");
+		expect(!PatternCache::validate(steamUi, expected, uiPolicy, bytes),
+		       "SteamUI cache cannot be reused for steamclient");
 	}
 
 	const std::string serialized = PatternCache::serialize(catalog);

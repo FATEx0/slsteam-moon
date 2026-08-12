@@ -269,6 +269,8 @@ bool PatternCatalog::Catalog::validatePolicy(
 	std::span<const CompiledLocator> compiled
 ) const noexcept
 {
+	if (locators_.size() > compiled.size())
+		return false;
 	std::unordered_set<std::string_view> compiledSymbols;
 	for (const auto& item : compiled)
 	{
@@ -281,7 +283,14 @@ bool PatternCatalog::Catalog::validatePolicy(
 		{
 			return item.symbol == locator.symbol;
 		});
-		if (found == compiled.end() || found->required != locator.required)
+		if (found == compiled.end() || found->required != locator.required ||
+			found->signature != locator.signature ||
+			found->followMode != locator.followMode)
+			return false;
+	}
+	for (const auto& item : compiled)
+	{
+		if (item.required && entry(item.symbol) == nullptr)
 			return false;
 	}
 	return true;

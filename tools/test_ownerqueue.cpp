@@ -25,6 +25,7 @@
 //   /tmp/test_ownerqueue
 
 #include "../src/utils/ownerqueue.hpp"
+#include "../src/feats/hotreload_types.hpp"
 // Only the inline policy helpers are used from this header (no Steam deps).
 #include "../src/ownerwork.hpp"
 
@@ -50,6 +51,7 @@ using OwnerQueue::Command;
 using OwnerQueue::Kind;
 using OwnerQueue::PushResult;
 using OwnerQueue::Queue;
+using ::PackageSnapshot;
 
 // A fixed, explicit "now" so nothing in these tests has to sleep.
 static constexpr std::uint64_t kT0 = 1'000'000;
@@ -119,6 +121,105 @@ static void test_coalescing()
 	q.drain([](const Command&) {});
 }
 
+static void test_package_snapshot_last_write_wins()
+{
+	std::printf("[4a] package snapshots coalesce by generation (last write wins)\n");
+	const PackageSnapshot a{ 1, { 10, 20 }, { 110, 220 }, true, { 10, 20 } };
+	const PackageSnapshot b{ 2, { 20, 30 }, { 220, 330 }, false, { 30 } };
+
+	Queue q;
+	CHECK(q.push(Command::syncPackage0(a), kT0) == PushResult::Queued,
+	      "first package snapshot queues");
+	CHECK(q.push(Command::syncPackage0(b), kT0 + 10) == PushResult::Coalesced,
+	      "newer package snapshot replaces the pending payload");
+	CHECK(q.depth() == 1, "snapshot replacement keeps one pending record");
+	CHECK(q.oldestAgeUs(kT0 + 100) == 100,
+	      "snapshot replacement preserves the oldest enqueue timestamp");
+
+	PackageSnapshot received;
+	q.drain([&](const Command& cmd)
+	{
+		CHECK(cmd.kind() == Kind::SyncPackage0,
+		      "owner receives a SyncPackage0 command");
+		received = cmd.packageSnapshot();
+	});
+	PackageSnapshot carriedB = b;
+	carriedB.addedAppIds = { 20, 30 };
+	CHECK(received == carriedB,
+	      "owner receives the latest snapshot with still-relevant additions carried forward");
+	CHECK(received.appIds == std::vector<std::uint32_t>({ 20, 30 }) &&
+	      received.depotIds == std::vector<std::uint32_t>({ 220, 330 }) &&
+	      received.addedAppIds == std::vector<std::uint32_t>({ 20, 30 }) &&
+	      !received.metadataComplete,
+	      "latest snapshot payload is complete and exact");
+
+	Queue repeat;
+	CHECK(repeat.push(Command::syncPackage0(a), kT0) == PushResult::Queued,
+	      "repeat test snapshot queues");
+	CHECK(repeat.push(Command::syncPackage0(a), kT0 + 10) == PushResult::Duplicate,
+	      "an exact repeated snapshot reports Duplicate and does not replace");
+	CHECK(repeat.depth() == 1 && repeat.oldestAgeUs(kT0 + 100) == 100,
+	      "an exact repeat keeps one record and its original timestamp");
+
+	Queue sameGeneration;
+	const PackageSnapshot conflicting{ 1, { 99 }, { 999 }, false, {} };
+	std::vector<PushResult> perCommand;
+	CHECK(sameGeneration.pushBatch({ Command::syncPackage0(a) }, kT0,
+	                               &perCommand),
+	      "same-generation baseline batch is accepted");
+	CHECK(perCommand.size() == 1 && perCommand[0] == PushResult::Queued,
+	      "baseline batch reports Queued after its dry run and live apply");
+	CHECK(sameGeneration.pushBatch({ Command::syncPackage0(conflicting) },
+	                               kT0 + 10, &perCommand),
+	      "conflicting equal-generation batch is accepted as idempotent");
+	CHECK(perCommand.size() == 1 && perCommand[0] == PushResult::Duplicate,
+	      "conflicting equal-generation batch reports Duplicate");
+	CHECK(sameGeneration.depth() == 1 &&
+	      sameGeneration.oldestAgeUs(kT0 + 100) == 100,
+	      "equal-generation disagreement keeps one record and its original timestamp");
+	PackageSnapshot sameGenerationRetained;
+	sameGeneration.drain([&](const Command& cmd)
+	{
+		sameGenerationRetained = cmd.packageSnapshot();
+	});
+	CHECK(sameGenerationRetained == a,
+	      "equal-generation disagreement leaves the original payload exact");
+
+	Queue older;
+	CHECK(older.push(Command::syncPackage0(b), kT0) == PushResult::Queued,
+	      "newer snapshot queues for stale-generation test");
+	CHECK(older.push(Command::syncPackage0(a), kT0 + 10) == PushResult::Duplicate,
+	      "an older generation reports Duplicate and cannot replace newer work");
+	PackageSnapshot retained;
+	older.drain([&](const Command& cmd) { retained = cmd.packageSnapshot(); });
+	CHECK(retained == b, "older-generation rejection leaves the newer payload intact");
+
+	Queue order;
+	std::vector<Kind> kinds;
+	PackageSnapshot orderedSnapshot;
+	CHECK(order.push(Command::injectPackage0({ 7 }), kT0) == PushResult::Queued,
+	      "inject queues before a managed-state command");
+	CHECK(order.push(Command::syncPackage0(a), kT0) == PushResult::Queued,
+	      "managed-state command queues in FIFO position");
+	CHECK(order.push(Command::reconcileLicenses(), kT0) == PushResult::Queued,
+	      "reconcile queues after the managed-state command");
+	CHECK(order.push(Command::syncPackage0(b), kT0 + 10) == PushResult::Coalesced,
+	      "replacement does not move the managed-state FIFO position");
+	CHECK(order.push(Command::installApp(9, 0), kT0) == PushResult::Queued,
+	      "install queues after other command kinds");
+	CHECK(order.drain([&](const Command& cmd)
+	{
+		kinds.push_back(cmd.kind());
+		if (cmd.kind() == Kind::SyncPackage0)
+			orderedSnapshot = cmd.packageSnapshot();
+	}) == 4, "mixed command queue drains all records");
+	CHECK(kinds == std::vector<Kind>({ Kind::InjectPackage0, Kind::SyncPackage0,
+	                                   Kind::ReconcileLicenses, Kind::InstallApp }),
+	      "snapshot replacement preserves FIFO position relative to other kinds");
+	CHECK(orderedSnapshot == carriedB,
+	      "the FIFO snapshot record carries the latest payload and pending additions");
+}
+
 static void test_idempotent_enqueue()
 {
 	std::printf("[4] idempotent enqueue\n");
@@ -174,6 +275,40 @@ static void test_bounded()
 	CHECK(capped2.push(Command::injectPackage0({ 1, 2, 3 }), kT0) == PushResult::Full,
 	      "oversized command rejected outright");
 	CHECK(capped2.depth() == 0, "nothing queued from a rejected command");
+
+	Queue snapshotAppCap(8, 3);
+	CHECK(snapshotAppCap.push(Command::syncPackage0(
+		PackageSnapshot{ 1, { 1, 2, 3 }, {}, true, {} }), kT0) == PushResult::Queued,
+	      "snapshot app-id list at the cap is accepted");
+	CHECK(snapshotAppCap.push(Command::syncPackage0(
+		PackageSnapshot{ 2, { 1, 2, 3, 4 }, {}, true, {} }), kT0 + 1) == PushResult::Full,
+	      "snapshot app-id list beyond the cap is rejected");
+
+	Queue snapshotDepotCap(8, 3);
+	CHECK(snapshotDepotCap.push(Command::syncPackage0(
+		PackageSnapshot{ 1, {}, { 11, 22, 33 }, true, {} }), kT0) == PushResult::Queued,
+	      "snapshot depot-id list at the cap is accepted");
+	CHECK(snapshotDepotCap.push(Command::syncPackage0(
+		PackageSnapshot{ 2, {}, { 11, 22, 33, 44 }, true, {} }), kT0 + 1) == PushResult::Full,
+	      "snapshot depot-id list beyond the cap is rejected");
+	CHECK(snapshotDepotCap.depth() == 1,
+	      "a rejected snapshot bound leaves the pending record unchanged");
+
+	Queue snapshotAddedCap(8, 2);
+	CHECK(snapshotAddedCap.push(Command::syncPackage0(
+		PackageSnapshot{ 1, { 1 }, { 11 }, true, { 1, 2, 3 } }), kT0) ==
+		      PushResult::Full,
+	      "snapshot added-id list beyond the cap is rejected");
+
+	Queue snapshotCapacity(1);
+	CHECK(snapshotCapacity.push(Command::syncPackage0(
+		PackageSnapshot{ 1, { 1 }, { 11 }, true, {} }), kT0) == PushResult::Queued,
+	      "a snapshot occupies one capacity slot");
+	CHECK(snapshotCapacity.push(Command::syncPackage0(
+		PackageSnapshot{ 2, { 2 }, { 22 }, true, {} }), kT0 + 1) == PushResult::Coalesced,
+	      "a newer snapshot still coalesces when the queue is at capacity");
+	CHECK(snapshotCapacity.push(Command::installApp(5, 0), kT0 + 2) == PushResult::Full,
+	      "a different command kind is rejected at snapshot capacity");
 }
 
 static void test_shutdown_rejection()
@@ -194,6 +329,16 @@ static void test_shutdown_rejection()
 	CHECK(q.drain([](const Command&) {}) == 0, "nothing to drain after shutdown");
 	CHECK(q.flushStale(kT0 + 60'000'000, 1000, [](const Command&) {}) == 0,
 	      "the stale escape hatch does not run work during teardown");
+
+	Queue snapshot;
+	snapshot.push(Command::syncPackage0(
+		PackageSnapshot{ 1, { 7 }, { 77 }, true, {} }), kT0);
+	snapshot.shutdown();
+	CHECK(snapshot.push(Command::syncPackage0(
+		PackageSnapshot{ 2, { 8 }, { 88 }, true, {} }), kT0) == PushResult::ShuttingDown,
+	      "a snapshot is rejected after shutdown");
+	CHECK(snapshot.depth() == 0 && snapshot.stats().abandoned == 1,
+	      "snapshot work is abandoned at shutdown");
 }
 
 // Problem 1 regression. main.cpp's load() runs once per audited module open,
@@ -587,6 +732,7 @@ int main()
 	test_push_and_fifo_drain();
 	test_enqueue_does_not_block();
 	test_coalescing();
+	test_package_snapshot_last_write_wins();
 	test_idempotent_enqueue();
 	test_bounded();
 	test_shutdown_rejection();

@@ -2,7 +2,10 @@
 
 #include "feats/provision_schedule.hpp"
 
+#include <cstdint>
 #include <cstdio>
+#include <unordered_set>
+#include <vector>
 
 namespace
 {
@@ -33,6 +36,8 @@ int main()
     using AppInfoProvision::shouldMarkColdCacheSanitized;
     using AppInfoProvision::PreinitProvisionAction;
     using AppInfoProvision::preinitProvisionAction;
+    using AppInfoProvision::mergeRuntimePublishCandidates;
+    using AppInfoProvision::selectRuntimePublishCandidates;
 
     check(preinitProvisionAction(true) ==
               PreinitProvisionAction::ColdFallbackThenSplice,
@@ -106,6 +111,18 @@ int main()
           "managed apps require curl warmup before the PICS worker");
     check(shouldWarmCurlBeforePics(false),
           "future hot-adds also require curl warmup before the PICS worker");
+
+    const std::unordered_set<std::uint32_t> managed{420530, 777, 888};
+    const std::unordered_set<std::uint32_t> synthetic{420530, 999, 888};
+    check(selectRuntimePublishCandidates(
+              std::vector<std::uint32_t>{999, 420530, 420530, 777},
+              managed, synthetic) == std::vector<std::uint32_t>{420530},
+          "runtime publication selects only current requested synthetic apps");
+    check(mergeRuntimePublishCandidates(
+              std::vector<std::uint32_t>{888, 420530},
+              std::vector<std::uint32_t>{777, 888, 777}) ==
+              std::vector<std::uint32_t>({777, 888, 420530}),
+          "queued refreshes retain a sorted unique union of publication ids");
 
     if (failures != 0)
     {

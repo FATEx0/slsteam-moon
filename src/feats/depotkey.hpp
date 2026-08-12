@@ -77,6 +77,10 @@ namespace DepotKey
 	// `addappid(depotId, 1, "<64 hex chars>")` into our cache, idempotently.
 	void importLuaScripts();
 
+	// Re-scan scripts after a watcher event. Unlike the startup one-shot this
+	// runs once per request, under the same importer serialization lock.
+	void reloadLuaScripts();
+
 	// Manifest provisioner: copies `<Steam>/config/depotcache/*.manifest` to
 	// `<Steam>/depotcache/` so Steam's downloader can find them locally.
 	void provisionManifests();

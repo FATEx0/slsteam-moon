@@ -56,6 +56,15 @@ namespace Patterns
 
 	extern Pattern_t TraceIPC;
 
+	namespace SteamUI
+	{
+		extern Pattern_t AppControllerRunFrame;
+		extern Pattern_t GetAppByID;
+		extern Pattern_t MarkAppChange;
+		extern Pattern_t BuildCompleteAppOverviewChange;
+		extern Pattern_t OwnershipFlagsReference;
+	}
+
 	namespace CAPIJob
 	{
 		extern Pattern_t GetPlayerStats;
@@ -87,7 +96,17 @@ namespace Patterns
 		extern Pattern_t GetSubscribedApps;
 		extern Pattern_t PostCallback;
 		extern Pattern_t UpdateAppOwnershipTicket;
+		extern Pattern_t MarkLicenseAsChanged;
+		extern Pattern_t ProcessPendingLicenseUpdates;
 		extern Pattern_t NotifyLicensesUpdated;
+	}
+
+	namespace CAppInfoCache
+	{
+		extern Pattern_t GetOrAddAppData;
+		extern Pattern_t ThreadedReadFromDisk;
+		extern Pattern_t SkipFlagReference;
+		extern Pattern_t ShaReference;
 	}
 
 	namespace IClientAppManager

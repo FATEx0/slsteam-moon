@@ -4,7 +4,7 @@
 //
 // Hooks Steam's LoadPackage so that, when Steam loads PackageId 0
 // (the default anonymous package every account has), our
-// AdditionalApps from the SLSsteam config get appended to
+// managed app ids from stplug-in/luaappids get appended to
 // `pInfo->AppIdVec` via the resolved `CUtlMemoryGrow` helper.
 //
 // Why: Steam's depot eligibility filter walks every package and
@@ -17,6 +17,8 @@
 // pipeline.
 
 #pragma once
+
+#include "hotreload_types.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -38,7 +40,7 @@ namespace PackagePatch
 	// reinjects them.  Idempotent against the same id-set.
 	bool injectIntoPackage0(const std::vector<uint32_t>& appIds);
 
-	// Register additional appids (beyond the config's AdditionalApps)
+	// Register planner appids beyond the managed base-app source union
 	// that the LoadPackage detour must also inject into package 0 on
 	// every load.  Used for DLC appids discovered from each AddedApp's
 	// provisioned appinfo: Steam's install planner only schedules a
@@ -46,7 +48,7 @@ namespace PackagePatch
 	// AppIdVec.  Registering them here (rather than only doing a one-shot
 	// manual inject) keeps them present across package-0 reloads — e.g.
 	// the reload the license reconcile triggers — the same way the
-	// AdditionalApps are kept.  Merged with AdditionalApps at inject
+	// managed app ids are kept.  Merged with the managed source union at inject
 	// time; deduplicated.  Replaces any previously-set extra list.
 	void setExtraAppIds(const std::vector<uint32_t>& appIds);
 
@@ -58,10 +60,26 @@ namespace PackagePatch
 	// anything has been injected.
 	void tryReconcileLicenses();
 
-	// Hot-reload entry point.  When the config watcher sees new
-	// AdditionalApps added at runtime, this re-arms the one-shot reconcile
+	// Legacy hot-add entry point kept until the complete-snapshot watcher owns
+	// dispatch. This re-arms the one-shot reconcile
 	// gate and re-broadcasts LicensesUpdated_t so Steam re-reads ownership.
 	// Safe no-op if package 0 was never injected or the pattern didn't
 	// resolve.
 	void forceReconcileLicenses();
+
+	// Reconcile package 0 to one complete managed-state snapshot.  The caller
+	// is the OwnerWork command runner, so vector mutation and the mark/process
+	// pair execute as one serialized Steam-owned work unit.
+	void synchronizePackage0(const PackageSnapshot& snapshot);
+
+	// Full runtime-add capability: mark/process locators plus the scoped
+	// unresolved-app guard.  A metadata-complete snapshot can still be
+	// processed when the guard is unavailable; synchronizePackage0 decides that
+	// per transition.
+	bool runtimeRefreshReady();
+
+	// Retry the latest applied desired state without mutating package vectors.
+	// OwnerWork invokes this after consuming the lock-free appinfo-resolution
+	// signal on the owner frame.
+	void reprocessCurrentState() noexcept;
 }

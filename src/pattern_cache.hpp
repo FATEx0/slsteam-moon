@@ -48,6 +48,8 @@ namespace PatternCache
 	{
 		std::string_view symbol;
 		bool required = true;
+		std::string_view signature;
+		std::string_view followMode;
 	};
 
 	bool identityMatches(

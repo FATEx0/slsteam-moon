@@ -60,6 +60,8 @@
 #include <string>
 #include <vector>
 
+#include "feats/hotreload_types.hpp"
+
 namespace OwnerWork
 {
 	// How long a pending command may sit unclaimed before the escape hatch
@@ -171,6 +173,11 @@ namespace OwnerWork
 	// the license update, in that order, on the owner IPC thread. Returns
 	// without waiting for the owner.
 	Mode submitHotAdd(const std::vector<std::uint32_t>& appIds);
+
+	// Managed-state watcher handoff. The complete snapshot is coalesced by
+	// generation in the owner queue; the older hot-add API remains available
+	// until the watcher switches over in a later task.
+	Mode submitManagedState(const PackageSnapshot& snapshot);
 
 	// API-watcher install request. Also non-blocking.
 	Mode submitInstallApp(std::uint32_t appId, std::uint32_t library);

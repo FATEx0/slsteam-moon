@@ -87,6 +87,7 @@
 // with no Steam process (see tools/test_ownerqueue.cpp).
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -96,6 +97,8 @@
 #include <utility>
 #include <vector>
 
+#include "../feats/hotreload_types.hpp"
+
 namespace OwnerQueue
 {
 	// Default pending capacity. The realistic pending set is 1 injection +
@@ -103,9 +106,10 @@ namespace OwnerQueue
 	// to bound memory and to make overflow behaviour explicit and testable.
 	inline constexpr std::size_t kDefaultCapacity = 32;
 
-	// Per-command app-id cap. The hot-add command carries the whole active
-	// app set; a pathological config must not be able to make an unbounded
-	// copy live in the queue.
+	// Per-command id-list cap. The hot-add command carries the whole active
+	// app set, while a managed-state snapshot carries app and depot ids. Each
+	// list is checked independently so the bound never relies on overflowing
+	// size arithmetic.
 	inline constexpr std::size_t kMaxIdsPerCommand = 4096;
 
 	// Monotonic microseconds. Used for enqueue timestamps, so the staleness
@@ -125,6 +129,7 @@ namespace OwnerQueue
 		InjectPackage0 = 0,     // CUtlMemoryGrow on package 0's vectors
 		ReconcileLicenses = 1,  // NotifyLicensesUpdated broadcast
 		InstallApp = 2,         // IClientAppManager::InstallApp
+		SyncPackage0 = 3,       // complete managed package-0 snapshot
 	};
 
 	// Immutable command record. Construct through the factories; every
@@ -134,19 +139,24 @@ namespace OwnerQueue
 	public:
 		static Command injectPackage0(std::vector<std::uint32_t> appIds)
 		{
-			return Command(Kind::InjectPackage0, std::move(appIds), 0, 0);
+			return Command(Kind::InjectPackage0, std::move(appIds), 0, 0, {});
 		}
 		static Command reconcileLicenses()
 		{
-			return Command(Kind::ReconcileLicenses, {}, 0, 0);
+			return Command(Kind::ReconcileLicenses, {}, 0, 0, {});
 		}
 		static Command installApp(std::uint32_t appId, std::uint32_t library)
 		{
-			return Command(Kind::InstallApp, {}, appId, library);
+			return Command(Kind::InstallApp, {}, appId, library, {});
+		}
+		static Command syncPackage0(PackageSnapshot snapshot)
+		{
+			return Command(Kind::SyncPackage0, {}, 0, 0, std::move(snapshot));
 		}
 
 		Kind kind() const { return m_kind; }
 		const std::vector<std::uint32_t>& appIds() const { return m_appIds; }
+		const PackageSnapshot& packageSnapshot() const { return m_packageSnapshot; }
 		std::uint32_t appId() const { return m_appId; }
 		std::uint32_t library() const { return m_library; }
 
@@ -164,20 +174,25 @@ namespace OwnerQueue
 					return true;
 				case Kind::InstallApp:
 					return m_appId == other.m_appId && m_library == other.m_library;
+				case Kind::SyncPackage0:
+					return m_packageSnapshot == other.m_packageSnapshot;
 			}
 			return false;
 		}
 
 	private:
 		Command(Kind kind, std::vector<std::uint32_t> appIds,
-		        std::uint32_t appId, std::uint32_t library)
+		        std::uint32_t appId, std::uint32_t library,
+		        PackageSnapshot packageSnapshot)
 			: m_kind(kind), m_appIds(std::move(appIds)),
+			  m_packageSnapshot(std::move(packageSnapshot)),
 			  m_appId(appId), m_library(library)
 		{
 		}
 
 		Kind                       m_kind;
 		std::vector<std::uint32_t> m_appIds;
+		PackageSnapshot            m_packageSnapshot;
 		std::uint32_t              m_appId;
 		std::uint32_t              m_library;
 	};
@@ -498,6 +513,11 @@ namespace OwnerQueue
 		{
 			if (cmd.appIds().size() > m_maxIds)
 				return false;
+			if (cmd.kind() == Kind::SyncPackage0 &&
+			    (cmd.packageSnapshot().appIds.size() > m_maxIds ||
+			     cmd.packageSnapshot().depotIds.size() > m_maxIds ||
+			     cmd.packageSnapshot().addedAppIds.size() > m_maxIds))
+				return false;
 
 			for (std::size_t i = 0; i < into.size(); ++i)
 			{
@@ -529,6 +549,45 @@ namespace OwnerQueue
 					// for ever.
 					into[i] = Entry{ Command::injectPackage0(std::move(merged)),
 					                 pending.enqueuedUs };
+					if (result)
+						*result = PushResult::Coalesced;
+					return true;
+				}
+
+				if (cmd.kind() == Kind::SyncPackage0)
+				{
+					// A stale or equal-generation update is already represented by
+					// the pending record. Report it as Duplicate so the caller
+					// knows no newer owner work was added. A newer generation
+					// replaces only the payload and keeps the original age.
+					if (cmd.packageSnapshot().generation <=
+					    pending.cmd.packageSnapshot().generation)
+					{
+						if (result)
+							*result = PushResult::Duplicate;
+						return true;
+					}
+
+					const std::uint64_t oldest = pending.enqueuedUs;
+					PackageSnapshot replacement = cmd.packageSnapshot();
+					auto carriedAdditions = mergeIds(
+						pending.cmd.packageSnapshot().addedAppIds,
+						replacement.addedAppIds);
+					carriedAdditions.erase(
+						std::remove_if(carriedAdditions.begin(), carriedAdditions.end(),
+							[&replacement](std::uint32_t appId)
+							{
+								return std::find(replacement.appIds.begin(),
+								                 replacement.appIds.end(), appId) ==
+								       replacement.appIds.end();
+							}),
+						carriedAdditions.end());
+					std::sort(carriedAdditions.begin(), carriedAdditions.end());
+					if (carriedAdditions.size() > m_maxIds)
+						return false;
+					replacement.addedAppIds = std::move(carriedAdditions);
+					into[i] = Entry{
+						Command::syncPackage0(std::move(replacement)), oldest };
 					if (result)
 						*result = PushResult::Coalesced;
 					return true;

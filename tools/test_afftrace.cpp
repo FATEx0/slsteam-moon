@@ -92,6 +92,15 @@ static void test_opt_in_parsing()
 static void test_record_format_and_privacy()
 {
 	std::printf("[2] record format + privacy (pure)\n");
+	CHECK(std::strcmp(AffTrace::callName(AffTrace::Call::Package0Sync),
+	                  "package0_sync") == 0,
+	      "runtime package synchronization has a fixed symbolic label");
+	CHECK(std::strcmp(AffTrace::callName(AffTrace::Call::MarkLicenseChanged),
+	                  "mark_license_changed") == 0,
+	      "runtime mark call has a fixed symbolic label");
+	CHECK(std::strcmp(AffTrace::callName(AffTrace::Call::ProcessLicenseUpdates),
+	                  "process_license_updates") == 0,
+	      "runtime process call has a fixed symbolic label");
 	AffTrace::Record r;
 	r.seq = 7;
 	r.tMonoUs = 1234567;

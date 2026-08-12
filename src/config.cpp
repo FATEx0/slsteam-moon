@@ -6,15 +6,13 @@
 #include "config_default.hpp"
 #include "filewatcher.hpp"
 #include "log.hpp"
-#include "ownerwork.hpp"
 #include "yaml-cpp/yaml.h"
 
 #include "feats/appinfo_provision.hpp"
-#include "feats/appinfo_vdf.hpp"
 #include "feats/depotkey.hpp"
 #include "config_discovery.hpp"
+#include "feats/hotreload.hpp"
 #include "feats/manifestid.hpp"
-#include "feats/packagepatch.hpp"
 #include "feats/ticket.hpp"
 
 #include <cerrno>
@@ -249,7 +247,6 @@ static void onFileChange()
 	const auto afterManaged = g_config.managedAppIds.get();
 	const auto removals = ConfigDiscovery::classifyReloadRemovals(
 	    beforeManaged, afterManaged, before, after);
-	const bool hasManagedSourceAddition = !removals.managedAdded.empty();
 
 	// Active removals revoke ownership/package state and invalidate the
 	// app-scoped cache. A managed-source removal that remains active through
@@ -283,60 +280,36 @@ static void onFileChange()
 		             appId, cacheForgotten ? "cleared" : "partial");
 	}
 
-	// Re-scan manifest pins for every watcher event, not only when the app-id
-	// set changes: editing an existing <appid>.lua can change its depot/GID
-	// relations without changing AdditionalApps membership.
+	// Re-scan keys and manifest pins for every watcher event, not only when the
+	// app-id set changes: editing an existing <appid>.lua can change its
+	// depot/key/GID relations without changing managed-source membership.
+	DepotKey::reloadLuaScripts();
 	ManifestId::importLuaScripts();
 
-	// On a newly-seen appid, inject it into package 0 and re-broadcast the
-	// license update so it can appear without a Steam restart. (Runtime live
-	// library refresh is still incomplete.)
-	bool hasNewApp = false;
+	// Restore ticket artifacts before publishing a newly active managed id.
+	// Compatibility-only entries remain outside HotReload's package snapshot.
 	for (uint32_t appId : after)
 	{
 		if (!before.contains(appId))
 		{
-			hasNewApp = true;
 			Ticket::restoreApp(appId);
 		}
 	}
 
-	if (hasNewApp || hasManagedSourceAddition)
-	{
-		// Local (non-Steam) work stays on this thread, unchanged and in the
-		// same order as before.
-		DepotKey::importLuaScripts();
-
-		// Steam-owned work: same two calls, same order, same inputs, but
-		// executed on the owner IPC thread. This does NOT wait for the owner —
-		// the hot-add is already asynchronous from the user's point of view, so
-		// the watcher hands the work over and returns (see ownerwork.hpp for
-		// the measurements that ruled out a blocking handoff).
-		const auto ids = std::vector<uint32_t>(after.begin(), after.end());
-		const auto mode = OwnerWork::submitHotAdd(ids);
-
-		g_pLog->info("Config watcher: hot-add detected, package 0 injection + "
-		             "license broadcast dispatched %s\n", OwnerWork::modeName(mode));
-	}
-	if (hasManagedSourceAddition)
-	{
-		// The managed-only removal deliberately quarantines appinfo cache while
-		// preserving compatibility ownership. Rebuild that cache asynchronously
-		// for the next restart; never splice Steam's live appinfo from this
-		// watcher thread.
-		const auto appinfoPath = AppInfoVdf::findExistingPath();
-		if (!appinfoPath.empty())
-		{
-			AppInfoProvision::refreshInBackground(appinfoPath);
-			g_pLog->info("Config watcher: managed-source refresh requested for "
-			             "the next appinfo splice\n");
-		}
-	}
+	// Steam-owned package and license work is serialized by OwnerWork.  Only
+	// the stplug-in/luaappids union enters this complete desired-state snapshot.
+	HotReload::publish(afterManaged, true);
 }
 
 bool CConfig::init()
 {
-	if(createFile())
+	const bool created = createFile();
+	// Establish the first complete source union before the watcher can observe
+	// an event.  HotReload binds later, after hooks are placed, and reads this
+	// already-initialized value.
+	loadSettings();
+
+	if(created)
 	{
 		watcher = new CFileWatcher(onFileChange);
 		watcher->addFile(getPath().c_str());
@@ -358,7 +331,6 @@ bool CConfig::init()
 		watcher->start();
 	}
 
-	loadSettings();
 	return true;
 }
 

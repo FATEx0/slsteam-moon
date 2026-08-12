@@ -24,8 +24,8 @@
 #include "feats/apps.hpp"
 #include "feats/cefport.hpp"
 #include "feats/depotkey.hpp"
+#include "feats/hotreload.hpp"
 #include "feats/manifestid.hpp"
-#include "feats/packagepatch.hpp"
 #include "feats/steamstub.hpp"
 
 #include "libmem/libmem.h"
@@ -93,6 +93,7 @@ static bool cleanEnvVar(const char* varName, const char* endsWith)
 //__attribute__((noreturn))
 static void unload()
 {
+	HotReload::shutdown();
 	Hooks::remove();
 
 	//This is absolutely unnessecary for applications loading SLSsteam where it cancels from setup()
@@ -607,44 +608,25 @@ static void load()
 		ManifestId::importLuaScripts();
 	}
 
-	// Re-inject AdditionalApps into package 0 in case Steam already
-	// loaded it before our hook was placed.  No-op when the
-	// LoadPackage detour has already seeded the same ids.
+	// Keep the broader local DLC set used by launch-time checks. Runtime
+	// package ownership itself is published below from the managed source union.
 	{
 		std::lock_guard<std::mutex> passLock(
 		    AppInfoProvision::provisioningPassMutex());
-		const auto added = g_config.addedAppIds.get();
-
-		// Collect DLC ids from each managed app's provisioned appinfo.
-		// Depot-tagged ids are planner-critical; advertised-only ids enter
-		// package 0 only when own content is known, unless the compatibility
-		// switch InjectAllAdvertisedDlc is enabled.  The local appDlc list is
-		// broader and remains available to launch-time gates.
-		//
-		// Register the planner subset with PackagePatch so the LoadPackage
-		// detour keeps re-injecting it across package-0 reloads, then do the
-		// one-shot manual inject for the case Steam already loaded package 0.
 		bool dlcCollectionComplete = false;
 		const auto dlcIds = AppInfoProvision::collectDlcAppIdsForAddedApps(
 		    &dlcCollectionComplete);
-		// Only planner-relevant DLC ids enter PackagePatch.  The broader
-		// appDlc set still feeds launch-time legacy-CD-key suppression. Keep
-		// the previous state if a concurrent cache writer prevented a
-		// consistent collection snapshot.
 		if (dlcCollectionComplete)
 		{
-			PackagePatch::setExtraAppIds(dlcIds.package0);
 			Apps::setAddedAppDlcIds(dlcIds.appDlc);
 		}
-		const auto ids = AppInfoProvision::mergePackage0AppIds(
-		    added, dlcCollectionComplete ? dlcIds.package0
-	                                 : std::vector<uint32_t>{});
-
-		if (!ids.empty())
-		{
-			PackagePatch::injectIntoPackage0(ids);
-		}
 	}
+
+	// Hooks are now installed and source discovery/imports are complete. Bind
+	// the appinfo guard to its process-lifetime Store and submit the first
+	// complete package snapshot. The legacy config AdditionalApps list is not
+	// part of this runtime state.
+	HotReload::initialize();
 
 	if (g_config.notifyInit.get())
 	{

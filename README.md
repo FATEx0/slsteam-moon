@@ -27,6 +27,9 @@ Reference material:
   invoked by the wrapper-integration helper.
 - [Midrags / SFF / LumaCore](https://github.com/Midrags/SFF) —
   Windows reference port for the `LoadPackage` patch logic.
+- [OpenSteamTool](https://github.com/OpenSteam001/OpenSteamTool) —
+  some features were ported from or inspired by this project.
+  Full credit to its author.
 
 ## Support
 

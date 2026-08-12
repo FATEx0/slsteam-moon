@@ -326,7 +326,10 @@ bool PatternCache::policyMatches(
 	for (const auto& locator : catalog.locators)
 	{
 		const auto* compiledLocator = compiledEntry(locator, compiled);
-		if (compiledLocator == nullptr || compiledLocator->required != locator.required)
+		if (compiledLocator == nullptr ||
+			compiledLocator->required != locator.required ||
+			compiledLocator->signature != locator.signature ||
+			compiledLocator->followMode != locator.followMode)
 			return false;
 	}
 	for (const auto& compiledLocator : compiled)

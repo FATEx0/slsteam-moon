@@ -4,7 +4,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
 #include <string_view>
+#include <unordered_set>
+#include <vector>
 
 namespace AppInfoProvision
 {
@@ -39,6 +43,37 @@ inline bool shouldRerunPendingRefresh(bool asyncEnabled,
 inline bool shouldRequeueRefreshAfterStartFailure(bool workerMayStillExist)
 {
 	return !workerMayStillExist;
+}
+
+inline std::vector<std::uint32_t> mergeRuntimePublishCandidates(
+	std::vector<std::uint32_t> current,
+	const std::vector<std::uint32_t>& incoming)
+{
+	current.insert(current.end(), incoming.begin(), incoming.end());
+	std::sort(current.begin(), current.end());
+	current.erase(std::unique(current.begin(), current.end()), current.end());
+	current.erase(std::remove(current.begin(), current.end(), 0), current.end());
+	return current;
+}
+
+inline std::vector<std::uint32_t> selectRuntimePublishCandidates(
+	const std::vector<std::uint32_t>& requested,
+	const std::unordered_set<std::uint32_t>& managed,
+	const std::unordered_set<std::uint32_t>& synthetic)
+{
+	std::vector<std::uint32_t> selected;
+	selected.reserve(requested.size());
+	for (const std::uint32_t appId : requested)
+	{
+		if (appId != 0 && managed.count(appId) != 0 &&
+			synthetic.count(appId) != 0)
+		{
+			selected.push_back(appId);
+		}
+	}
+	std::sort(selected.begin(), selected.end());
+	selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+	return selected;
 }
 
 enum class PreinitProvisionAction

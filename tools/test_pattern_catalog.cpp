@@ -27,6 +27,14 @@ namespace
 		8192,
 		std::string(40, 'b'),
 	};
+	const PatternCatalog::ModuleIdentity steamUiExpected
+	{
+		"steamui",
+		"steamui.so",
+		std::string(64, 'a'),
+		8192,
+		std::string(40, 'b'),
+	};
 
 	std::string validToml()
 	{
@@ -65,6 +73,57 @@ namespace
 			text.replace(position, from.size(), to);
 	}
 
+	std::string hotReloadClientToml()
+	{
+		return validToml() +
+			"\n[[locators]]\n"
+			"symbol = \"Patterns::CAppInfoCache::GetOrAddAppData\"\n"
+			"name = \"CAppInfoCache::GetOrAddAppData\"\n"
+			"target_rva = 5000\n"
+			"match_rva = 5000\n"
+			"signature = \"E8 ? ? ? ? 05 ? ? ? ? 55 89 E5\"\n"
+			"follow_mode = \"None\"\n"
+			"resolver = \"signature\"\n"
+			"required = false\n"
+			"match_count = 1\n"
+			"target_count = 1\n"
+			"\n[[locators]]\n"
+			"symbol = \"Patterns::CAppInfoCache::ThreadedReadFromDisk\"\n"
+			"name = \"CAppInfoCache::ThreadedReadFromDisk\"\n"
+			"target_rva = 5050\n"
+			"match_rva = 5050\n"
+			"signature = \"55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 0C 11 00 00 8B 45 08 89 85 0C EF FF FF\"\n"
+			"follow_mode = \"None\"\n"
+			"resolver = \"signature\"\n"
+			"required = false\n"
+			"match_count = 1\n"
+			"target_count = 1\n"
+			"\n[[locators]]\n"
+			"symbol = \"Patterns::CAppInfoCache::SkipFlagReference\"\n"
+			"name = \"CAppInfoCache::SkipFlagReference\"\n"
+			"target_rva = 5100\n"
+			"match_rva = 5100\n"
+			"signature = \"80 7E 10 00 0F 44 C8\"\n"
+			"follow_mode = \"None\"\n"
+			"resolver = \"signature\"\n"
+			"required = false\n"
+			"match_count = 1\n"
+			"target_count = 1\n";
+	}
+
+	std::string steamUiToml()
+	{
+		auto body = validToml();
+		replaceOnce(body, "component = \"steamclient\"", "component = \"steamui\"");
+		replaceOnce(body, "module_name = \"steamclient.so\"", "module_name = \"steamui.so\"");
+		replaceOnce(body, "Patterns::Root", "Patterns::SteamUI::AppControllerRunFrame");
+		replaceOnce(body, "name = \"Root\"", "name = \"CSteamUIAppController::RunFrame\"");
+		replaceOnce(body, "signature = \"55 89 E5\"",
+			"signature = \"55 57 56 53 E8 ? ? ? ?\"");
+		replaceOnce(body, "required = true", "required = false");
+		return body;
+	}
+
 	void expectRejected(std::string body, std::string_view label)
 	{
 		std::string error;
@@ -91,22 +150,48 @@ int main()
 
 		const PatternCatalog::CompiledLocator allowed[] =
 		{
-			{"Patterns::Root", true},
+			{"Patterns::Root", true, "55 89 E5", "None"},
 		};
 		expect(parsed->validatePolicy(allowed),
 		       "metadata matches compiled symbol and required policy");
 		const PatternCatalog::CompiledLocator weakened[] =
 		{
-			{"Patterns::Root", false},
+			{"Patterns::Root", false, "55 89 E5", "None"},
 		};
 		expect(!parsed->validatePolicy(weakened),
 		       "metadata cannot change compiled optionality");
 		const PatternCatalog::CompiledLocator unrelated[] =
 		{
-			{"Patterns::Other", true},
+			{"Patterns::Other", true, "55 89 E5", "None"},
 		};
 		expect(!parsed->validatePolicy(unrelated),
 		       "metadata cannot introduce an uncompiled symbol");
+		const PatternCatalog::CompiledLocator signatureMismatch[] =
+		{
+			{"Patterns::Root", true, "55 8B EC", "None"},
+		};
+		expect(!parsed->validatePolicy(signatureMismatch),
+		       "signature mismatch falls back to the embedded resolver");
+		const PatternCatalog::CompiledLocator followMismatch[] =
+		{
+			{"Patterns::Root", true, "55 89 E5", "Relative"},
+		};
+		expect(!parsed->validatePolicy(followMismatch),
+		       "follow-mode mismatch falls back to the embedded resolver");
+		const PatternCatalog::CompiledLocator optionalAbsent[] =
+		{
+			{"Patterns::Root", true, "55 89 E5", "None"},
+			{"Patterns::Optional", false, "8B 45 08", "None"},
+		};
+		expect(parsed->validatePolicy(optionalAbsent),
+		       "an absent optional locator is legal");
+		const PatternCatalog::CompiledLocator requiredAbsent[] =
+		{
+			{"Patterns::Root", true, "55 89 E5", "None"},
+			{"Patterns::Required", true, "8B 45 08", "None"},
+		};
+		expect(!parsed->validatePolicy(requiredAbsent),
+		       "an absent required locator rejects the catalog");
 		const PatternCatalog::ExecutableRange executable[] =
 		{
 			{4096, 5000},
@@ -123,6 +208,56 @@ int main()
 		       "RVA outside executable segments is ignored");
 		expect(!parsed->executableTarget("Patterns::Root", true, 4096, executable),
 		       "RVA outside the current module is ignored");
+	}
+
+	{
+		auto client = PatternCatalog::parseCanonical(
+			hotReloadClientToml(), expected, &error);
+		expect(client.has_value(),
+		       "exact client catalog accepts optional function and instruction locators");
+		if (client)
+		{
+			const PatternCatalog::CompiledLocator policy[] =
+			{
+				{"Patterns::Root", true, "55 89 E5", "None"},
+				{"Patterns::CAppInfoCache::GetOrAddAppData", false,
+				 "E8 ? ? ? ? 05 ? ? ? ? 55 89 E5", "None"},
+				{"Patterns::CAppInfoCache::ThreadedReadFromDisk", false,
+				 "55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 0C 11 00 00 8B 45 08 89 85 0C EF FF FF", "None"},
+				{"Patterns::CAppInfoCache::SkipFlagReference", false,
+				 "80 7E 10 00 0F 44 C8", "None"},
+			};
+			expect(client->validatePolicy(policy),
+			       "hot-reload client locator metadata matches exactly");
+			expect(client->entry("Patterns::CAppInfoCache::GetOrAddAppData") != nullptr &&
+			       !client->entry("Patterns::CAppInfoCache::GetOrAddAppData")->required,
+			       "optional client function remains optional");
+			expect(client->entry(
+				"Patterns::CAppInfoCache::ThreadedReadFromDisk") != nullptr &&
+			       !client->entry(
+				"Patterns::CAppInfoCache::ThreadedReadFromDisk")->required,
+			       "optional live disk reload remains optional");
+			expect(client->target("Patterns::CAppInfoCache::SkipFlagReference") == 5100,
+			       "instruction-site lookup keeps its exact RVA");
+		}
+	}
+	{
+		const auto body = steamUiToml();
+		auto ui = PatternCatalog::parseCanonical(body, steamUiExpected, &error);
+		expect(ui.has_value(), "exact SteamUI catalog parses in the SteamUI module");
+		if (ui)
+		{
+			const PatternCatalog::CompiledLocator policy[] =
+			{
+				{"Patterns::SteamUI::AppControllerRunFrame", false,
+				 "55 57 56 53 E8 ? ? ? ?", "None"},
+			};
+			expect(ui->validatePolicy(policy),
+			       "SteamUI locator is independently addressable and optional");
+		}
+		auto wrongModule = PatternCatalog::parseCanonical(body, expected, &error);
+		expect(!wrongModule,
+		       "a SteamUI catalog cannot supply a steamclient locator");
 	}
 
 	{

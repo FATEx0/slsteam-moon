@@ -39,6 +39,25 @@ namespace DepotKey
 			return m_done;
 		}
 
+		// Watcher-triggered imports deliberately run again after startup while
+		// retaining the same serialization boundary.  They do not consume or
+		// reset the one-shot startup state.
+		template <typename Ready, typename Import>
+		bool rerun(Ready&& ready, Import&& import) noexcept
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			try
+			{
+				if (!ready()) return false;
+				import();
+				return true;
+			}
+			catch (...)
+			{
+				return false;
+			}
+		}
+
 	private:
 		mutable std::mutex m_mutex;
 		bool m_done = false;

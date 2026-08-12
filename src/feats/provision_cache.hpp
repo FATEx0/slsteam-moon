@@ -21,12 +21,147 @@
 
 #pragma once
 
+#include <charconv>
 #include <cstdint>
+#include <limits>
+#include <string_view>
 
 namespace AppInfoProvision
 {
 namespace cache
 {
+
+struct CacheMetadataView
+{
+	std::uint32_t appId = 0;
+	std::uint64_t wireSize = 0;
+	std::string_view shaBase64;
+	bool hasSynthetic = false;
+	bool synthetic = false;
+};
+
+// Parse the small metadata format emitted by persistBuffer without invoking
+// yaml-cpp. YAML::LoadFile reports a missing/malformed file by throwing; the
+// portable optimized build cannot reliably unwind that throw from a watcher
+// pthread, so a cache miss must be represented as an ordinary false result.
+inline bool parseCacheMetadata(
+	std::string_view text,
+	CacheMetadataView& output) noexcept
+{
+	CacheMetadataView parsed;
+	bool appIdSeen = false;
+	bool wireSizeSeen = false;
+	bool shaSeen = false;
+	bool changeSeen = false;
+	bool normalizedSeen = false;
+	bool syntheticSeen = false;
+
+	const auto parseUnsigned = [](
+		std::string_view value,
+		std::uint64_t& result) noexcept
+	{
+		if (value.empty()) return false;
+		result = 0;
+		const auto converted = std::from_chars(
+			value.data(), value.data() + value.size(), result, 10);
+		return converted.ec == std::errc{} &&
+			converted.ptr == value.data() + value.size();
+	};
+	const auto parseBool = [](
+		std::string_view value,
+		bool& result) noexcept
+	{
+		if (value == "true") { result = true; return true; }
+		if (value == "false") { result = false; return true; }
+		return false;
+	};
+
+	std::size_t cursor = 0;
+	while (cursor < text.size())
+	{
+		const std::size_t newline = text.find('\n', cursor);
+		const std::size_t end = newline == std::string_view::npos
+			? text.size() : newline;
+		const std::string_view line = text.substr(cursor, end - cursor);
+		cursor = newline == std::string_view::npos ? text.size() : newline + 1;
+		if (line.empty() || line.find('\r') != std::string_view::npos)
+			return false;
+
+		const std::size_t separator = line.find(": ");
+		if (separator == std::string_view::npos || separator == 0 ||
+			separator + 2 >= line.size())
+		{
+			return false;
+		}
+		const std::string_view key = line.substr(0, separator);
+		const std::string_view value = line.substr(separator + 2);
+		std::uint64_t number = 0;
+
+		if (key == "appid")
+		{
+			if (appIdSeen || !parseUnsigned(value, number) || number == 0 ||
+				number > std::numeric_limits<std::uint32_t>::max())
+				return false;
+			appIdSeen = true;
+			parsed.appId = static_cast<std::uint32_t>(number);
+		}
+		else if (key == "change_number")
+		{
+			if (changeSeen || !parseUnsigned(value, number) ||
+				number > std::numeric_limits<std::uint32_t>::max())
+				return false;
+			changeSeen = true;
+		}
+		else if (key == "wire_size")
+		{
+			if (wireSizeSeen || !parseUnsigned(value, number) || number == 0)
+				return false;
+			wireSizeSeen = true;
+			parsed.wireSize = number;
+		}
+		else if (key == "sha_b64")
+		{
+			// A SHA-1 digest is exactly 20 bytes, whose canonical Base64
+			// representation is 27 alphabet characters plus one '='.  Reject
+			// every other padding layout here so from_base64 cannot throw later.
+			if (shaSeen || value.size() != 28 || value.back() != '=')
+				return false;
+			for (const unsigned char byte : value.substr(0, value.size() - 1))
+			{
+				const bool valid =
+					(byte >= 'A' && byte <= 'Z') ||
+					(byte >= 'a' && byte <= 'z') ||
+					(byte >= '0' && byte <= '9') || byte == '+' || byte == '/';
+				if (!valid) return false;
+			}
+			shaSeen = true;
+			parsed.shaBase64 = value;
+		}
+		else if (key == "normalized")
+		{
+			bool ignored = false;
+			if (normalizedSeen || !parseBool(value, ignored))
+				return false;
+			normalizedSeen = true;
+		}
+		else if (key == "synthetic")
+		{
+			if (syntheticSeen || !parseBool(value, parsed.synthetic))
+				return false;
+			syntheticSeen = true;
+			parsed.hasSynthetic = true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	if (!appIdSeen || !wireSizeSeen || !shaSeen)
+		return false;
+	output = parsed;
+	return true;
+}
 
 // Identity of the on-disk buffer used as the memoization key for its
 // expensive YAML/SHA-1/VDF validation.  Seconds plus size are not enough:

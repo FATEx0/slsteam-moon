@@ -128,8 +128,13 @@ bool asyncProvisioningEnabled();
 // Start one detached refresh pass from a post-setup worker context, such as
 // the PICS receive path or the config watcher. Never call it from setup() or
 // the LD_AUDIT la_preinit path. Existing buffers are refreshed asynchronously;
-// the next Steam start consumes the new pair.
+// the next Steam start consumes the new pair. The overload carrying
+// `runtimePublishApps` also asks Steam's live appinfo cache to re-read validated
+// synthetic entries for exactly those newly managed ids.
 void refreshInBackground(const std::string& appinfoVdfPath);
+void refreshInBackground(
+    const std::string& appinfoVdfPath,
+    const std::vector<uint32_t>& runtimePublishApps);
 
 // Common lock held while the cache's .bin/.yaml pair is read or published.
 // Keep this inline because AppInfoVdf's standalone transaction test links

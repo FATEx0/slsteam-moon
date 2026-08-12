@@ -38,11 +38,13 @@ static int g_failures = 0;
 int main()
 {
 	using AppInfoProvision::cache::CacheUse;
+	using AppInfoProvision::cache::CacheMetadataView;
 	using AppInfoProvision::cache::CacheRecordFacts;
 	using AppInfoProvision::cache::CacheValidationKey;
 	using AppInfoProvision::cache::cachePublicationAllowed;
 	using AppInfoProvision::cache::chooseCacheUse;
 	using AppInfoProvision::cache::protonPublicationAllowed;
+	using AppInfoProvision::cache::parseCacheMetadata;
 	using AppInfoProvision::cache::syntheticMarkerConsistent;
 	using AppInfoProvision::cache::syntheticMarkerPublicationConsistent;
 	using AppInfoProvision::cache::syntheticMarkerStateConsistent;
@@ -53,6 +55,37 @@ int main()
 	using AppInfoProvision::cache::shouldPreserveCacheFromRawPics;
 	using AppInfoProvision::cache::shouldPreserveSyntheticMarker;
 	using AppInfoProvision::cache::wireSizeMatches;
+
+	CacheMetadataView metadata{};
+	CHECK(!parseCacheMetadata("", metadata),
+	      "missing cache metadata is rejected without a parser exception");
+	CHECK(!parseCacheMetadata("synthetic: false\n", metadata),
+	      "incomplete cache metadata is rejected");
+	CHECK(!parseCacheMetadata(
+	          "appid: 3405340\nchange_number: 1\nwire_size: 8192\n"
+	          "sha_b64: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\nnormalized: true\n"
+	          "synthetic: false\nbroken yaml\n",
+	          metadata),
+	      "malformed cache metadata is rejected even with a valid synthetic field");
+	CHECK(!parseCacheMetadata(
+	          "appid: 3405340\nchange_number: 1\nwire_size: 8192\n"
+	          "sha_b64: AAAAAAAAAAAAA=AAAAAAAAAAAAAA\nnormalized: true\n"
+	          "synthetic: false\n",
+	          metadata),
+	      "non-canonical SHA padding is rejected before Base64 decoding");
+	CHECK(parseCacheMetadata(
+	          "appid: 3405340\nchange_number: 1\nwire_size: 8192\n"
+	          "sha_b64: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\nnormalized: true\n"
+	          "synthetic: false\n",
+	          metadata) &&
+	      metadata.appId == 3405340 && metadata.wireSize == 8192 &&
+	      metadata.hasSynthetic && !metadata.synthetic,
+	      "generated cache metadata is parsed without yaml-cpp");
+	CHECK(parseCacheMetadata(
+	          "appid: 3405340\nchange_number: 1\nwire_size: 8192\n"
+	          "sha_b64: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\nnormalized: true\n",
+	          metadata) && !metadata.hasSynthetic,
+	      "legacy cache metadata without explicit provenance remains readable");
 
 	const CacheValidationKey fileIdentity{
 	    .appId = 420530,

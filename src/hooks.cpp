@@ -18,6 +18,7 @@
 #include "sdk/IClientUtils.hpp"
 
 #include "feats/achievements.hpp"
+#include "feats/appinfostate.hpp"
 #include "feats/appticket.hpp"
 #include "feats/apps.hpp"
 #include "feats/depotkey.hpp"
@@ -27,6 +28,7 @@
 #include "feats/manifestbind.hpp"
 #include "feats/misc.hpp"
 #include "feats/fakeappid.hpp"
+#include "feats/libraryremoval.hpp"
 #include "feats/packagepatch.hpp"
 #include "feats/parental.hpp"
 #include "feats/pics.hpp"
@@ -1285,7 +1287,15 @@ bool Hooks::setup()
 
 	Hooks::place();
 
+	// AppInfoState keeps this non-owning Store* in its hot path.  The static
+	// lifetime is part of the manual-detour contract: it must outlive every
+	// installed or disabled-hooked detour and every in-flight reader.  Task 7's
+	// coordinator Store must provide the same lifetime before rebinding here.
+	static HotReloadState::Store bootstrapStore;
+	(void)AppInfoState::setup(bootstrapStore);
+
 	PackagePatch::setup();
+	(void)LibraryRemoval::setup();
 	ManifestBind::setup();
 	DepotQuarantine::setup();
 	ReconcilePin::setup();
@@ -1381,6 +1391,13 @@ void Hooks::remove()
 		g_pLog->info("Hooks::remove: no hook placement to tear down; owner-thread work "
 		             "queue left accepting work\n");
 	}
+
+	// Stop the optional UI queue before any of its SteamUI detours are restored.
+	LibraryRemoval::remove();
+
+	// AppInfoState performs the quiescent manual five-byte restore here, before
+	// any other hook or package state can tear down the original call path.
+	AppInfoState::remove();
 
 	TraceIPC.remove();
 

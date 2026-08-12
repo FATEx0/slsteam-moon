@@ -4,6 +4,7 @@
 #include "../vftableinfo.hpp"
 
 #include <cstdint>
+#include <limits>
 
 int32_t IClientApps::getAppData(uint32_t appId, const char* name, const char* pChOut, uint32_t outSize)
 {
@@ -30,6 +31,21 @@ uint32_t IClientApps::getAppDataSection(uint32_t appId, EAppInfoSection section,
 		 outSize,
 		 1
 	);
+}
+
+bool IClientApps::requestAppInfoUpdate(const std::vector<uint32_t>& appIds)
+{
+	if (appIds.empty() ||
+		appIds.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+	{
+		return false;
+	}
+	return MemHlp::callVFunc<
+		bool(*)(void*, const uint32_t*, int)>(
+			VFTIndexes::IClientApps::RequestAppInfoUpdate,
+			this,
+			appIds.data(),
+			static_cast<int>(appIds.size()));
 }
 
 EAppType IClientApps::getAppType(uint32_t appId)

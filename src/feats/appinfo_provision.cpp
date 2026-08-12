@@ -5,6 +5,8 @@
 #include "appinfo_provision.hpp"
 #include "provision_result.hpp"
 
+#include "appinfo_vdf.hpp"
+#include "appinfostate.hpp"
 #include "cmclient.hpp"
 #include "compattool.hpp"
 #include "depotkey.hpp"
@@ -105,6 +107,7 @@ std::mutex g_refreshScheduleMu;
 bool g_refreshInFlight = false;
 bool g_refreshPending = false;
 std::string g_refreshPendingPath;
+std::vector<std::uint32_t> g_refreshPendingRuntimeApps;
 std::uint64_t g_refreshWorkerToken = 0;
 std::mutex g_coldRetryMu;
 std::chrono::steady_clock::time_point g_coldRetryAfter{};
@@ -1484,21 +1487,66 @@ private:
 	const char* end_;
 };
 
+bool readCacheMetadataFile(
+	uint32_t appId,
+	std::string& storage,
+	cache::CacheMetadataView& metadata,
+	std::string* diag = nullptr)
+{
+	const auto reject = [&](const char* message)
+	{
+		if (diag) *diag = message;
+		return false;
+	};
+
+	std::ifstream input(getMetaPath(appId), std::ios::binary | std::ios::ate);
+	if (!input.is_open()) return reject("metadata is missing");
+	const std::streamsize rawSize = input.tellg();
+	if (rawSize <= 0 || rawSize > (64LL << 10))
+		return reject("metadata size is outside the accepted range");
+
+	storage.assign(static_cast<std::size_t>(rawSize), '\0');
+	input.seekg(0, std::ios::beg);
+	if (!input.read(storage.data(), rawSize) || input.gcount() != rawSize)
+		return reject("metadata read failed");
+	if (!cache::parseCacheMetadata(storage, metadata))
+		return reject("metadata format is invalid");
+	return true;
+}
+
+bool cacheMetadataMarkerAllowsRead(
+	uint32_t appId,
+	const cache::CacheMetadataView& metadata)
+{
+	{
+		std::lock_guard<std::mutex> invalidationLock(g_cacheReadInvalidationMu);
+		if (g_cacheReadInvalidated.count(appId) != 0)
+			return false;
+	}
+	const bool markerPresent = SynthMark::isMarked(getCacheDir(), appId);
+	return cache::syntheticMarkerStateConsistent(
+		metadata.hasSynthetic, metadata.synthetic, markerPresent);
+}
+
 bool readValidatedCacheBufferLocked(uint32_t appId, std::string& wireOut,
                                     std::string& diag)
 {
 	try
 	{
-		if (!cacheMarkerAllowsRead(appId))
+		std::string metadataText;
+		cache::CacheMetadataView metadata;
+		if (!readCacheMetadataFile(
+				appId, metadataText, metadata, &diag))
+		{
+			return false;
+		}
+		if (!cacheMetadataMarkerAllowsRead(appId, metadata))
 		{
 			diag = "synthetic marker state is inconsistent";
 			return false;
 		}
-		const YAML::Node meta = YAML::LoadFile(getMetaPath(appId));
-		const uint32_t metadataAppId = meta["appid"].as<uint32_t>();
-		const size_t declaredSize = meta["wire_size"].as<size_t>();
 		const std::string declaredSha = std::string(
-		    base64::from_base64(meta["sha_b64"].as<std::string>()));
+		    base64::from_base64(std::string(metadata.shaBase64)));
 
 		std::ifstream ifs(getBufferPath(appId), std::ios::binary | std::ios::ate);
 		if (!ifs.is_open()) { diag = "buffer is missing"; return false; }
@@ -1526,8 +1574,8 @@ bool readValidatedCacheBufferLocked(uint32_t appId, std::string& wireOut,
 		const bool parsed = appNode && appNode.IsMap() && appNode.size() > 0;
 		const cache::CacheRecordFacts facts{
 		    .requestedAppId = appId,
-		    .metadataAppId = metadataAppId,
-		    .declaredSize = declaredSize,
+		    .metadataAppId = metadata.appId,
+		    .declaredSize = metadata.wireSize,
 		    .actualSize = wire.size(),
 		    .shaSize = declaredSha.size(),
 		    .shaMatches = declaredSha == actualSha,
@@ -1558,17 +1606,11 @@ bool hasValidatedCachedBuffer(uint32_t appId, std::string& diag)
 bool cachedWireSizeMatches(uint32_t appId, long long actualSize)
 {
 	if (actualSize <= 0) return false;
-	try
-	{
-		const YAML::Node meta = YAML::LoadFile(getMetaPath(appId));
-		const auto declaredSize = meta["wire_size"].as<unsigned long long>();
-		return cache::wireSizeMatches(
-		    static_cast<unsigned long long>(actualSize), declaredSize);
-	}
-	catch (...)
-	{
-		return false;
-	}
+	std::string metadataText;
+	cache::CacheMetadataView metadata;
+	return readCacheMetadataFile(appId, metadataText, metadata) &&
+		cache::wireSizeMatches(
+			static_cast<unsigned long long>(actualSize), metadata.wireSize);
 }
 
 cache::CacheUse cacheUseForApp(uint32_t appId, bool refreshUnavailable)
@@ -1851,29 +1893,27 @@ bool isSynthesizedAppLocked(uint32_t appId)
 	if (invalidated && !active) return false;
 	const bool markerPresent = SynthMark::isMarked(getCacheDir(), appId);
 	if (!markerPresent) return false;
-	try
+	std::string metadataText;
+	cache::CacheMetadataView metadata;
+	if (readCacheMetadataFile(appId, metadataText, metadata))
 	{
-		const YAML::Node meta = YAML::LoadFile(getMetaPath(appId));
-		const YAML::Node syntheticNode = meta["synthetic"];
-		if (syntheticNode)
-			return syntheticNode.as<bool>();
+		if (metadata.hasSynthetic)
+			return metadata.synthetic;
 		// Before explicit provenance metadata existed, the persisted marker
 		// itself was the synthetic bit. Preserve that behavior for existing
 		// installations instead of requiring migration on first boot.
 		return true;
 	}
-	catch (...)
-	{
-		// Managed-source cleanup deliberately retains the marker after moving
-		// the cache pair. An active compatibility app must remain protected by
-		// that marker until a new publication or full removal reconciles it.
-		std::error_code metadataError;
-		const bool metadataPresent = std::filesystem::exists(
-		    getMetaPath(appId), metadataError);
-		return !metadataError &&
-		       cache::retainedSyntheticMarkerProtectionAllowed(
-		           markerPresent, metadataPresent, active);
-	}
+
+	// Managed-source cleanup deliberately retains the marker after moving
+	// the cache pair. An active compatibility app must remain protected by
+	// that marker until a new publication or full removal reconciles it.
+	std::error_code metadataError;
+	const bool metadataPresent = std::filesystem::exists(
+	    getMetaPath(appId), metadataError);
+	return !metadataError &&
+	       cache::retainedSyntheticMarkerProtectionAllowed(
+	           markerPresent, metadataPresent, active);
 }
 
 } // namespace
@@ -2564,6 +2604,63 @@ enum class RefreshWorkerStartResult
 	Uncertain,
 };
 
+void publishRuntimeAppInfo(
+    const std::string& appinfoVdfPath,
+    const std::vector<std::uint32_t>& requested)
+{
+	const auto selected = selectRuntimePublishCandidates(
+		requested, g_config.managedAppIds.get(), SynthMark::loadAll(getCacheDir()));
+	if (selected.empty())
+		return;
+
+	// A pre-existing validated synthetic pair is an explicit fallback for this
+	// just-added app even when its async freshness window elapsed.  The splice
+	// remains transactional and AppInfoVdf revalidates the complete pair.
+	const std::unordered_set<std::uint32_t> explicitFallback(
+		selected.begin(), selected.end());
+	if (AppInfoVdf::injectAllCached(appinfoVdfPath, explicitFallback) == 0)
+	{
+		g_pLog->warn(
+			"AppInfoProvision: live synthetic appinfo splice failed for %zu app(s); "
+			"restart remains available\n",
+			selected.size());
+		return;
+	}
+
+	const AppInfoReload::Result reloaded =
+		AppInfoState::reloadFromDisk(selected);
+	switch (reloaded.status)
+	{
+		case AppInfoReload::Status::Unavailable:
+			g_pLog->warn(
+				"AppInfoProvision: live appinfo disk reload unavailable for %zu "
+				"synthetic app(s); restart remains available\n",
+				selected.size());
+			break;
+		case AppInfoReload::Status::ReadFailed:
+			g_pLog->warn(
+				"AppInfoProvision: Steam rejected live appinfo disk reload for %zu "
+				"synthetic app(s); restart remains available\n",
+				selected.size());
+			break;
+		case AppInfoReload::Status::Loaded:
+			if (reloaded.resolved == 0)
+			{
+				g_pLog->warn(
+					"AppInfoProvision: live appinfo reload completed but no current "
+					"synthetic app resolved; restart remains available\n");
+			}
+			else
+			{
+				g_pLog->info(
+					"AppInfoProvision: published %zu synthetic app(s) into the live "
+					"appinfo cache\n",
+					reloaded.resolved);
+			}
+			break;
+	}
+}
+
 void refreshWorkerStartFailed() noexcept
 {
 	if (g_pLog)
@@ -2582,18 +2679,20 @@ void resetRefreshAfterStartFailure(std::uint64_t token) noexcept
 void finishRefresh(const std::string& completedPath, std::uint64_t token);
 
 RefreshWorkerStartResult startRefreshWorker(
-    const std::string& appinfoVdfPath, std::uint64_t token)
+    const std::string& appinfoVdfPath, std::uint64_t token,
+    const std::vector<std::uint32_t>& runtimePublishApps)
 {
 	bool workerMayStillExist = false;
 	const bool started = ThreadStart::startDetached(
-		[path = appinfoVdfPath, token]
+		[path = appinfoVdfPath, token, runtimePublishApps]
 		{
 			ThreadStart::runGuarded(
-				[path]
+				[path, runtimePublishApps]
 				{
 					ScopedNotifySuppression suppression;
 					BootProf::Span profile(g_pLog.get(), "provision.async");
 					provisionAllAddedApps(path, false);
+					publishRuntimeAppInfo(path, runtimePublishApps);
 				},
 				[]
 				{
@@ -2622,7 +2721,8 @@ RefreshWorkerStartResult startRefreshWorker(
 
 void retainRefreshAfterFailedStart(const std::string& appinfoVdfPath,
                                    std::uint64_t token,
-                                   RefreshWorkerStartResult result)
+                                   RefreshWorkerStartResult result,
+                                   const std::vector<std::uint32_t>& runtimePublishApps)
 {
 	if (result != RefreshWorkerStartResult::NotStarted ||
 	    !shouldRequeueRefreshAfterStartFailure(/*workerMayStillExist=*/false))
@@ -2638,11 +2738,14 @@ void retainRefreshAfterFailedStart(const std::string& appinfoVdfPath,
 	g_refreshPending = true;
 	if (g_refreshPendingPath.empty())
 		g_refreshPendingPath = appinfoVdfPath;
+	g_refreshPendingRuntimeApps = mergeRuntimePublishCandidates(
+		std::move(g_refreshPendingRuntimeApps), runtimePublishApps);
 }
 
 void finishRefresh(const std::string& completedPath, std::uint64_t token)
 {
 	std::string nextPath;
+	std::vector<std::uint32_t> nextRuntimePublishApps;
 	std::uint64_t nextToken = 0;
 	{
 		std::lock_guard<std::mutex> lock(g_refreshScheduleMu);
@@ -2656,6 +2759,7 @@ void finishRefresh(const std::string& completedPath, std::uint64_t token)
 		{
 			g_refreshPending = false;
 			g_refreshPendingPath.clear();
+			g_refreshPendingRuntimeApps.clear();
 			g_refreshInFlight = false;
 			return;
 		}
@@ -2663,19 +2767,32 @@ void finishRefresh(const std::string& completedPath, std::uint64_t token)
 		nextPath = g_refreshPendingPath.empty()
 		               ? completedPath
 		               : g_refreshPendingPath;
+		nextRuntimePublishApps = std::move(g_refreshPendingRuntimeApps);
 		g_refreshPending = false;
 		g_refreshPendingPath.clear();
+		g_refreshPendingRuntimeApps.clear();
 		// Keep the gate closed while handing the queued request to the next
 		// worker. A request arriving in this window queues behind that worker.
 		nextToken = ++g_refreshWorkerToken;
 	}
 
-	const auto startResult = startRefreshWorker(nextPath, nextToken);
-	retainRefreshAfterFailedStart(nextPath, nextToken, startResult);
+	const auto startResult = startRefreshWorker(
+		nextPath, nextToken, nextRuntimePublishApps);
+	retainRefreshAfterFailedStart(
+		nextPath, nextToken, startResult, nextRuntimePublishApps);
 }
 
 void refreshInBackground(const std::string& appinfoVdfPath)
 {
+	refreshInBackground(appinfoVdfPath, {});
+}
+
+void refreshInBackground(
+	const std::string& appinfoVdfPath,
+	const std::vector<std::uint32_t>& runtimePublishApps)
+{
+	std::string workerPath = appinfoVdfPath;
+	std::vector<std::uint32_t> workerRuntimePublishApps;
 	std::uint64_t token = 0;
 	{
 		std::lock_guard<std::mutex> lock(g_refreshScheduleMu);
@@ -2689,17 +2806,26 @@ void refreshInBackground(const std::string& appinfoVdfPath)
 		{
 			g_refreshPending = true;
 			g_refreshPendingPath = appinfoVdfPath;
+			g_refreshPendingRuntimeApps = mergeRuntimePublishCandidates(
+				std::move(g_refreshPendingRuntimeApps), runtimePublishApps);
 			return;
 		}
 
+		if (!g_refreshPendingPath.empty())
+			workerPath = g_refreshPendingPath;
+		workerRuntimePublishApps = mergeRuntimePublishCandidates(
+			std::move(g_refreshPendingRuntimeApps), runtimePublishApps);
 		g_refreshInFlight = true;
 		g_refreshPending = false;
 		g_refreshPendingPath.clear();
+		g_refreshPendingRuntimeApps.clear();
 		token = ++g_refreshWorkerToken;
 	}
 
-	const auto startResult = startRefreshWorker(appinfoVdfPath, token);
-	retainRefreshAfterFailedStart(appinfoVdfPath, token, startResult);
+	const auto startResult = startRefreshWorker(
+		workerPath, token, workerRuntimePublishApps);
+	retainRefreshAfterFailedStart(
+		workerPath, token, startResult, workerRuntimePublishApps);
 }
 
 DlcInjectionIds collectDlcAppIdsForAddedApps(bool* complete)
@@ -2942,27 +3068,10 @@ void clearCacheReadInvalidation(uint32_t appId)
 bool cacheMarkerAllowsRead(uint32_t appId)
 {
 	if (appId == 0) return false;
-	{
-		std::lock_guard<std::mutex> invalidationLock(g_cacheReadInvalidationMu);
-		if (g_cacheReadInvalidated.count(appId) != 0)
-			return false;
-	}
-	try
-	{
-		const YAML::Node meta = YAML::LoadFile(getMetaPath(appId));
-		const bool markerPresent = SynthMark::isMarked(getCacheDir(), appId);
-		const YAML::Node syntheticNode = meta["synthetic"];
-		const bool hasSyntheticMetadata = syntheticNode.IsDefined();
-		const bool synthetic = hasSyntheticMetadata
-		    ? syntheticNode.as<bool>()
-		    : false;
-		return cache::syntheticMarkerStateConsistent(
-		    hasSyntheticMetadata, synthetic, markerPresent);
-	}
-	catch (...)
-	{
-		return false;
-	}
+	std::string metadataText;
+	cache::CacheMetadataView metadata;
+	return readCacheMetadataFile(appId, metadataText, metadata) &&
+		cacheMetadataMarkerAllowsRead(appId, metadata);
 }
 
 bool isSynthesizedApp(uint32_t appId)

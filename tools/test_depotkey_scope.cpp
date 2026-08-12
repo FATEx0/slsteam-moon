@@ -120,6 +120,11 @@ int main()
 	      "completed Lua import rejects later claims");
 	CHECK(imported == 1,
 	      "completed Lua import remains idempotent");
+	CHECK(importGate.rerun([&] { return prerequisitesReady; },
+	                       [&] { ++imported; }),
+	      "watcher rescan runs after the startup gate completed");
+	CHECK(imported == 2,
+	      "watcher rescan executes the importer exactly once per request");
 
 	// A failed import must also leave the gate retryable, rather than
 	// permanently suppressing the next startup/watcher attempt.

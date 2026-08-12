@@ -97,9 +97,12 @@ namespace AffTrace
 		None = 0,
 		OnModify,               // watcher callback
 		Package0Inject,         // package-0 injection unit of work
+		Package0Sync,           // complete desired-state package reconciliation
 		LicenseReconcile,       // license broadcast unit of work
 		InstallApp,             // app-manager install unit of work
 		CutlMemoryGrow,         // resolved Steam CUtlMemoryGrow
+		MarkLicenseChanged,     // resolved CUser package-change marker
+		ProcessLicenseUpdates,  // resolved CUser pending-update processor
 		NotifyLicensesUpdated,  // Steam NotifyLicensesUpdated
 		RunIpcFrame,            // IClientUtils::RunIPCFrame
 		Drain,                  // owner-thread queue drain
@@ -191,9 +194,12 @@ namespace AffTrace
 			case Call::None:                  return "none";
 			case Call::OnModify:              return "on_modify";
 			case Call::Package0Inject:        return "package0_inject";
+			case Call::Package0Sync:          return "package0_sync";
 			case Call::LicenseReconcile:      return "license_reconcile";
 			case Call::InstallApp:            return "install_app";
 			case Call::CutlMemoryGrow:        return "cutlmemory_grow";
+			case Call::MarkLicenseChanged:    return "mark_license_changed";
+			case Call::ProcessLicenseUpdates: return "process_license_updates";
 			case Call::NotifyLicensesUpdated: return "notify_licenses_updated";
 			case Call::RunIpcFrame:           return "run_ipc_frame";
 			case Call::Drain:                 return "drain";

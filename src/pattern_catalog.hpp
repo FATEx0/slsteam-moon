@@ -41,6 +41,8 @@ namespace PatternCatalog
 	{
 		std::string_view symbol;
 		bool required;
+		std::string_view signature;
+		std::string_view followMode;
 	};
 
 	struct ExecutableRange

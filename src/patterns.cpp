@@ -262,6 +262,15 @@ namespace
 				             pattern.name.c_str());
 			return std::nullopt;
 		}
+		if (entry->signature != pattern.pattern ||
+			entry->followMode != followModeName(pattern.followMode))
+		{
+			if (logInvalid)
+				g_pLog->warn(
+					"Pattern catalog resolver mismatch for '%s'; using embedded resolver\n",
+					pattern.name.c_str());
+			return std::nullopt;
+		}
 
 		const lm_module_t& module = pattern.module ? *pattern.module : g_modSteamClient;
 		const lm_address_t rva = static_cast<lm_address_t>(entry->targetRva);
@@ -373,7 +382,12 @@ namespace
 		{
 			if ((pattern->module == &g_modSteamUI) != steamUi)
 				continue;
-			result.push_back({pattern->symbol, !pattern->optional});
+			result.push_back({
+				pattern->symbol,
+				!pattern->optional,
+				pattern->pattern,
+				followModeName(pattern->followMode),
+			});
 		}
 		return result;
 	}
@@ -385,7 +399,12 @@ namespace
 		{
 			if ((pattern->module == &g_modSteamUI) != steamUi)
 				continue;
-			result.push_back({pattern->symbol, !pattern->optional});
+			result.push_back({
+				pattern->symbol,
+				!pattern->optional,
+				pattern->pattern,
+				followModeName(pattern->followMode),
+			});
 		}
 		return result;
 	}
@@ -733,7 +752,13 @@ bool Patterns::init()
 	// Establish immutable compiled policy before reading any remote-derived
 	// metadata.  A catalog whose required flags or symbols disagree with this
 	// registry is rejected in full.
+	CUser::MarkLicenseAsChanged.optional = true;
+	CUser::ProcessPendingLicenseUpdates.optional = true;
 	CUser::NotifyLicensesUpdated.optional = true;
+	CAppInfoCache::GetOrAddAppData.optional = true;
+	CAppInfoCache::ThreadedReadFromDisk.optional = true;
+	CAppInfoCache::SkipFlagReference.optional = true;
+	CAppInfoCache::ShaReference.optional = true;
 	CDepotDownloadMgr::ProcessDepotManifest.optional = true;
 	CDepotDownloadMgr::PrepareDepotDownload.optional = true;
 	CDepotDownloadMgr::BuildDepotDependency.optional = true;
@@ -742,6 +767,11 @@ bool Patterns::init()
 	CDepotDownloadMgr::OnChunkUnpackedReg.optional = true;
 	ParentalSignatureCheck.optional = true;
 	ParentalSettingsReceived.optional = true;
+	SteamUI::AppControllerRunFrame.optional = true;
+	SteamUI::GetAppByID.optional = true;
+	SteamUI::MarkAppChange.optional = true;
+	SteamUI::BuildCompleteAppOverviewChange.optional = true;
+	SteamUI::OwnershipFlagsReference.optional = true;
 
 	loadActiveCatalogs();
 
@@ -820,6 +850,68 @@ namespace Patterns
 		"E8 ? ? ? ? 83 C4 10 85 FF 74 ? 8B 07 83 EC 04 FF B5 ? ? ? ? FF B5 ? ? ? ? 57 FF 10 83 C4 10 8D 45 ? 83 EC 04 89 F3 6A 04 50 FF 75",
 		SigFollowMode::Relative
 	};
+
+	namespace SteamUI
+	{
+		// Linux i386 steamui.so build
+		// 38adc592f0ab97349639b297203739db70b6547f (SHA-256
+		// 833914b45fcb407e50631d1f62558a28c2f74dc7431b0f0aebd6d25e45b4cd72).
+		// Each complete signature below has exactly one .text match.  They are
+		// optional as a group: live visual removal must fail closed without
+		// affecting package refresh when Steam moves any UI implementation.
+		Pattern_t AppControllerRunFrame
+		{
+			"CSteamUIAppController::RunFrame",
+			"55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 7C E8 ? ? ? ? 8B 84 24 90 00 00 00 D9 5C 24 0C D9 44 24 0C",
+			SigFollowMode::None,
+			&g_modSteamUI,
+			"Patterns::SteamUI::AppControllerRunFrame"
+		};
+		// Direct cdecl entry: (controller, appid, create).  The opening PIC
+		// thunk is part of the entry and must be repaired in a trampoline only
+		// if this locator is detoured in the future; LibraryRemoval calls it.
+		Pattern_t GetAppByID
+		{
+			"CSteamUIAppController::GetAppByID",
+			"E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 4C 8B 5D 10 8B 75 08 89 45 C8 8B 80 E0 09 00 00",
+			SigFollowMode::None,
+			&g_modSteamUI,
+			"Patterns::SteamUI::GetAppByID"
+		};
+		// Direct cdecl entry: (source, appid, change_flags).  Hooking this
+		// captures the otherwise private source receiver used by RunFrame.
+		Pattern_t MarkAppChange
+		{
+			"CUpdateManager::MarkAppChange",
+			"E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 3C 8B 75 0C 8B 5D 10 89 45 D4 8B 80 E0 09 00 00",
+			SigFollowMode::None,
+			&g_modSteamUI,
+			"Patterns::SteamUI::MarkAppChange"
+		};
+		// Direct cdecl entry: (controller, change, optional_callback).  The
+		// detour only publishes an atomic reassert request after the original.
+		Pattern_t BuildCompleteAppOverviewChange
+		{
+			"BuildCompleteAppOverviewChange",
+			"55 89 E5 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 81 EC 8C 00 00 00 8B 7D 08 89 5D A4 E8 ? ? ? ? 84 C0",
+			SigFollowMode::None,
+			&g_modSteamUI,
+			"Patterns::SteamUI::BuildCompleteAppOverviewChange"
+		};
+		// FillInAppOverview reads CSteamApp::OwnershipFlags through `mov
+		// eax,[ecx+disp8]` immediately before serializing eAppOwnershipFlags.
+		// Keep the instruction address so LibraryRemoval derives and validates
+		// the Linux field offset (currently 0x18) instead of importing the
+		// unrelated Windows layout constant.
+		Pattern_t OwnershipFlagsReference
+		{
+			"CSteamApp::OwnershipFlagsReference",
+			"8B 41 18 8B 9D ? ? ? ? 83 EC 04 50 8D 83 ? ? ? ? 50 FF B5 ? ? ? ? E8 ? ? ? ?",
+			SigFollowMode::None,
+			&g_modSteamUI,
+			"Patterns::SteamUI::OwnershipFlagsReference"
+		};
+	}
 
 	namespace CAPIJob
 	{
@@ -919,6 +1011,29 @@ namespace Patterns
 			nullptr,
 			"Patterns::CUser::UpdateAppOwnershipTicket"
 		};
+		// Current Linux i386 entry at RVA 0x0186BDC0.  Callers at
+		// 0x0187309x/0x018731ax push this/package-id/bool, and the body hashes
+		// the package id into the changed-license table.  This is a direct
+		// cdecl entry with a PIC thunk call; the full signature has one match in
+		// the inspected steamclient.so.
+		Pattern_t MarkLicenseAsChanged
+		{
+			"CUser::MarkLicenseAsChanged",
+			"55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 2C 8B 74 24 40 8B 44 24 48 8B BE ? ? 00 00 88 44 24 1C 8D 86 ? ? 00 00 89 44 24 0C 85 FF 0F 84 ? ? ? ?",
+			SigFollowMode::None
+		};
+		// Current Linux i386 entry at RVA 0x0186C800.  Its cdecl receiver is
+		// read from [esp+0x40] after the saved-register prologue; it walks the
+		// pending-license vector, validates CAppData, and drives the downstream
+		// callback path containing callback 0xF90BE.  Caller 0x0187A67B passes
+		// the same local-user receiver.  The full direct-entry signature has one
+		// module match.
+		Pattern_t ProcessPendingLicenseUpdates
+		{
+			"CUser::ProcessPendingLicenseUpdates",
+			"55 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 83 EC 2C 8B 44 24 40 8B 88 7C 1C 00 00 85 C9 0F 8E ? ? ? ? 05 70 1C 00 00 89 44 24 18 8D 83 14 B3 03 00 8B 30",
+			SigFollowMode::None
+		};
 		// CUser::<broadcast LicensesUpdated_t>(CUser* this)
 		//
 		// The license-update notifier: rebuilds the LicensesUpdated_t
@@ -953,6 +1068,55 @@ namespace Patterns
 		{
 			"CUser::NotifyLicensesUpdated",
 			"55 89 E5 57 56 53 E8 ? ? ? ? 81 C3 ? ? ? ? 81 EC ? ? ? ? 8B 45 08 8B B8 ? ? 00 00 89 9D ? ? FF FF 85 FF",
+			SigFollowMode::None
+		};
+	}
+
+	namespace CAppInfoCache
+	{
+		// Current Linux i386 cdecl entry at RVA 0x00FCA900.  The current
+		// module's GetOrAddAppData source assertion xref is inside this body;
+		// [ebp+8]/[ebp+0xc]/[ebp+0x10] are cache/appid/create and the returned
+		// node is consumed as CAppData by ProcessPendingLicenseUpdates.  The
+		// direct PIC-thunk prologue is the trampoline entry; one full match.
+		// The separate 0x00FD4070 regparm helper is a lookup path, not this
+		// cdecl GetOrAddAppData target.
+		Pattern_t GetOrAddAppData
+		{
+			"CAppInfoCache::GetOrAddAppData",
+			"E8 ? ? ? ? 05 ? ? ? ? 55 89 E5 57 56 53 83 EC 2C 8B 75 0C 8B 7D 10 89 45 D0 8B 80 BC 08 00 00 8B 00 85 C0 0F 85 ? ? ? ?",
+			SigFollowMode::None
+		};
+		// CAppInfoCache::ThreadedReadFromDisk is Steam's own background cache
+		// loader.  The current Linux i386 entry is RVA 0x00FC89F0 and takes the
+		// CAppInfoCache pointer as its sole cdecl argument.  The 0x110c-byte
+		// parser frame plus the saved cache argument makes this prologue unique
+		// in the current module (one full match); signed catalogs can replace the
+		// optional locator independently when a client update changes the frame.
+		Pattern_t ThreadedReadFromDisk
+		{
+			"CAppInfoCache::ThreadedReadFromDisk",
+			"55 89 E5 57 56 E8 ? ? ? ? 81 C6 ? ? ? ? 53 81 EC 0C 11 00 00 8B 45 08 89 85 0C EF FF FF",
+			SigFollowMode::None
+		};
+		// Instruction site at RVA 0x0186C929: cmp byte ptr [esi+disp8],0
+		// tests the same CAppData returned by GetOrAddAppData.  None is
+		// intentional because AppDataLayout decodes this instruction in place;
+		// the full reference signature has one module match.
+		Pattern_t SkipFlagReference
+		{
+			"CAppInfoCache::SkipFlagReference",
+			"80 7E 10 00 0F 44 C8 88 4C 24 1E 8B 44 24 10 83 C7 01 3B 7D 44 8B 30 7C 9E",
+			SigFollowMode::None
+		};
+		// Instruction site at RVA 0x0186C914: lea eax,[eax+disp8], using the
+		// GetOrAddAppData return while the preceding mov esi,eax preserves a copy
+		// for the later skip test.  A 20-byte SHA comparison follows.  None keeps
+		// the instruction address for runtime layout derivation; one full match.
+		Pattern_t ShaReference
+		{
+			"CAppInfoCache::ShaReference",
+			"8D 40 1C 50 E8 ? ? ? ? 83 C4 10 85 C0 75 10 0F B6 4C 24 1E 80 7E 10 00 0F 44 C8 88 4C 24 1E",
 			SigFollowMode::None
 		};
 	}

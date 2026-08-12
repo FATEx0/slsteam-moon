@@ -254,19 +254,20 @@ std::vector<uint32_t> managedDepotsForApp(uint32_t appId)
 }
 
 
-void importLuaScripts()
+namespace
 {
-	std::string stplug;
-	g_importGate.run(
-		[&]() {
-			const auto steamRoot = findSteamRoot();
-			if (steamRoot.empty()) return false;
+bool luaImportReady(std::string& stplug)
+{
+	const auto steamRoot = findSteamRoot();
+	if (steamRoot.empty()) return false;
 
-			stplug = steamRoot + "/config/stplug-in";
-			return std::filesystem::exists(stplug.c_str());
-		},
-		[&]() {
-			static const std::regex addappidWithKeyRe(
+	stplug = steamRoot + "/config/stplug-in";
+	return std::filesystem::exists(stplug.c_str());
+}
+
+void importLuaScriptsFrom(const std::string& stplug)
+{
+	static const std::regex addappidWithKeyRe(
 		"addappid\\s*\\(\\s*(\\d+)\\s*,\\s*\\d+\\s*,\\s*\"([0-9A-Fa-f]{64})\"\\s*\\)"
 	);
 
@@ -315,7 +316,23 @@ void importLuaScripts()
 		g_pLog->infoOnce("DepotKey: imported %d Lua-script depot keys from %s\n",
 		             imported, stplug.c_str());
 	}
-		});
+}
+} // namespace
+
+void importLuaScripts()
+{
+	std::string stplug;
+	(void)g_importGate.run(
+		[&]() { return luaImportReady(stplug); },
+		[&]() { importLuaScriptsFrom(stplug); });
+}
+
+void reloadLuaScripts()
+{
+	std::string stplug;
+	(void)g_importGate.rerun(
+		[&]() { return luaImportReady(stplug); },
+		[&]() { importLuaScriptsFrom(stplug); });
 }
 
 
