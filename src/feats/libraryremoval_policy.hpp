@@ -15,37 +15,10 @@
 
 namespace LibraryRemovalPolicy
 {
-// Linux i386 CAppOverview_Change layout for the Steam protobuf schema:
-// repeated CAppOverview app_overview = 1 occupies [0x10, 0x20), followed by
-// repeated uint32 removed_appid = 2 at 0x20. The hook only uses this offset
-// after resolving the matching SteamUI builder for the current module.
-inline constexpr std::size_t kRemovedAppIdsFieldOffset = 0x20;
-
 inline constexpr std::uint32_t hiddenOwnershipFlags(
 	std::uint32_t) noexcept
 {
 	return 0;
-}
-
-template<typename Append>
-std::size_t appendRemovedAppIds(
-	void* change,
-	std::span<const std::uint32_t> appIds,
-	Append&& append)
-{
-	if (change == nullptr)
-		return 0;
-
-	void* const field = static_cast<void*>(
-		static_cast<std::byte*>(change) + kRemovedAppIdsFieldOffset);
-	std::size_t count = 0;
-	for (const std::uint32_t appId : appIds)
-	{
-		if (!append(field, appId))
-			break;
-		++count;
-	}
-	return count;
 }
 
 inline std::optional<std::size_t> deriveOwnershipOffset(

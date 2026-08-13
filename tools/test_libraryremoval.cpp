@@ -35,31 +35,6 @@ int main()
 	check(LibraryRemovalPolicy::hiddenOwnershipFlags(0x0803) == 0,
 	      "visual removal clears every ownership presentation flag");
 
-	std::array<std::byte, 64> change{};
-	std::vector<std::uint32_t> appended;
-	void* observedField = nullptr;
-	const std::array<std::uint32_t, 2> removedIds{10, 20};
-	const std::size_t appendedCount =
-		LibraryRemovalPolicy::appendRemovedAppIds(
-			change.data(), std::span<const std::uint32_t>(removedIds),
-			[&](void* field, std::uint32_t appId)
-			{
-				observedField = field;
-				appended.push_back(appId);
-				return true;
-			});
-	check(observedField ==
-	      static_cast<void*>(change.data() +
-	                         LibraryRemovalPolicy::kRemovedAppIdsFieldOffset),
-	      "removed ids target the repeated uint32 field in the Steam message");
-	check(appendedCount == 2 && appended ==
-	      std::vector<std::uint32_t>({10, 20}),
-	      "every applied removal is appended to the normal Steam delta");
-	check(LibraryRemovalPolicy::appendRemovedAppIds(
-	          nullptr, std::span<const std::uint32_t>(removedIds),
-	          [](void*, std::uint32_t) { return true; }) == 0,
-	      "a missing Steam change message is rejected safely");
-
 	LibraryRemovalPolicy::Queue queue(4);
 	check(queue.push(10), "first removal queues");
 	check(!queue.push(10), "duplicate removal coalesces");

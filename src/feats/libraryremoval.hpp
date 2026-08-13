@@ -23,5 +23,4 @@ namespace LibraryRemoval
 	// Called after the re-added package generation has completed its license
 	// refresh; compensates a removal that was already in flight.
 	void restore(std::uint32_t appId) noexcept;
-	void requestFullReassert() noexcept;
 }

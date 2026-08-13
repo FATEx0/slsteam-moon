@@ -14,7 +14,6 @@ struct Matrix
 	bool uiRunFrame = false;
 	bool uiGetAppById = false;
 	bool uiMarkAppChange = false;
-	bool uiBuildComplete = false;
 	bool uiOwnershipLayout = false;
 
 	constexpr bool canProcessLicenseChange() const noexcept
@@ -30,7 +29,7 @@ struct Matrix
 	constexpr bool canRemoveVisually() const noexcept
 	{
 		return uiRunFrame && uiGetAppById && uiMarkAppChange &&
-			uiBuildComplete && uiOwnershipLayout;
+			uiOwnershipLayout;
 	}
 };
 } // namespace HotReloadCapabilities

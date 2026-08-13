@@ -12,13 +12,10 @@
 #include "../patterns.hpp"
 
 #include "libmem/libmem.h"
-#include "google/protobuf/repeated_field.h"
-
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <span>
 
 namespace
 {
@@ -27,8 +24,6 @@ using GetAppByIDFn = void* (__attribute__((cdecl)) *)(
 using MarkAppChangeFn = void (__attribute__((cdecl)) *)(
 	void*, std::uint32_t, std::uint32_t);
 using RunFrameFn = void* (__attribute__((cdecl)) *)(void*);
-using BuildCompleteFn = void (__attribute__((cdecl)) *)(
-	void*, void*, void*);
 
 template<typename Fn>
 struct Detour
@@ -43,47 +38,14 @@ constexpr std::uint32_t kAppInfoOrConfig = 0x0002;
 
 LibraryRemovalPolicy::Queue g_queue(HotReloadInputs::kMaxSnapshotIds);
 std::atomic<bool> g_ready{false};
-std::atomic<bool> g_reassertRequested{false};
 std::atomic<void*> g_appChangeSource{nullptr};
 GetAppByIDFn g_getAppByID = nullptr;
 std::size_t g_ownershipFlagsOffset = 0;
 Detour<MarkAppChangeFn> g_markAppChange;
 Detour<RunFrameFn> g_runFrame;
-Detour<BuildCompleteFn> g_buildComplete;
 
 static_assert(sizeof(void*) == 4,
 	"SteamUI protobuf layout is defined for the Linux i386 client");
-static_assert(sizeof(google::protobuf::RepeatedField<std::uint32_t>) == 12,
-	"unexpected protobuf repeated uint32 layout");
-
-bool appendRemovedAppId(void* field, std::uint32_t appId) noexcept
-{
-	try
-	{
-		auto* const removed = reinterpret_cast<
-			google::protobuf::RepeatedField<std::uint32_t>*>(field);
-		// Steam normally builds this message without an arena. Avoid crossing
-		// protobuf runtimes if a future client starts arena-allocating it.
-		if (removed->GetArena() != nullptr)
-		{
-			if (g_pLog != nullptr)
-				g_pLog->once(
-					"LibraryRemoval: SteamUI removal field uses an unsupported arena; "
-					"visual removal deferred to restart\n");
-			return false;
-		}
-		removed->Add(appId);
-		return true;
-	}
-	catch (...)
-	{
-		if (g_pLog != nullptr)
-			g_pLog->once(
-				"LibraryRemoval: could not append removed_appid; "
-				"visual removal deferred to restart\n");
-		return false;
-	}
-}
 
 template<typename Fn>
 void uninstall(Detour<Fn>& detour) noexcept
@@ -125,9 +87,6 @@ bool install(
 
 void processOneRemoval(void* controller)
 {
-	if (g_reassertRequested.exchange(false, std::memory_order_acq_rel))
-		g_queue.requestFullReassert();
-
 	const auto appId = g_queue.drainOne();
 	if (!appId)
 		return;
@@ -201,35 +160,6 @@ void* __attribute__((cdecl)) hkRunFrame(void* controller)
 	return g_runFrame.original(controller);
 }
 
-void __attribute__((cdecl)) hkBuildComplete(
-	void* controller,
-	void* change,
-	void* optionalCallback)
-{
-	g_buildComplete.original(controller, change, optionalCallback);
-	try
-	{
-		const std::vector<std::uint32_t> removed = g_queue.appliedSnapshot();
-		const std::size_t appended =
-			LibraryRemovalPolicy::appendRemovedAppIds(
-				change, std::span<const std::uint32_t>(removed),
-				appendRemovedAppId);
-		if (appended != 0 && g_pLog != nullptr)
-		{
-			g_pLog->info(
-				"LibraryRemoval: appended %zu removed_appid entr%s to SteamUI delta\n",
-				appended, appended == 1 ? "y" : "ies");
-		}
-	}
-	catch (...)
-	{
-		if (g_pLog != nullptr)
-			g_pLog->warn(
-				"LibraryRemoval: complete-change append failed; retry deferred\n");
-		g_reassertRequested.store(true, std::memory_order_release);
-	}
-}
-
 bool deriveOwnershipOffset(std::size_t& offset) noexcept
 {
 	std::array<std::uint8_t, 3> instruction{};
@@ -253,12 +183,10 @@ void rollback() noexcept
 	g_ready.store(false, std::memory_order_release);
 	g_queue.close();
 	uninstall(g_runFrame);
-	uninstall(g_buildComplete);
 	uninstall(g_markAppChange);
 	g_getAppByID = nullptr;
 	g_ownershipFlagsOffset = 0;
 	g_appChangeSource.store(nullptr, std::memory_order_release);
-	g_reassertRequested.store(false, std::memory_order_release);
 }
 } // namespace
 
@@ -280,8 +208,6 @@ bool setup() noexcept
 			Patterns::SteamUI::GetAppByID.address != LM_ADDRESS_BAD;
 		capabilities.uiMarkAppChange =
 			Patterns::SteamUI::MarkAppChange.address != LM_ADDRESS_BAD;
-		capabilities.uiBuildComplete =
-			Patterns::SteamUI::BuildCompleteAppOverviewChange.address != LM_ADDRESS_BAD;
 		capabilities.uiOwnershipLayout =
 			Patterns::SteamUI::OwnershipFlagsReference.address != LM_ADDRESS_BAD &&
 			deriveOwnershipOffset(g_ownershipFlagsOffset);
@@ -301,10 +227,7 @@ bool setup() noexcept
 
 		// RunFrame is installed last, so no queued work can execute until both
 		// support detours have valid original trampolines.
-		if (!install(g_buildComplete,
-				Patterns::SteamUI::BuildCompleteAppOverviewChange,
-				reinterpret_cast<lm_address_t>(&hkBuildComplete), false) ||
-			!install(g_markAppChange, Patterns::SteamUI::MarkAppChange,
+		if (!install(g_markAppChange, Patterns::SteamUI::MarkAppChange,
 				reinterpret_cast<lm_address_t>(&hkMarkAppChange), true) ||
 			!install(g_runFrame, Patterns::SteamUI::AppControllerRunFrame,
 				reinterpret_cast<lm_address_t>(&hkRunFrame), true))
@@ -397,9 +320,4 @@ void restore(std::uint32_t appId) noexcept
 	}
 }
 
-void requestFullReassert() noexcept
-{
-	if (ready())
-		g_reassertRequested.store(true, std::memory_order_release);
-}
 } // namespace LibraryRemoval

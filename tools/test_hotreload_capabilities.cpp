@@ -19,7 +19,7 @@ HotReloadCapabilities::Matrix complete()
 {
 	return {
 		true, true, true,
-		true, true, true, true, true,
+		true, true, true, true,
 	};
 }
 }
@@ -33,7 +33,6 @@ int main()
 	      "complete matrix enables runtime license processing");
 	check(value.canRemoveVisually(),
 	      "complete matrix enables live visual removal");
-
 	auto withoutGetOrAdd = value;
 	withoutGetOrAdd.unresolvedAppGuard = false;
 	check(!withoutGetOrAdd.canProcessUnresolvedAdd(),
