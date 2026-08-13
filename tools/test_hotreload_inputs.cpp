@@ -49,6 +49,17 @@ int main()
 	check(!bounded.valid && !bounded.snapshot.metadataComplete &&
 		bounded.snapshot.appIds.empty() && bounded.snapshot.depotIds.empty(),
 		"oversized input fails closed without a destructive partial snapshot");
+	const std::vector<AppInput> pendingInputs{
+		{1245620, true, {2778580}, {1245621}, true, true, 300},
+	};
+	const auto pending = HotReloadInputs::build(10, pendingInputs);
+	check(pending.valid && !pending.snapshot.metadataComplete &&
+		pending.snapshot.appIds ==
+			std::vector<std::uint32_t>({1245620, 2778580}) &&
+		pending.metadataMissingBaseIds ==
+			std::vector<std::uint32_t>({1245620}) &&
+		pending.cacheMtimeSecs.at(1245620) == 300,
+		"pending child metadata keeps the first runtime topology unresolved");
 
 	check(HotReloadPublishPolicy::shouldEvaluateInputs(
 		/*initialPublication=*/false, /*membershipChanged=*/false,
@@ -74,6 +85,79 @@ int main()
 		/*initialPublication=*/false, /*membershipChanged=*/false,
 		/*forceSourceRefresh=*/false),
 		"an ordinary unchanged event skips fingerprint evaluation");
+	check(HotReloadPublishPolicy::shouldAwaitDlcMetadata(
+		/*initialPublication=*/false, /*addedBaseNeedsMetadata=*/true),
+		"a runtime addition stays pending until its child metadata is live");
+	check(!HotReloadPublishPolicy::shouldAwaitDlcMetadata(
+		/*initialPublication=*/true, /*addedBaseNeedsMetadata=*/true),
+		"cold boot retains the established package publication behavior");
+	check(!HotReloadPublishPolicy::shouldAwaitDlcMetadata(
+		/*initialPublication=*/false, /*addedBaseNeedsMetadata=*/false),
+		"a base without DLC candidates is immediately complete");
+	check(HotReloadPublishPolicy::metadataRepairDue(
+		/*hasPending=*/true, /*nowMs=*/100, /*retryAfterMs=*/100),
+		"pending metadata repair runs when its cooldown expires");
+	check(!HotReloadPublishPolicy::metadataRepairDue(
+		/*hasPending=*/true, /*nowMs=*/99, /*retryAfterMs=*/100),
+		"pending metadata repair respects its cooldown");
+	check(!HotReloadPublishPolicy::metadataRepairDue(
+		/*hasPending=*/false, /*nowMs=*/100, /*retryAfterMs=*/0),
+		"empty metadata repair state does no work");
+	check(HotReloadPublishPolicy::metadataCacheVisibleInSession(
+		/*cacheReady=*/true, /*deferredUntilRestart=*/false) &&
+		!HotReloadPublishPolicy::metadataCacheVisibleInSession(
+			/*cacheReady=*/true, /*deferredUntilRestart=*/true) &&
+		!HotReloadPublishPolicy::metadataCacheVisibleInSession(
+			/*cacheReady=*/false, /*deferredUntilRestart=*/false),
+		"disk-only migration cannot leak into a later live package generation");
+	check(HotReloadPublishPolicy::metadataRepairDefersUntilRestart(
+			/*runtimePending=*/false) &&
+		!HotReloadPublishPolicy::metadataRepairDefersUntilRestart(
+			/*runtimePending=*/true),
+		"legacy repair is deferred before enqueue while hot-add stays live");
+	const auto startupRepairAfter =
+		HotReloadPublishPolicy::metadataRepairDeadlineMs(
+			/*nowMs=*/500, /*delayMs=*/30000);
+	check(HotReloadPublishPolicy::shouldArmMetadataRepair(
+			/*postLoginOpportunitySeen=*/false) &&
+		!HotReloadPublishPolicy::shouldArmMetadataRepair(
+			/*postLoginOpportunitySeen=*/true) &&
+		startupRepairAfter == 30500 &&
+		!HotReloadPublishPolicy::metadataRepairDue(
+			/*hasPending=*/true, /*nowMs=*/30499, startupRepairAfter) &&
+		HotReloadPublishPolicy::metadataRepairDue(
+			/*hasPending=*/true, /*nowMs=*/30500, startupRepairAfter),
+		"startup grace keeps legacy repair out of the login and splash window");
+	const auto prioritizedRepairs =
+		HotReloadPublishPolicy::prioritizeMetadataRepairs({
+			{10, false, 300},
+			{20, true, 100},
+			{30, false, 500},
+			{40, true, 50},
+		});
+	check(prioritizedRepairs ==
+		std::vector<std::uint32_t>({20, 40, 30, 10}),
+		"hot-add pending bases precede newest-first migration repairs");
+	check(HotReloadPublishPolicy::mergeMetadataRepairIds(
+		{10, 30}, {20, 30, 0}) ==
+		std::vector<std::uint32_t>({10, 20, 30}),
+		"failed hot-add completion joins migration repair without duplicates");
+
+	PackageSnapshot previous;
+	previous.generation = 4;
+	previous.appIds = {1245620};
+	previous.depotIds = {1245621};
+	previous.metadataComplete = false;
+	PackageSnapshot completed = previous;
+	completed.generation = 5;
+	completed.appIds = {1245620, 2778580};
+	completed.metadataComplete = true;
+	check(HotReloadPublishPolicy::metadataSnapshotChanged(previous, completed),
+		"metadata completion publishes the newly discovered DLC topology");
+	PackageSnapshot duplicate = completed;
+	duplicate.generation = 99;
+	check(!HotReloadPublishPolicy::metadataSnapshotChanged(completed, duplicate),
+		"generation alone does not republish an identical metadata snapshot");
 
 	const std::vector<ProvisionTerminal::LocalInput> localInputs{
 		{330, "", 999},

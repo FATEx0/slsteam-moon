@@ -33,7 +33,14 @@ struct Result
 {
 	Status status = Status::Unavailable;
 	std::size_t resolved = 0;
+	std::size_t present = 0;
 };
+
+inline bool allRequestedPresent(
+	const Result& result, std::size_t requested) noexcept
+{
+	return result.status == Status::Loaded && result.present == requested;
+}
 
 inline bool hasSha(void* data, const AppDataLayout::Layout& layout) noexcept
 {
@@ -66,12 +73,13 @@ inline Result reload(
 		if (!runtime.readFromDisk(runtime.cache))
 			return {Status::ReadFailed, 0};
 
-		Result result{Status::Loaded, 0};
+		Result result{Status::Loaded, 0, 0};
 		for (const std::uint32_t appId : appIds)
 		{
 			void* const data = runtime.lookup(runtime.cache, appId, false);
-			if (hasSha(data, layout) && store.noteResolved(appId))
-				++result.resolved;
+			if (!hasSha(data, layout)) continue;
+			++result.present;
+			if (store.noteResolved(appId)) ++result.resolved;
 		}
 		return result;
 	}

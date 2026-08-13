@@ -22,6 +22,7 @@
 #pragma once
 
 #include <charconv>
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <unordered_set>
@@ -82,6 +83,46 @@ struct DlcAppIds
 	std::vector<uint32_t> depotTagged;
 	std::vector<uint32_t> advertised;
 };
+
+// Immutable facts extracted from one CM product-info record before it may be
+// used as runtime-only DLC metadata.  Keeping this decision pure makes the
+// security boundary explicit: a depot helper/public_only row or a DLC owned
+// by another base can never enter Steam's live appinfo cache through this
+// path.
+struct DlcMetadataFacts
+{
+	uint32_t requestedBaseAppId = 0;
+	uint32_t requestedDlcAppId = 0;
+	uint32_t wireAppId = 0;
+	uint32_t parentAppId = 0;
+	bool hasCommon = false;
+	bool typeIsDlc = false;
+};
+
+inline bool isValidDlcMetadata(const DlcMetadataFacts& facts) noexcept
+{
+	return facts.requestedBaseAppId != 0 &&
+		facts.requestedDlcAppId != 0 &&
+		facts.requestedDlcAppId != facts.requestedBaseAppId &&
+		facts.wireAppId == facts.requestedDlcAppId &&
+		facts.parentAppId == facts.requestedBaseAppId &&
+		facts.hasCommon && facts.typeIsDlc;
+}
+
+inline std::vector<uint32_t> selectDlcMetadataCandidates(
+	uint32_t baseAppId, const DlcAppIds& sources)
+{
+	std::unordered_set<uint32_t> seen;
+	std::vector<uint32_t> out;
+	for (const uint32_t id : sources.advertised)
+		if (id != 0 && id != baseAppId && seen.insert(id).second)
+			out.push_back(id);
+	for (const uint32_t id : sources.depotTagged)
+		if (id != 0 && id != baseAppId && seen.insert(id).second)
+			out.push_back(id);
+	std::sort(out.begin(), out.end());
+	return out;
+}
 
 // Parse the depot id from a valid depotcache/ManifestStore filename.  The
 // artifact stores use <depot>_<gid>.manifest; keep this parser pure so the

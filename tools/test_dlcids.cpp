@@ -201,6 +201,49 @@ int main()
 	}
 
 	// 10) no DLC info -> empty, no crash.
+	// 10) Runtime metadata discovery considers every DLC named by the
+	// normalized base record, but the result is only a fetch candidate.  A
+	// depot-only technical app is rejected later unless its own record proves
+	// that it is a DLC of this base.
+	{
+		AppInfoProvision::DlcAppIds sources;
+		sources.advertised = {1799420, 2778580, 1799420};
+		sources.depotTagged = {2778580, 3655690, 1245620, 0};
+		const auto candidates =
+			AppInfoProvision::selectDlcMetadataCandidates(1245620, sources);
+		CHECK(candidates == std::vector<uint32_t>({1799420, 2778580, 3655690}),
+		      "metadata candidates: union is deterministic and excludes base/zero");
+	}
+
+	// 11) A child product-info record is publishable only when its identity,
+	// common block, DLC type, and parent all agree with the requested relation.
+	// This rejects public_only technical rows such as depot helper appids.
+	{
+		const AppInfoProvision::DlcMetadataFacts valid{
+			.requestedBaseAppId = 1245620,
+			.requestedDlcAppId = 2778580,
+			.wireAppId = 2778580,
+			.parentAppId = 1245620,
+			.hasCommon = true,
+			.typeIsDlc = true,
+		};
+		CHECK(AppInfoProvision::isValidDlcMetadata(valid),
+		      "metadata validation: matching DLC child is accepted");
+		auto publicOnly = valid;
+		publicOnly.hasCommon = false;
+		CHECK(!AppInfoProvision::isValidDlcMetadata(publicOnly),
+		      "metadata validation: public_only record is rejected");
+		auto wrongParent = valid;
+		wrongParent.parentAppId = 999;
+		CHECK(!AppInfoProvision::isValidDlcMetadata(wrongParent),
+		      "metadata validation: unrelated DLC is rejected");
+		auto wrongIdentity = valid;
+		wrongIdentity.wireAppId = 2778590;
+		CHECK(!AppInfoProvision::isValidDlcMetadata(wrongIdentity),
+		      "metadata validation: mismatched app identity is rejected");
+	}
+
+	// 12) no DLC info -> empty, no crash.
 	{
 		const std::string wire =
 			"\"appinfo\"\n{\n\t\"appid\"\t\t\"285900\"\n\t\"depots\"\n\t{\n"

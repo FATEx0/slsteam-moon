@@ -46,9 +46,10 @@ inline bool isTerminalOutcome(ProvisionOutcome outcome)
 	       outcome == ProvisionOutcome::NoUsableContent;
 }
 
-// Reloading Steam's live appinfo map is a recovery action for a response we
-// deliberately suppressed. It is safe only after this pass published a new,
-// validated pair; cache reuse and offline fallback must remain disk-only.
+// Reloading Steam's live appinfo map is a recovery action for a newly added
+// app or a response we deliberately suppressed. It is safe only after this
+// pass published a new, validated pair; cache reuse and offline fallback must
+// remain disk-only.
 inline bool runtimePublicationAllowed(bool requested,
                                       ProvisionOutcome outcome) noexcept
 {

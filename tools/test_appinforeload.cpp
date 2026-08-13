@@ -75,10 +75,19 @@ int main()
 		      "a successful disk read reports a loaded live cache");
 		check(result.resolved == 1,
 		      "only one current managed generation is resolved");
+		check(result.present == 2,
+		      "every requested occurrence with a live SHA is observed");
 		check(store.takeResolvedDirty(),
 		      "a loaded SHA raises the owner-thread reprocess signal");
 		check(!store.takeResolvedDirty(),
 		      "duplicate requested ids do not raise duplicate signals");
+
+		const auto alreadyResolved = AppInfoReload::reload(
+			runtime, std::vector<std::uint32_t>{420530}, store, layout);
+		check(alreadyResolved.resolved == 0 && alreadyResolved.present == 1,
+		      "an already-resolved generation still reports live presence");
+		check(AppInfoReload::allRequestedPresent(alreadyResolved, 1),
+		      "runtime publication accepts a base resolved before its worker");
 	}
 
 	{
@@ -94,7 +103,8 @@ int main()
 			runtime, std::vector<std::uint32_t>{420530}, store, layout);
 		check(result.status == AppInfoReload::Status::ReadFailed,
 		      "a failed Steam disk read remains restart-recoverable");
-		check(result.resolved == 0 && !store.takeResolvedDirty(),
+		check(result.resolved == 0 && result.present == 0 &&
+		      !store.takeResolvedDirty(),
 		      "a failed read cannot claim app metadata was published");
 	}
 
@@ -110,7 +120,8 @@ int main()
 			unavailable, std::vector<std::uint32_t>{420530}, store, layout);
 		check(result.status == AppInfoReload::Status::Unavailable,
 		      "a missing optional locator disables only live disk reload");
-		check(result.resolved == 0 && !store.takeResolvedDirty(),
+		check(result.resolved == 0 && result.present == 0 &&
+		      !store.takeResolvedDirty(),
 		      "an unavailable reload leaves the restart fallback untouched");
 	}
 

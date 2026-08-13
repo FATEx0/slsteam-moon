@@ -20,6 +20,26 @@ namespace HotReload
 		const std::unordered_set<std::uint32_t>& managedAppIds,
 		bool forceSourceRefresh = false) noexcept;
 
+	// The async base refresh has made a newer metadata topology durable. Rebuild
+	// one generation even when managed membership and manifest fingerprints are
+	// unchanged. Returns false for stale remove/re-add work or an identical
+	// topology.
+	bool publishMetadataCompletion(
+		std::uint32_t baseAppId,
+		std::uint64_t expectedManagedGeneration) noexcept;
+
+	// Called from a real post-login PICS worker callback. Schedules a bounded,
+	// cooldown-limited repair for durable child metadata missing from older
+	// caches; it never starts work from LD_AUDIT preinit.
+	void repairMissingDlcMetadata(
+		const std::string& appinfoVdfPath) noexcept;
+
+	// Mark a migration sidecar durable without changing Steam's live appinfo or
+	// package state. It becomes visible naturally on the next cold splice.
+	bool noteDlcMetadataCacheCompletion(
+		std::uint32_t baseAppId,
+		std::uint64_t expectedManagedGeneration) noexcept;
+
 	// Process-lifetime lock-free membership store used by GetOrAddAppData.
 	HotReloadState::Store& store() noexcept;
 

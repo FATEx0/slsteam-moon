@@ -60,6 +60,7 @@ int main()
 	using AppInfoProvision::cache::shouldValidateCache;
 	using AppInfoProvision::cache::shouldPreserveCacheFromRawPics;
 	using AppInfoProvision::cache::shouldPreserveSyntheticMarker;
+	using AppInfoProvision::cache::shouldInvalidateDlcMetadata;
 	using AppInfoProvision::cache::wireSizeMatches;
 
 	CHECK(!coldFallbackNeeded(CacheReadiness::Busy),
@@ -358,6 +359,10 @@ int main()
 	CHECK(!shouldPreserveSyntheticMarker(/*retainCompatibility=*/false,
 	                                     /*isSynthetic=*/true),
 	      "full cleanup removes even a confirmed synthetic marker");
+	CHECK(!shouldInvalidateDlcMetadata(/*basePublicationSucceeded=*/false),
+	      "failed base publication preserves compatible DLC metadata");
+	CHECK(shouldInvalidateDlcMetadata(/*basePublicationSucceeded=*/true),
+	      "committed base publication invalidates its prior DLC metadata");
 
 	const CacheRecordFacts validRecord{
 	    .requestedAppId = 420530,

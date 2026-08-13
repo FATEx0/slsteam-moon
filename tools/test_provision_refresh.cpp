@@ -95,6 +95,32 @@ int main()
 	CHECK(requestNeedsFetch(localChange, CacheReadiness::Fresh, 7),
 	      "changed local inputs re-render even a fresh cache pair");
 
+	const RefreshRequest metadataOnly{
+		420530, 0, 2, reasonMask(RefreshReason::DlcMetadata), true, false};
+	CHECK(!requestNeedsFetch(metadataOnly, CacheReadiness::Fresh, 7) &&
+	      !requestNeedsFetch(metadataOnly, CacheReadiness::Missing, 0),
+	      "DLC metadata repair never refetches or rewrites the base app cache");
+	CHECK(!dlcMetadataPublishesLive(metadataOnly),
+	      "startup migration persists metadata without touching live Steam state");
+	RefreshRequest pendingMetadataRepair = metadataOnly;
+	pendingMetadataRepair.publishRuntime = true;
+	CHECK(dlcMetadataPublishesLive(pendingMetadataRepair),
+	      "a failed live hot-add completion remains live on retry");
+	RefreshRequest metadataAndHotAdd = metadataOnly;
+	metadataAndHotAdd.reasons |= reasonMask(RefreshReason::HotAdd);
+	CHECK(requestNeedsFetch(metadataAndHotAdd, CacheReadiness::Fresh, 7),
+	      "metadata repair coalescing never suppresses a real hot-add refresh");
+	CHECK(!dlcMetadataPublishesLive(metadataAndHotAdd),
+	      "a hot-add reason without explicit runtime authorization stays disk-only");
+	metadataAndHotAdd.publishRuntime = true;
+	CHECK(dlcMetadataPublishesLive(metadataAndHotAdd),
+	      "an explicitly authorized hot-add publishes its child metadata live");
+	RefreshRequest coalescedLegacy = metadataOnly;
+	coalescedLegacy.reasons |= reasonMask(RefreshReason::LocalInputs);
+	coalescedLegacy.publishRuntime = true;
+	CHECK(!dlcMetadataPublishesLive(coalescedLegacy),
+	      "unrelated runtime refresh cannot promote legacy metadata migration");
+
 	const RefreshRequest newerChange{
 		420530, 8, 2, reasonMask(RefreshReason::PicsChanges), true, false};
 	CHECK(requestNeedsFetch(newerChange, CacheReadiness::Fresh, 7),

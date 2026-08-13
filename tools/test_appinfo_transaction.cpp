@@ -106,6 +106,19 @@ bool hasScopedValidationArtifact(const std::string& directory)
 	return false;
 }
 
+struct MetadataGuardState
+{
+	int calls = 0;
+	bool allow = false;
+};
+
+bool metadataGuard(void* opaque) noexcept
+{
+	auto& state = *static_cast<MetadataGuardState*>(opaque);
+	++state.calls;
+	return state.allow;
+}
+
 } // namespace
 
 namespace AppInfoProvision
@@ -118,6 +131,7 @@ bool cacheMarkerAllowsRead(uint32_t)
 {
 	return testCacheMarkerAllowsRead;
 }
+
 }
 
 int main()
@@ -177,6 +191,60 @@ int main()
 	assert(scopedBytes.find("456") != std::string::npos);
 	assert(scopedBytes.find("789") == std::string::npos);
 	assert(!hasScopedValidationArtifact(root + "/appcache"));
+
+	// Runtime DLC enrichment publishes a validated metadata-only child even
+	// though the child is not a managed base app.  Its record deliberately has
+	// no depots: ownership/UI metadata must not affect manifest selection.
+	const auto metadataAppinfo = root + "/appcache/metadata.vdf";
+	createEmptyAppInfo(metadataAppinfo);
+	const std::string dlcWire =
+		"\"appinfo\"\n{\n"
+		"\t\"appid\"\t\"2001\"\n"
+		"\t\"common\"\n\t{\n"
+		"\t\t\"name\"\t\"Metadata DLC\"\n"
+		"\t\t\"type\"\t\"DLC\"\n"
+		"\t\t\"parent\"\t\"1001\"\n"
+		"\t}\n"
+		"\t\"extended\"\n\t{\n"
+		"\t\t\"dlcforappid\"\t\"1001\"\n"
+		"\t}\n"
+		"}\n";
+	const std::vector<AppInfoVdf::MetadataApp> metadataApps{{
+		.appid = 2001,
+		.changeNumber = 77,
+		.sha = sha1Of(dlcWire),
+		.wireBuffer = dlcWire,
+	}};
+	assert(AppInfoVdf::injectValidatedMetadataApps(
+		metadataAppinfo, metadataApps) == 1);
+	const auto metadataBytes = readAll(metadataAppinfo);
+	assert(metadataBytes.find("Metadata DLC") != std::string::npos);
+	assert(metadataBytes.find("depots") == std::string::npos);
+
+	// The caller revalidates its base pair only after the appinfo file lock is
+	// acquired. If that identity changed while child metadata was fetched, the
+	// guarded transaction must leave appinfo byte-for-byte unchanged.
+	const auto guardedAppinfo = root + "/appcache/metadata-guarded.vdf";
+	createEmptyAppInfo(guardedAppinfo);
+	const auto guardedBefore = readAll(guardedAppinfo);
+	MetadataGuardState deniedGuard;
+	assert(AppInfoVdf::injectValidatedMetadataAppsGuarded(
+		guardedAppinfo, metadataApps, &deniedGuard, &metadataGuard) == 0);
+	assert(deniedGuard.calls == 1);
+	assert(readAll(guardedAppinfo) == guardedBefore);
+
+	// A Steam/owned DLC entry with content already present must win. Metadata
+	// enrichment is insert-only and cannot downgrade it to the stripped wire.
+	const auto existingDlcAppinfo = root + "/appcache/existing-dlc.vdf";
+	createEmptyAppInfo(existingDlcAppinfo);
+	const std::string existingDlcWire = wireFor(424242);
+	assert(AppInfoVdf::injectApp(
+		existingDlcAppinfo, 2001, 78, sha1Of(existingDlcWire),
+		existingDlcWire));
+	const auto existingDlcBefore = readAll(existingDlcAppinfo);
+	assert(AppInfoVdf::injectValidatedMetadataApps(
+		existingDlcAppinfo, metadataApps) == 1);
+	assert(readAll(existingDlcAppinfo) == existingDlcBefore);
 
 	// A concurrent Steam writer wins the file identity race. The scoped path
 	// must not replace that file or create/overwrite its rollback snapshot.

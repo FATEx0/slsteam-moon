@@ -4,6 +4,7 @@
 
 #include "appinfo_provision.hpp"
 #include "dlcids.hpp"
+#include "hotreload_publish_policy.hpp"
 
 #include "../config.hpp"
 
@@ -21,7 +22,9 @@ namespace HotReloadInputs
 {
 BuildResult buildFromCaches(
 	std::uint64_t generation,
-	const std::unordered_set<std::uint32_t>& managedAppIds)
+	const std::unordered_set<std::uint32_t>& managedAppIds,
+	const std::unordered_set<std::uint32_t>& metadataPendingBaseIds,
+	const std::unordered_set<std::uint32_t>& metadataDeferredBaseIds)
 {
 	std::vector<std::uint32_t> sortedBases(
 		managedAppIds.begin(), managedAppIds.end());
@@ -41,8 +44,12 @@ BuildResult buildFromCaches(
 				AppInfoProvision::readValidatedCacheBuffer(baseAppId, wire);
 			if (input.cacheValid)
 			{
+				input.cacheMtimeSecs =
+					AppInfoProvision::cachePairMtimeSecs(baseAppId);
 				const auto sources =
 					AppInfoProvision::extractDlcAppIdsBySource(wire, baseAppId);
+				const auto metadataCandidates =
+					AppInfoProvision::selectDlcMetadataCandidates(baseAppId, sources);
 				std::unordered_set<std::uint32_t> advertisedWithContent;
 				const bool baseHasDlcDepots =
 					AppInfoProvision::hasDepotsInDlc(wire);
@@ -59,6 +66,43 @@ BuildResult buildFromCaches(
 					sources, advertisedWithContent,
 					g_config.injectAllAdvertisedDlc.get());
 				input.plannerAppIds = selected.package0;
+
+				DlcMetadata::CacheRecord metadata;
+				const bool metadataReady =
+					AppInfoProvision::readValidatedDlcMetadataCache(
+						baseAppId, 0, metadata);
+				// The coordinator, not sidecar existence alone, decides when a
+				// runtime addition is complete.  A durable sidecar may exist after a
+				// failed live splice/reload; keep license refresh deferred until the
+				// worker explicitly confirms the live publication.
+				input.childMetadataPending =
+					metadataPendingBaseIds.count(baseAppId) != 0 &&
+					!metadataCandidates.empty();
+				input.childMetadataMissing =
+					!metadataCandidates.empty() && !metadataReady;
+				if (HotReloadPublishPolicy::metadataCacheVisibleInSession(
+					metadataReady,
+					metadataDeferredBaseIds.count(baseAppId) != 0))
+				{
+					std::unordered_set<std::uint32_t> rejected(
+						metadata.rejectedAppIds.begin(),
+						metadata.rejectedAppIds.end());
+					input.plannerAppIds.erase(
+						std::remove_if(
+							input.plannerAppIds.begin(), input.plannerAppIds.end(),
+							[&rejected](std::uint32_t appId)
+							{
+								return rejected.count(appId) != 0;
+							}),
+						input.plannerAppIds.end());
+					std::unordered_set<std::uint32_t> seen(
+						input.plannerAppIds.begin(), input.plannerAppIds.end());
+					for (const auto& app : metadata.apps)
+					{
+						if (app.appid != 0 && seen.insert(app.appid).second)
+							input.plannerAppIds.push_back(app.appid);
+					}
+				}
 			}
 
 			input.depotIds = DepotKey::managedDepotsForApp(baseAppId);

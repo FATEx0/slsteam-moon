@@ -21,6 +21,7 @@ enum class RefreshReason : std::uint8_t
 	LocalInputs     = 1u << 3,
 	CacheRepair     = 1u << 4,
 	ForceFull       = 1u << 5,
+	DlcMetadata     = 1u << 6,
 };
 
 constexpr std::uint8_t reasonMask(RefreshReason reason) noexcept
@@ -37,6 +38,16 @@ struct RefreshRequest
 	bool forceRefresh = false;
 	bool publishRuntime = false;
 };
+
+inline constexpr bool dlcMetadataPublishesLive(
+	const RefreshRequest& request) noexcept
+{
+	const std::uint8_t metadata = reasonMask(RefreshReason::DlcMetadata);
+	const std::uint8_t hotAdd = reasonMask(RefreshReason::HotAdd);
+	const bool metadataOnly = (request.reasons & ~metadata) == 0;
+	const bool explicitlyHotAdded = (request.reasons & hotAdd) != 0;
+	return request.publishRuntime && (metadataOnly || explicitlyHotAdded);
+}
 
 struct ObservedAppState
 {

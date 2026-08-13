@@ -5,10 +5,12 @@
 #pragma once
 
 #include "provision_cache.hpp"
+#include "provision_refresh.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -35,19 +37,32 @@ inline std::vector<std::uint32_t> mergeRuntimePublishCandidates(
 }
 
 inline std::vector<std::uint32_t> selectRuntimePublishCandidates(
-	const std::vector<std::uint32_t>& requested,
+	const std::vector<RefreshRequest>& requested,
 	const std::unordered_set<std::uint32_t>& managed,
-	const std::unordered_set<std::uint32_t>& synthetic)
+	const std::unordered_set<std::uint32_t>& synthetic,
+	const std::unordered_map<std::uint32_t, std::uint64_t>& generations)
 {
 	std::vector<std::uint32_t> selected;
 	selected.reserve(requested.size());
-	for (const std::uint32_t appId : requested)
+	for (const RefreshRequest& request : requested)
 	{
-		if (appId != 0 && managed.count(appId) != 0 &&
-			synthetic.count(appId) != 0)
-		{
-			selected.push_back(appId);
-		}
+		if (request.appId == 0 || !request.publishRuntime ||
+			managed.count(request.appId) == 0)
+			continue;
+		const auto generation = generations.find(request.appId);
+		if (generation == generations.end() ||
+			generation->second != request.managedGeneration)
+			continue;
+		const bool localUpdate =
+			(request.reasons & (reasonMask(RefreshReason::HotAdd) |
+			                    reasonMask(RefreshReason::LocalInputs))) != 0;
+		const bool suppressedSynthetic =
+			synthetic.count(request.appId) != 0 &&
+			(request.reasons & (reasonMask(RefreshReason::PicsProductInfo) |
+			                    reasonMask(RefreshReason::PicsChanges) |
+			                    reasonMask(RefreshReason::ForceFull))) != 0;
+		if (localUpdate || suppressedSynthetic)
+			selected.push_back(request.appId);
 	}
 	std::sort(selected.begin(), selected.end());
 	selected.erase(std::unique(selected.begin(), selected.end()), selected.end());

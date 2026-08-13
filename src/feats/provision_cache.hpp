@@ -327,6 +327,15 @@ inline bool shouldPreserveSyntheticMarker(bool retainCompatibility,
 	return retainCompatibility && isSynthetic;
 }
 
+// A child-metadata sidecar belongs to the base pair that was current before
+// publication.  Preserve it when the pair transaction rolls back; once the
+// new pair commits, readers must either observe matching new metadata or
+// reject the old sidecar by its base digest.
+inline bool shouldInvalidateDlcMetadata(bool basePublicationSucceeded)
+{
+	return basePublicationSucceeded;
+}
+
 struct CacheRecordFacts
 {
 	unsigned int requestedAppId = 0;

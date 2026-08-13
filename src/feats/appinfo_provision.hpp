@@ -41,6 +41,7 @@
 #pragma once
 
 #include "dlcids.hpp"
+#include "dlc_metadata.hpp"
 #include "manifeststore.hpp"
 #include "provision_cache.hpp"
 #include "provision_refresh.hpp"
@@ -71,6 +72,9 @@ struct CacheProbe
 };
 
 CacheProbe probeCache(std::uint32_t appId, CacheProbeMode mode);
+// Observation-only recency used outside Steam callbacks to prioritize bounded
+// metadata migration. Zero means the pair changed or could not be observed.
+std::int64_t cachePairMtimeSecs(std::uint32_t appId) noexcept;
 std::string localContentFingerprint(std::uint32_t appId);
 std::string localContentFingerprint(
 	std::uint32_t appId,
@@ -127,6 +131,9 @@ inline bool requestNeedsFetch(const RefreshRequest& request,
 	std::uint32_t cachedChangeNumber) noexcept
 {
 	if (request.appId == 0) return false;
+	const std::uint8_t nonMetadataReasons = static_cast<std::uint8_t>(
+		request.reasons & ~reasonMask(RefreshReason::DlcMetadata));
+	if (nonMetadataReasons == 0) return false;
 	if (request.forceRefresh) return true;
 	if (readiness == CacheReadiness::Missing ||
 	    readiness == CacheReadiness::Invalid ||
@@ -204,6 +211,16 @@ CachePublicationToken snapshotCachePublication(uint32_t appId);
 // otherwise unreadable; callers must retain their previous injection state in
 // every incomplete case.
 DlcInjectionIds collectDlcAppIdsForAddedApps(bool* complete = nullptr);
+
+// Read a durable metadata-only child cache for one currently managed base.
+// `expectedGeneration` closes remove/re-add races. A zero token asks the
+// reader to compare against the current process generation: generation zero
+// may reuse a cross-process record after base identity validation, while a
+// nonzero current generation still requires an exact record match.
+bool readValidatedDlcMetadataCache(
+	std::uint32_t baseAppId,
+	std::uint64_t expectedGeneration,
+	DlcMetadata::CacheRecord& record);
 
 // Fetch and persist a synthetic PICS buffer for `appId` if needed.
 // `appinfoVdfPath` is the path to Steam's appcache/appinfo.vdf and is

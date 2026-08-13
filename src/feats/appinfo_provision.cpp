@@ -7,11 +7,14 @@
 
 #include "appinfo_vdf.hpp"
 #include "appinfostate.hpp"
+#include "apps.hpp"
 #include "cmclient.hpp"
 #include "compattool.hpp"
 #include "depotkey.hpp"
 #include "emptydepot.hpp"
 #include "dlcids.hpp"
+#include "dlc_metadata.hpp"
+#include "hotreload.hpp"
 #include "manifestid.hpp"
 #include "manifeststore.hpp"
 #include "manifeststore_io.hpp"
@@ -60,6 +63,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -876,6 +880,26 @@ std::string getMetaPath(uint32_t appId)
 	return getCacheDir() + "/picsbuffer_" + std::to_string(appId) + ".yaml";
 }
 
+std::string getDlcMetadataPath(uint32_t baseAppId)
+{
+	return getCacheDir() + "/dlcmetadata_" +
+		std::to_string(baseAppId) + ".yaml";
+}
+
+bool readTextFileBounded(
+	const std::string& path, std::size_t maxBytes, std::string& output)
+{
+	output.clear();
+	std::ifstream input(path, std::ios::binary | std::ios::ate);
+	if (!input.is_open()) return false;
+	const std::streamsize rawSize = input.tellg();
+	if (rawSize <= 0 || static_cast<std::uint64_t>(rawSize) > maxBytes)
+		return false;
+	output.assign(static_cast<std::size_t>(rawSize), '\0');
+	input.seekg(0, std::ios::beg);
+	return input.read(output.data(), rawSize) && input.gcount() == rawSize;
+}
+
 std::string pendingProtonPath()
 {
 	return getCacheDir() + "/proton-mappings.pending";
@@ -1011,6 +1035,14 @@ bool statBuffer(uint32_t appId, cache::CacheValidationKey& identityOut)
 	    .metadataInode = static_cast<std::uint64_t>(metadataStat.st_ino),
 	};
 	return true;
+}
+
+std::int64_t cachePairMtimeSecsImpl(uint32_t appId) noexcept
+{
+	cache::CacheValidationKey identity{};
+	if (!statBuffer(appId, identity)) return 0;
+	return std::max<std::int64_t>(
+		identity.mtimeSecs, identity.metadataMtimeSecs);
 }
 
 // Freshness window for legacy/full provider passes. Startup accepts a
@@ -1986,6 +2018,11 @@ CacheProbe probeCache(uint32_t appId, CacheProbeMode mode)
 	return probeCacheImpl(appId, mode);
 }
 
+std::int64_t cachePairMtimeSecs(uint32_t appId) noexcept
+{
+	return cachePairMtimeSecsImpl(appId);
+}
+
 void sha1Bytes(const void* data, std::size_t size, std::uint8_t out[20])
 {
 	sha1BytesInternal(data, size, out);
@@ -2005,7 +2042,7 @@ bool publishCachePairLocked(uint32_t appId, const std::string& wire,
 		error = "unable to invalidate terminal sidecar";
 		return false;
 	}
-	return CachePair::publish(
+	const bool published = CachePair::publish(
 		getBufferPath(appId), getMetaPath(appId), wire, metadata, synthetic,
 		markerBefore,
 		[&](bool desired) {
@@ -2013,6 +2050,29 @@ bool publishCachePairLocked(uint32_t appId, const std::string& wire,
 			               : SynthMark::unmark(cacheDir, appId);
 		},
 		[&] { return SynthMark::isMarked(cacheDir, appId); }, error);
+	if (!published) return false;
+
+	// The pair transaction may restore the previous base on failure, so its
+	// compatible child metadata must survive that rollback. Invalidate only
+	// after the new pair commits. Readers share the cache lock held by the
+	// caller and cannot observe the new base beside the old sidecar; even after
+	// an interrupted cleanup, the sidecar's base digest makes it unusable.
+	if (cache::shouldInvalidateDlcMetadata(published))
+	{
+		std::error_code metadataError;
+		std::filesystem::remove(getDlcMetadataPath(appId), metadataError);
+		if (metadataError)
+		{
+			// The pair is already committed and cannot be reported as rolled
+			// back. The old sidecar remains fail-closed: readers compare its
+			// base SHA/change to the new pair and schedule a later repair.
+			g_pLog->debug(
+				"AppInfoProvision: cache pair committed for app=%u but DLC "
+				"metadata cleanup failed: %s\n",
+				appId, metadataError.message().c_str());
+		}
+	}
+	return true;
 }
 
 bool memoizePublishedCachePairLocked(uint32_t appId)
@@ -2064,6 +2124,95 @@ bool readValidatedCacheBuffer(uint32_t appId, std::string& buffer)
 	if (!cacheLock.acquired()) return false;
 	std::string diag;
 	return readValidatedCacheBufferLocked(appId, buffer, diag);
+}
+
+bool readValidatedDlcMetadataCache(
+	std::uint32_t baseAppId,
+	std::uint64_t expectedGeneration,
+	DlcMetadata::CacheRecord& record)
+{
+	record = {};
+	if (baseAppId == 0) return false;
+	std::error_code metadataPathError;
+	if (!std::filesystem::is_regular_file(
+		getDlcMetadataPath(baseAppId), metadataPathError) || metadataPathError)
+		return false;
+
+	std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+	const bool managed = g_config.managedAppIds.get().count(baseAppId) != 0;
+	const std::uint64_t currentGeneration =
+		cachePublicationGenerationLocked(baseAppId);
+	if (!managed) return false;
+
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired()) return false;
+	std::string validatedBaseWire;
+	std::string baseValidationDiag;
+	if (!readValidatedCacheBufferLocked(
+		baseAppId, validatedBaseWire, baseValidationDiag)) return false;
+	std::string baseMetadataText;
+	cache::CacheMetadataView baseMetadata;
+	if (!readCacheMetadataFile(
+		baseAppId, baseMetadataText, baseMetadata) ||
+		baseMetadata.appId != baseAppId) return false;
+	std::string encoded;
+	if (!readTextFileBounded(
+		getDlcMetadataPath(baseAppId), 32u << 20, encoded)) return false;
+	if (!DlcMetadata::decodeCache(encoded, record) ||
+		record.baseAppId != baseAppId) return false;
+	std::uint8_t baseDigest[20]{};
+	sha1BytesInternal(
+		validatedBaseWire.data(), validatedBaseWire.size(), baseDigest);
+	const std::string baseSha(
+		reinterpret_cast<const char*>(baseDigest), sizeof(baseDigest));
+	if (!DlcMetadata::baseIdentityMatches(
+		record.baseChangeNumber, record.baseSha,
+		baseMetadata.changeNumber, baseSha)) return false;
+	if (!DlcMetadata::cacheGenerationMatches(
+		record.baseGeneration, expectedGeneration, currentGeneration))
+		return false;
+	for (const auto& app : record.apps)
+	{
+		std::string normalized;
+		if (!DlcMetadata::normalize(
+			app.wireBuffer, app.appid, baseAppId, normalized) ||
+			normalized != app.wireBuffer) return false;
+		std::uint8_t digest[20]{};
+		sha1BytesInternal(
+			app.wireBuffer.data(), app.wireBuffer.size(), digest);
+		if (app.sha != std::string(
+			reinterpret_cast<const char*>(digest), sizeof(digest))) return false;
+	}
+	return true;
+}
+
+// Caller holds g_cachePublicationMu and the cache file lock. Re-read the
+// complete base pair at the publication boundary: a managed generation only
+// tracks remove/re-add, while a raw PICS or cross-process writer can replace
+// the pair without changing that generation during the CM metadata fetch.
+static bool dlcMetadataPublicationMatchesBaseLocked(
+	const DlcMetadata::CacheRecord& record,
+	std::uint64_t expectedGeneration)
+{
+	if (record.baseAppId == 0) return false;
+	std::string currentWire;
+	std::string validationDiag;
+	if (!readValidatedCacheBufferLocked(
+		record.baseAppId, currentWire, validationDiag)) return false;
+	std::string metadataText;
+	cache::CacheMetadataView metadata;
+	if (!readCacheMetadataFile(
+		record.baseAppId, metadataText, metadata) ||
+		metadata.appId != record.baseAppId) return false;
+	std::uint8_t digest[20]{};
+	sha1BytesInternal(currentWire.data(), currentWire.size(), digest);
+	const std::string currentSha(
+		reinterpret_cast<const char*>(digest), sizeof(digest));
+	return DlcMetadata::publicationMatchesBase(
+		record.baseGeneration, expectedGeneration,
+		cachePublicationGenerationLocked(record.baseAppId),
+		record.baseChangeNumber, record.baseSha,
+		metadata.changeNumber, currentSha);
 }
 
 std::mutex& cachePublicationMutex()
@@ -2528,9 +2677,13 @@ bool provisionApp(uint32_t appId, const std::string& appinfoVdfPath)
 		appId, appinfoVdfPath, pass, context));
 }
 
-void publishRuntimeAppInfo(
+bool publishRuntimeAppInfo(
 	const std::string& appinfoVdfPath,
-	const std::vector<std::uint32_t>& requested);
+	const std::vector<RefreshRequest>& requested);
+
+void enrichAndPublishDlcMetadata(
+	const std::string& appinfoVdfPath,
+	const std::vector<RefreshRequest>& publishedBases);
 
 int provisionAppsPass(const std::string& appinfoVdfPath,
                        const std::unordered_set<uint32_t>& added,
@@ -2809,6 +2962,7 @@ ProvisionPassSummary provisionRequestedApps(
 	const auto planOrigin = [](const std::vector<RefreshRequest>& batch) {
 		std::uint8_t reasons = 0;
 		for (const auto& request : batch) reasons |= request.reasons;
+		if (reasons & reasonMask(RefreshReason::DlcMetadata)) return "dlc-metadata";
 		if (reasons & reasonMask(RefreshReason::ForceFull)) return "force-full";
 		if (reasons & reasonMask(RefreshReason::LocalInputs)) return "local-inputs";
 		if (reasons & reasonMask(RefreshReason::HotAdd)) return "hot-add";
@@ -2842,7 +2996,7 @@ ProvisionPassSummary provisionRequestedApps(
 		}
 	}
 
-	std::vector<uint32_t> publish;
+	std::vector<RefreshRequest> publish;
 	for (const RefreshRequest& request : fetch)
 	{
 		ProvisionOutcome outcome = ProvisionOutcome::IncompleteContent;
@@ -2859,17 +3013,38 @@ ProvisionPassSummary provisionRequestedApps(
 		else if (isTerminalOutcome(outcome)) ++summary.terminal;
 		else ++summary.failed;
 		if (runtimePublicationAllowed(request.publishRuntime, outcome))
-			publish.push_back(request.appId);
+			publish.push_back(request);
+	}
+	for (const RefreshRequest& request : accepted)
+	{
+		const std::uint8_t nonMetadataReasons = static_cast<std::uint8_t>(
+			request.reasons & ~reasonMask(RefreshReason::DlcMetadata));
+		if (nonMetadataReasons == 0)
+			publish.push_back(request);
 	}
 
+	bool runtimePublished = false;
 	coordinator.commit([&] {
 		if (allowConfigWrite)
 		{
 			if (!injectProtonMappings()) persistPendingProtonMappings(true);
 		}
 		else persistPendingProtonMappings(false);
+		std::vector<RefreshRequest> basePublish;
+		for (const auto& request : publish)
+		{
+			if ((request.reasons & ~reasonMask(RefreshReason::DlcMetadata)) != 0)
+				basePublish.push_back(request);
+		}
+		if (!basePublish.empty())
+			runtimePublished = publishRuntimeAppInfo(appinfoVdfPath, basePublish);
 	});
-	if (!publish.empty()) publishRuntimeAppInfo(appinfoVdfPath, publish);
+	const bool metadataOnly = std::any_of(
+		publish.begin(), publish.end(), [](const RefreshRequest& request) {
+			return (request.reasons & reasonMask(RefreshReason::DlcMetadata)) != 0;
+		});
+	if (runtimePublished || metadataOnly)
+		enrichAndPublishDlcMetadata(appinfoVdfPath, publish);
 	g_pLog->info(
 		"AppInfoProvision: pass origin=targeted requested=%zu fetched=%zu "
 		"updated=%zu ready=%zu terminal=%zu failed=%zu\n",
@@ -3058,24 +3233,32 @@ enum class RefreshWorkerStartResult
 	Uncertain,
 };
 
-void publishRuntimeAppInfo(
+bool publishRuntimeAppInfo(
     const std::string& appinfoVdfPath,
-    const std::vector<std::uint32_t>& requested)
+    const std::vector<RefreshRequest>& requested)
 {
+	std::unordered_map<std::uint32_t, std::uint64_t> generations;
+	{
+		std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+		for (const RefreshRequest& request : requested)
+			generations[request.appId] =
+				cachePublicationGenerationLocked(request.appId);
+	}
 	const auto selected = selectRuntimePublishCandidates(
-		requested, g_config.managedAppIds.get(), SynthMark::loadAll(getCacheDir()));
+		requested, g_config.managedAppIds.get(), SynthMark::loadAll(getCacheDir()),
+		generations);
 	if (selected.empty())
-		return;
+		return false;
 
 	const std::unordered_set<std::uint32_t> scoped(
 		selected.begin(), selected.end());
 	if (AppInfoVdf::injectCachedApps(appinfoVdfPath, scoped) == 0)
 	{
 		g_pLog->warn(
-			"AppInfoProvision: live synthetic appinfo splice failed for %zu app(s); "
+			"AppInfoProvision: live appinfo splice failed for %zu app(s); "
 			"restart remains available\n",
 			selected.size());
-		return;
+		return false;
 	}
 
 	const AppInfoReload::Result reloaded =
@@ -3085,31 +3268,318 @@ void publishRuntimeAppInfo(
 		case AppInfoReload::Status::Unavailable:
 			g_pLog->warn(
 				"AppInfoProvision: live appinfo disk reload unavailable for %zu "
-				"synthetic app(s); restart remains available\n",
+				"app(s); restart remains available\n",
 				selected.size());
-			break;
+			return false;
 		case AppInfoReload::Status::ReadFailed:
 			g_pLog->warn(
 				"AppInfoProvision: Steam rejected live appinfo disk reload for %zu "
-				"synthetic app(s); restart remains available\n",
+				"app(s); restart remains available\n",
 				selected.size());
-			break;
+			return false;
 		case AppInfoReload::Status::Loaded:
-			if (reloaded.resolved == 0)
+			if (!AppInfoReload::allRequestedPresent(reloaded, selected.size()))
 			{
 				g_pLog->warn(
-					"AppInfoProvision: live appinfo reload completed but no current "
-					"synthetic app resolved; restart remains available\n");
+					"AppInfoProvision: live appinfo reload found %zu/%zu current "
+					"app(s); restart remains available\n",
+					reloaded.present, selected.size());
+				return false;
 			}
 			else
 			{
 				g_pLog->info(
-					"AppInfoProvision: published %zu synthetic app(s) into the live "
+					"AppInfoProvision: published %zu app(s) into the live "
 					"appinfo cache\n",
-					reloaded.resolved);
+					reloaded.present);
 			}
-			break;
+			return true;
 	}
+	return false;
+}
+
+struct DlcMetadataWork
+{
+	DlcMetadata::CacheRecord record;
+	std::uint64_t expectedGeneration = 0;
+	std::unordered_set<std::uint32_t> candidates;
+	bool cacheReady = false;
+	bool fetchComplete = false;
+	bool publishLive = false;
+};
+
+struct DlcMetadataLiveCommitGuard
+{
+	std::vector<const DlcMetadataWork*> work;
+	std::unique_lock<std::mutex> publicationLock;
+	std::optional<ProcessLock::FileLock> cacheLock;
+};
+
+bool acquireDlcMetadataLiveCommitGuard(void* opaque) noexcept
+{
+	try
+	{
+		auto& guard = *static_cast<DlcMetadataLiveCommitGuard*>(opaque);
+		guard.publicationLock = std::unique_lock<std::mutex>(g_cachePublicationMu);
+		guard.cacheLock.emplace(cacheLockPath(), false);
+		if (!guard.cacheLock->acquired()) return false;
+		const auto managed = g_config.managedAppIds.get();
+		for (const DlcMetadataWork* item : guard.work)
+		{
+			if (item == nullptr ||
+				managed.count(item->record.baseAppId) == 0 ||
+				!dlcMetadataPublicationMatchesBaseLocked(
+					item->record, item->expectedGeneration)) return false;
+		}
+		return !guard.work.empty();
+	}
+	catch (...)
+	{
+		return false;
+	}
+}
+
+std::vector<DlcMetadataWork> discoverDlcMetadataWork(
+	const std::vector<RefreshRequest>& publishedBases)
+{
+	std::vector<DlcMetadataWork> work;
+	work.reserve(publishedBases.size());
+	for (const RefreshRequest& request : publishedBases)
+	{
+		std::string baseWire;
+		if (!readValidatedCacheBuffer(request.appId, baseWire)) continue;
+		const auto candidates = selectDlcMetadataCandidates(
+			request.appId,
+			extractDlcAppIdsBySource(baseWire, request.appId));
+
+		DlcMetadataWork item;
+		item.publishLive = dlcMetadataPublishesLive(request);
+		item.expectedGeneration = request.managedGeneration;
+		item.record.baseAppId = request.appId;
+		item.record.baseGeneration = request.managedGeneration;
+		std::uint8_t baseDigest[20]{};
+		sha1BytesInternal(baseWire.data(), baseWire.size(), baseDigest);
+		item.record.baseSha.assign(
+			reinterpret_cast<const char*>(baseDigest), sizeof(baseDigest));
+		const CacheProbe probe = probeCache(
+			request.appId, CacheProbeMode::BlockingValidate);
+		item.record.baseChangeNumber = probe.changeNumber;
+		item.candidates.insert(candidates.begin(), candidates.end());
+		DlcMetadata::CacheRecord cached;
+		if (readValidatedDlcMetadataCache(
+			request.appId, request.managedGeneration, cached))
+		{
+			item.record = std::move(cached);
+			item.cacheReady = true;
+			item.fetchComplete = true;
+		}
+		work.push_back(std::move(item));
+	}
+	return work;
+}
+
+void enrichAndPublishDlcMetadata(
+	const std::string& appinfoVdfPath,
+	const std::vector<RefreshRequest>& publishedBases)
+{
+	auto work = discoverDlcMetadataWork(publishedBases);
+	if (work.empty()) return;
+
+	std::vector<std::uint32_t> candidates;
+	std::unordered_set<std::uint32_t> candidateSeen;
+	for (const auto& item : work)
+	{
+		if (item.cacheReady) continue;
+		for (const std::uint32_t appId : item.candidates)
+			if (candidateSeen.insert(appId).second) candidates.push_back(appId);
+	}
+	std::sort(candidates.begin(), candidates.end());
+	std::unordered_map<std::uint32_t, std::string> cmBuffers;
+	std::unordered_map<std::uint32_t, std::uint32_t> cmChanges;
+	if (!candidates.empty())
+	{
+		g_pLog->info(
+			"AppInfoProvision: fetching metadata for %zu DLC candidate(s)\n",
+			candidates.size());
+		if (CmClient::fetchProductInfoDetailed(
+			candidates, cmBuffers, &cmChanges) != CmClient::FetchResult::Success)
+		{
+			g_pLog->info(
+				"AppInfoProvision: DLC metadata fetch unavailable; base publication retained\n");
+			return;
+		}
+	}
+
+	for (auto& item : work)
+	{
+		if (item.cacheReady) continue;
+		item.fetchComplete = std::all_of(
+			item.candidates.begin(), item.candidates.end(),
+			[&](std::uint32_t candidate) {
+				return cmBuffers.count(candidate) != 0;
+			});
+		if (!item.fetchComplete)
+		{
+			g_pLog->info(
+				"AppInfoProvision: DLC metadata for base=%u was partial; completion remains pending\n",
+				item.record.baseAppId);
+			continue;
+		}
+		for (const std::uint32_t candidate : item.candidates)
+		{
+			const auto buffer = cmBuffers.find(candidate);
+			std::string normalized;
+			if (buffer == cmBuffers.end() ||
+				!DlcMetadata::normalize(
+					buffer->second, candidate, item.record.baseAppId, normalized))
+			{
+				item.record.rejectedAppIds.push_back(candidate);
+				continue;
+			}
+			std::uint8_t digest[20]{};
+			sha1BytesInternal(normalized.data(), normalized.size(), digest);
+			const auto change = cmChanges.find(candidate);
+			item.record.apps.push_back({
+				.appid = candidate,
+				.changeNumber = change == cmChanges.end() ? 0 : change->second,
+				.sha = std::string(
+					reinterpret_cast<const char*>(digest), sizeof(digest)),
+				.wireBuffer = std::move(normalized),
+			});
+		}
+		std::sort(item.record.rejectedAppIds.begin(),
+		          item.record.rejectedAppIds.end());
+	}
+
+	struct CompletedDlcMetadata
+	{
+		std::uint32_t baseAppId = 0;
+		std::uint64_t generation = 0;
+		bool publishLive = false;
+	};
+	std::vector<CompletedDlcMetadata> completedBases;
+	{
+		std::lock_guard<std::mutex> passLock(g_provisionPassMu);
+		std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+		const auto managed = g_config.managedAppIds.get();
+		ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+		if (!cacheLock.acquired()) return;
+		for (const auto& item : work)
+		{
+			if (!item.fetchComplete) continue;
+			if (managed.count(item.record.baseAppId) == 0 ||
+				!dlcMetadataPublicationMatchesBaseLocked(
+					item.record, item.expectedGeneration))
+				continue;
+			if (!item.cacheReady)
+			{
+				std::string encoded;
+				if (!DlcMetadata::encodeCache(item.record, encoded)) continue;
+				std::string error;
+				if (!AtomicFile::write(
+					getDlcMetadataPath(item.record.baseAppId), encoded, error))
+				{
+					g_pLog->debug(
+						"AppInfoProvision: cannot persist DLC metadata for base=%u: %s\n",
+						item.record.baseAppId, error.c_str());
+					continue;
+				}
+			}
+			completedBases.push_back({
+				item.record.baseAppId, item.expectedGeneration,
+				item.publishLive});
+		}
+	}
+	if (completedBases.empty()) return;
+	for (const auto& base : completedBases)
+	{
+		if (!base.publishLive)
+			(void)HotReload::noteDlcMetadataCacheCompletion(
+				base.baseAppId, base.generation);
+	}
+	completedBases.erase(
+		std::remove_if(
+			completedBases.begin(), completedBases.end(),
+			[](const auto& base) { return !base.publishLive; }),
+		completedBases.end());
+	if (completedBases.empty())
+	{
+		g_pLog->info(
+			"AppInfoProvision: cached DLC metadata for cold-start migration; "
+			"live Steam state unchanged\n");
+		return;
+	}
+
+	std::vector<AppInfoVdf::MetadataApp> liveApps;
+	std::vector<std::uint32_t> liveIds;
+	{
+		// Revalidate under the same pass boundary used by config removal. The
+		// guarded appinfo transaction acquires appinfo -> publication -> cache,
+		// then holds the base identities stable through its CAS. Network and
+		// sidecar I/O are already complete before this short commit section.
+		std::lock_guard<std::mutex> passLock(g_provisionPassMu);
+		DlcMetadataLiveCommitGuard guard;
+		{
+			std::unordered_set<std::uint32_t> completedIds;
+			for (const auto& base : completedBases)
+				completedIds.insert(base.baseAppId);
+			for (const auto& item : work)
+			{
+				if (completedIds.count(item.record.baseAppId) == 0) continue;
+				guard.work.push_back(&item);
+				for (const auto& app : item.record.apps)
+				{
+					liveApps.push_back(
+						{app.appid, app.changeNumber, app.sha, app.wireBuffer});
+					liveIds.push_back(app.appid);
+				}
+			}
+		}
+		const int injected = liveApps.empty() ? 0 :
+			AppInfoVdf::injectValidatedMetadataAppsGuarded(
+				appinfoVdfPath, liveApps, &guard,
+				&acquireDlcMetadataLiveCommitGuard);
+		guard.cacheLock.reset();
+		if (guard.publicationLock.owns_lock()) guard.publicationLock.unlock();
+		if (!liveApps.empty() && injected != static_cast<int>(liveApps.size()))
+		{
+			g_pLog->warn(
+				"AppInfoProvision: live DLC metadata splice failed or its base changed; completion remains pending\n");
+			return;
+		}
+		std::sort(liveIds.begin(), liveIds.end());
+		liveIds.erase(std::unique(liveIds.begin(), liveIds.end()), liveIds.end());
+		if (!liveIds.empty())
+		{
+			const auto reloaded = AppInfoState::reloadFromDisk(liveIds);
+			if (reloaded.status != AppInfoReload::Status::Loaded ||
+				reloaded.present != liveIds.size())
+			{
+				g_pLog->warn(
+					"AppInfoProvision: Steam rejected live DLC metadata reload; completion remains pending\n");
+				return;
+			}
+		}
+	}
+	std::size_t publishedBasesCount = 0;
+	for (const auto& base : completedBases)
+	{
+		if (HotReload::publishMetadataCompletion(
+			base.baseAppId, base.generation))
+			++publishedBasesCount;
+	}
+	if (publishedBasesCount == 0) return;
+
+	bool complete = false;
+	DlcInjectionIds allDlc;
+	{
+		std::lock_guard<std::mutex> passLock(g_provisionPassMu);
+		allDlc = collectDlcAppIdsForAddedApps(&complete);
+	}
+	if (complete) Apps::setAddedAppDlcIds(allDlc.appDlc);
+	g_pLog->info(
+		"AppInfoProvision: published %zu validated DLC metadata record(s) for %zu base app(s)\n",
+		liveApps.size(), publishedBasesCount);
 }
 
 void refreshWorkerStartFailed() noexcept

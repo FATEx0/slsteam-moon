@@ -46,7 +46,7 @@ ifeq ($(shell type mold &> /dev/null && echo "found"),found)
 	LDFLAGS += -fuse-ld=mold
 endif
 
-.PHONY: all build rebuild clean install release test-cmwire test-cmclient-loader test-dlcids test-dlc-scope test-config-path test-config-discovery test-synthmark test-pattern-catalog test-pattern-cache test-pattern-refresh test-process-lock test-atomic-file test-cache-pair test-appinfo-transaction test-appinfo-reload test-audit-symbols test-audit-policy test-memhlp-target test-memhlp-prologue test-memhlp-pic test-utils-sha test-provision-cache test-provision-refresh test-provision-result test-provision-terminal test-pending-proton test-provision-schedule test-provision-pass test-runtime-dependencies test-thread-start test-steamstub-warmup test-boundedexecutor test-steamless-prewarm test-depotkey-scope test-curl-timeout test-manifest-index test-manifeststore-io test-hotreload-inputs test-hotreload-capabilities test-libraryremoval test-pics test-prewarm-backoff test-yaml-runtime
+.PHONY: all build rebuild clean install release test-cmwire test-cmclient-loader test-dlcids test-dlc-scope test-dlc-metadata test-config-path test-config-discovery test-synthmark test-pattern-catalog test-pattern-cache test-pattern-refresh test-process-lock test-atomic-file test-cache-pair test-appinfo-transaction test-appinfo-reload test-audit-symbols test-audit-policy test-memhlp-target test-memhlp-prologue test-memhlp-pic test-utils-sha test-provision-cache test-provision-refresh test-provision-result test-provision-terminal test-pending-proton test-provision-schedule test-provision-pass test-runtime-dependencies test-thread-start test-steamstub-warmup test-boundedexecutor test-steamless-prewarm test-depotkey-scope test-curl-timeout test-manifest-index test-manifeststore-io test-hotreload-inputs test-hotreload-capabilities test-libraryremoval test-pics test-prewarm-backoff test-yaml-runtime
 .NOTPARALLEL: clean rebuild
 
 all: build
@@ -138,6 +138,13 @@ test-dlc-scope:
 		tools/test_dlc_scope.cpp src/feats/dlc.cpp -pthread \
 		-o /tmp/test_dlc_scope
 	/tmp/test_dlc_scope
+
+test-dlc-metadata:
+	$(CXX) -m32 -std=c++20 -D_GLIBCXX_USE_CXX11_ABI=0 \
+		-Wall -Wextra -Wpedantic -I include -I src \
+		tools/test_dlc_metadata.cpp src/feats/dlc_metadata.cpp \
+		lib/libyaml-cpp.a -o /tmp/test_dlc_metadata
+	/tmp/test_dlc_metadata
 
 test-config-path:
 	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \

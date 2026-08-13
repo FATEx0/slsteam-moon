@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -22,11 +23,16 @@ struct AppInput
 	bool cacheValid = false;
 	std::vector<std::uint32_t> plannerAppIds;
 	std::vector<std::uint32_t> depotIds;
+	bool childMetadataPending = false;
+	bool childMetadataMissing = false;
+	std::int64_t cacheMtimeSecs = 0;
 };
 
 struct BuildResult
 {
 	PackageSnapshot snapshot;
+	std::vector<std::uint32_t> metadataMissingBaseIds;
+	std::unordered_map<std::uint32_t, std::int64_t> cacheMtimeSecs;
 	bool valid = false;
 };
 
@@ -62,6 +68,12 @@ inline BuildResult build(std::uint64_t generation,
 
 		for (const std::uint32_t depotId : input.depotIds)
 			if (depotId != 0) depotIds.insert(depotId);
+		if (input.childMetadataPending)
+			out.snapshot.metadataComplete = false;
+		if (input.childMetadataMissing && input.baseAppId != 0)
+			out.metadataMissingBaseIds.push_back(input.baseAppId);
+		if (input.baseAppId != 0)
+			out.cacheMtimeSecs[input.baseAppId] = input.cacheMtimeSecs;
 
 		if (appIds.size() > maxIds || depotIds.size() > maxIds)
 		{
@@ -76,11 +88,15 @@ inline BuildResult build(std::uint64_t generation,
 	out.snapshot.depotIds.assign(depotIds.begin(), depotIds.end());
 	std::sort(out.snapshot.appIds.begin(), out.snapshot.appIds.end());
 	std::sort(out.snapshot.depotIds.begin(), out.snapshot.depotIds.end());
+	std::sort(out.metadataMissingBaseIds.begin(),
+	          out.metadataMissingBaseIds.end());
 	out.valid = true;
 	return out;
 }
 
 BuildResult buildFromCaches(std::uint64_t generation,
-	const std::unordered_set<std::uint32_t>& managedAppIds);
+	const std::unordered_set<std::uint32_t>& managedAppIds,
+	const std::unordered_set<std::uint32_t>& metadataPendingBaseIds = {},
+	const std::unordered_set<std::uint32_t>& metadataDeferredBaseIds = {});
 
 } // namespace HotReloadInputs

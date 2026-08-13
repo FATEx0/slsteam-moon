@@ -1238,6 +1238,63 @@ int injectCachedApps(const std::string& path,
 	return injected;
 }
 
+int injectValidatedMetadataApps(
+	const std::string& path,
+	const std::vector<MetadataApp>& metadataApps)
+
+{
+	return injectValidatedMetadataAppsGuarded(
+		path, metadataApps, nullptr, nullptr);
+}
+
+int injectValidatedMetadataAppsGuarded(
+	const std::string& path,
+	const std::vector<MetadataApp>& metadataApps,
+	void* context,
+	MetadataCommitGuard guard)
+{
+	if (metadataApps.empty()) return 0;
+
+	ProcessLock::FileLock lock(appInfoLockPath(path));
+	if (!lock.acquired()) return 0;
+	if (guard != nullptr && !guard(context)) return 0;
+
+	AppInfoFile file;
+	std::string error;
+	if (!readWithRecovery(path, file, error)) return 0;
+	AtomicFile::FileIdentity inputIdentity{};
+	if (!AtomicFile::readIdentity(path, inputIdentity)) return 0;
+
+	bool changed = false;
+	for (const MetadataApp& app : metadataApps)
+	{
+		if (app.appid == 0) return 0;
+		const bool alreadyPresent = std::any_of(
+			file.apps.begin(), file.apps.end(),
+			[&app](const AppEntry& entry) { return entry.appid == app.appid; });
+		if (alreadyPresent)
+		{
+			// Never downgrade an entry supplied by Steam (or a previous complete
+			// source) to metadata-only data: it may contain owned DLC depots,
+			// launch configuration, or tokens that this safe record strips.
+			continue;
+		}
+		bool entryChanged = false;
+		if (!mergeAppImpl(file, app.appid, app.changeNumber, app.sha,
+		                  app.wireBuffer, entryChanged, error))
+			return 0;
+		changed = changed || entryChanged;
+	}
+	if (changed && !publishCheckedIfUnchanged(
+		path, inputIdentity, file, error))
+	{
+		g_pLog->warn("AppInfoVdf: DLC metadata transaction aborted: %s\n",
+		             error.c_str());
+		return 0;
+	}
+	return static_cast<int>(metadataApps.size());
+}
+
 #ifdef APPINFO_VDF_TESTING
 void setBeforeScopedPublishHook(std::function<void()> hook)
 {

@@ -5,6 +5,7 @@
 #include "provision_cache.hpp"
 #include "appinfo_vdf.hpp"
 #include "depotkey.hpp"
+#include "hotreload.hpp"
 #include "manifeststore.hpp"
 #include "prewarm.hpp"
 #include "synthmark.hpp"
@@ -724,6 +725,10 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	// blocks on GitHub; this brings it up to date from a real worker
 	// thread, gated by a TTL so we don't fetch on every relaunch.
 	Updater::refreshInBackgroundIfStale();
+	// Run migration repair only after response-specific hot-add/cache work has
+	// been queued, so an older library entry can never delay the game that
+	// triggered this callback. The coordinator applies its own cooldown.
+	HotReload::repairMissingDlcMetadata(appinfoVdfPath);
 }
 
 void recvChangesSinceResponse(CMsgClientPICSChangesSinceResponse* resp)

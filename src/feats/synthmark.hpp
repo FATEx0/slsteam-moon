@@ -190,6 +190,7 @@ namespace SynthMark
 			return parseCacheAppId(filename, "synthetic_", "", appId) ||
 			       parseCacheAppId(filename, "picsbuffer_", ".bin", appId) ||
 			       parseCacheAppId(filename, "picsbuffer_", ".yaml", appId) ||
+			       parseCacheAppId(filename, "dlcmetadata_", ".yaml", appId) ||
 			       parseCacheAppId(filename, "terminal_", ".state", appId);
 		}
 
@@ -279,6 +280,7 @@ namespace SynthMark
 		add("picsbuffer_" + id + ".bin");
 		add("picsbuffer_" + id + ".yaml");
 		add("terminal_" + id + ".state");
+		add("dlcmetadata_" + id + ".yaml");
 		if (includeSyntheticMarker)
 			add("synthetic_" + id);
 		if (includeTicketArtifacts)

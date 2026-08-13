@@ -356,6 +356,30 @@ static void setup()
 
 			BootProf::Span spliceProfile(g_pLog.get(), "appinfo.splice_preinit");
 			AppInfoVdf::injectAllCached(candidate);
+			std::vector<AppInfoVdf::MetadataApp> dlcMetadataApps;
+			std::unordered_set<std::uint32_t> seenDlcMetadataApps;
+			for (const std::uint32_t baseAppId :
+				g_config.managedAppIds.get())
+			{
+				DlcMetadata::CacheRecord record;
+				if (!AppInfoProvision::readValidatedDlcMetadataCache(
+					baseAppId, 0, record)) continue;
+				for (const auto& app : record.apps)
+				{
+					if (!seenDlcMetadataApps.insert(app.appid).second) continue;
+					dlcMetadataApps.push_back({
+						.appid = app.appid,
+						.changeNumber = app.changeNumber,
+						.sha = app.sha,
+						.wireBuffer = app.wireBuffer,
+					});
+				}
+			}
+			if (!dlcMetadataApps.empty())
+			{
+				(void)AppInfoVdf::injectValidatedMetadataApps(
+					candidate, dlcMetadataApps);
+			}
 		}
 	}
 

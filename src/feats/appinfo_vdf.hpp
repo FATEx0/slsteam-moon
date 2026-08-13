@@ -60,6 +60,14 @@
 
 namespace AppInfoVdf
 {
+	struct MetadataApp
+	{
+		uint32_t appid = 0;
+		uint32_t changeNumber = 0;
+		std::string sha;
+		std::string wireBuffer;
+	};
+	using MetadataCommitGuard = bool (*)(void*) noexcept;
 	// Return the first existing Steam appinfo.vdf path from the supported
 	// installation roots, or an empty string when Steam is not bootstrapped.
 	std::string findExistingPath();
@@ -90,6 +98,28 @@ namespace AppInfoVdf
 	int injectCachedApps(const std::string& path,
 	                     const std::unordered_set<uint32_t>& requestedApps);
 
+	// Atomically insert missing, already-validated metadata-only child records.
+	// Existing Steam records are preserved byte-for-byte so their content
+	// topology and tokens can never be downgraded by this path. The
+	// caller owns parent/generation validation; this layer deliberately does
+	// not require child ids to be managed base apps.
+	int injectValidatedMetadataApps(
+		const std::string& path,
+		const std::vector<MetadataApp>& metadataApps);
+
+	// Same insert-only transaction, with a final caller-owned guard acquired
+	// after the appinfo file lock. The guard may retain locks in `context`
+	// until this function returns, allowing a base-cache identity check to stay
+	// linearizable with the appinfo CAS without imposing cache knowledge here.
+	int injectValidatedMetadataAppsGuarded(
+		const std::string& path,
+		const std::vector<MetadataApp>& metadataApps,
+		void* context,
+		MetadataCommitGuard guard);
+
+	// Startup companion for metadata-only child caches. Validates each record
+	// against its currently managed base and merges it in the same v41
+	// transaction as normal cached base records.
 #ifdef APPINFO_VDF_TESTING
 	void setBeforeScopedPublishHook(std::function<void()> hook);
 #endif
