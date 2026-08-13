@@ -293,6 +293,21 @@ bool Apps::checkAppOwnership(uint32_t appId, CAppOwnershipInfo* pInfo)
 		return false;
 	}
 
+	const bool manualUnlock = g_config.isAddedAppId(appId);
+	const EAppType type = g_pClientApps
+		? g_pClientApps->getAppType(appId)
+		: APPTYPE_INVALID;
+	const bool typeKnown = type != APPTYPE_INVALID;
+	const bool gameOrApplication =
+		type == APPTYPE_APPLICATION || type == APPTYPE_GAME;
+	if (!ownershipOverrideAllowed(
+	        manualUnlock, g_config.playNotOwnedGames.get(),
+	        pInfo->ownsLicense, typeKnown, type == APPTYPE_DLC,
+	        g_config.automaticFilter.get(), gameOrApplication))
+	{
+		return false;
+	}
+
 	if (pInfo->lowViolence)
 	{
 		pInfo->lowViolence = false;
@@ -308,36 +323,6 @@ bool Apps::checkAppOwnership(uint32_t appId, CAppOwnershipInfo* pInfo)
 	if (times.contains(appId))
 	{
 		pInfo->purchaseTime = times.at(appId);
-	}
-
-	const bool manualUnlock = g_config.isAddedAppId(appId);
-	if (!manualUnlock && (!g_config.playNotOwnedGames.get() || pInfo->ownsLicense))
-	{
-		return false;
-	}
-
-	if (!manualUnlock && g_config.automaticFilter.get())
-	{
-		if (!g_pClientApps)
-		{
-			return false;
-		}
-
-		auto type = g_pClientApps->getAppType(appId);
-		if (type == APPTYPE_DLC) //Don't touch DLC here, otherwise downloads might break. Hopefully this won't decrease compatibility
-		{
-			return false;
-		}
-
-		switch(type)
-		{
-			case APPTYPE_APPLICATION:
-			case APPTYPE_GAME:
-				break;
-
-			default:
-				return false;
-		}
 	}
 
 	unlockApp(appId, pInfo);

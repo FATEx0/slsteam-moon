@@ -522,7 +522,7 @@ static bool hkClientAppManager_BIsDlcEnabled(void* pClientAppManager, uint32_t a
 	);
 
 	
-	if (DLC::isDlcEnabled(appId))
+	if (DLC::isDlcEnabled(appId, dlcId))
 	{
 		return true;
 	}
@@ -623,8 +623,19 @@ static bool hkClientApps_GetDLCDataByIndex(void* pClientApps, uint32_t appId, in
 {
 	appId = FakeAppIds::getRealAppIdForCurrentPipe();
 
-	const bool ret = DLC::getDlcDataByIndex(appId, dlcIndex, pDlcId, pIsAvailable, pChDlcName, dlcNameLen)
-		|| Hooks::IClientApps_GetDLCDataByIndex.originalFn.fn(pClientApps, appId, dlcIndex, pDlcId, pIsAvailable, pChDlcName, dlcNameLen);
+	bool ret = DLC::getDlcDataByIndex(
+		appId, dlcIndex, pDlcId, pIsAvailable, pChDlcName, dlcNameLen);
+	if (!ret)
+	{
+		ret = Hooks::IClientApps_GetDLCDataByIndex.originalFn.fn(
+			pClientApps, appId, dlcIndex, pDlcId, pIsAvailable,
+			pChDlcName, dlcNameLen);
+		if (ret)
+		{
+			DLC::makeDlcAvailable(
+				pDlcId ? *pDlcId : 0, pIsAvailable);
+		}
+	}
 
 
 	g_pLog->debugOnce

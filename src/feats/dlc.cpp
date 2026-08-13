@@ -17,6 +17,18 @@ bool DLC::shouldUnlockDlc(uint32_t appId)
 		return false;
 	}
 
+	// The upstream DLC hook applied the global AppIds blacklist/whitelist to
+	// every DLC queried while any game was active.  With the default empty
+	// blacklist that made DLC from ordinary, genuinely-owned games eligible
+	// for the local ownership override.  Scope the override to DLC ids
+	// discovered from LuaTools-managed base apps instead.  This deliberately
+	// does not depend on ownership of the base app: adding an already-owned
+	// game through LuaTools must still enable its managed DLC set.
+	if (!Apps::isAddedAppDlcId(appId))
+	{
+		return false;
+	}
+
 	if (g_config.shouldExcludeAppId(appId))
 	{
 		return false;
@@ -43,9 +55,10 @@ bool DLC::checkAppOwnership(uint32_t appId, CAppOwnershipInfo *info)
 	return true;
 }
 
-bool DLC::isDlcEnabled(uint32_t appId)
+bool DLC::isDlcEnabled(uint32_t baseAppId, uint32_t dlcId)
 {
-	return shouldUnlockDlc(appId);
+	(void)baseAppId;
+	return shouldUnlockDlc(dlcId);
 }
 
 bool DLC::isAppDlcInstalled(uint32_t appId)
@@ -62,6 +75,11 @@ bool DLC::userSubscribedInTicket(uint32_t appId)
 
 uint32_t DLC::getDlcCount(uint32_t appId)
 {
+	if (!g_config.managedAppIds.get().contains(appId))
+	{
+		return 0;
+	}
+
 	const auto dlcData = g_config.dlcData.get();
 	if (dlcData.contains(appId))
 	{
@@ -73,7 +91,8 @@ uint32_t DLC::getDlcCount(uint32_t appId)
 
 bool DLC::getDlcDataByIndex(uint32_t appId, int index, uint32_t* dlcId, bool* available, char* dlcName, size_t& dlcNameLen)
 {
-	if (!dlcId || !available || !dlcName)
+	if (!dlcId || !available || !dlcName
+	    || !g_config.managedAppIds.get().contains(appId))
 	{
 		return false;
 	}
@@ -93,10 +112,14 @@ bool DLC::getDlcDataByIndex(uint32_t appId, int index, uint32_t* dlcId, bool* av
 
 		return true;
 	}
-	else if (!g_config.shouldExcludeAppId(*dlcId))
+	return false;
+}
+
+void DLC::makeDlcAvailable(uint32_t dlcId, bool* available)
+{
+	if (available && Apps::isAddedAppDlcId(dlcId)
+	    && !g_config.shouldExcludeAppId(dlcId))
 	{
 		*available = true;
 	}
-
-	return false;
 }
