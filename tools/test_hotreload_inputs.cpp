@@ -1,3 +1,4 @@
+#include "../src/feats/appinfo_provision.hpp"
 #include "../src/feats/hotreload_inputs.hpp"
 #include "../src/feats/hotreload_publish_policy.hpp"
 
@@ -49,12 +50,43 @@ int main()
 		bounded.snapshot.appIds.empty() && bounded.snapshot.depotIds.empty(),
 		"oversized input fails closed without a destructive partial snapshot");
 
-	check(!HotReloadPublishPolicy::shouldPublish(false, false),
-		"an unchanged membership event may coalesce normally");
-	check(HotReloadPublishPolicy::shouldPublish(false, true),
-		"a source-write event forces a rebuilt package snapshot");
-	check(HotReloadPublishPolicy::shouldPublish(true, false),
+	check(HotReloadPublishPolicy::shouldEvaluateInputs(
+		/*initialPublication=*/false, /*membershipChanged=*/false,
+		/*forceSourceRefresh=*/true),
+		"a forced source event evaluates local inputs");
+	check(!HotReloadPublishPolicy::shouldPublish(
+		/*initialPublication=*/false, /*membershipChanged=*/false,
+		/*fingerprintsChanged=*/false),
+		"an unchanged duplicate forced event does not publish");
+	check(HotReloadPublishPolicy::shouldPublish(
+		/*initialPublication=*/true, /*membershipChanged=*/false,
+		/*fingerprintsChanged=*/false),
+		"the initial state always publishes");
+	check(HotReloadPublishPolicy::shouldPublish(
+		/*initialPublication=*/false, /*membershipChanged=*/true,
+		/*fingerprintsChanged=*/false),
 		"a membership transition always publishes");
+	check(HotReloadPublishPolicy::shouldPublish(
+		/*initialPublication=*/false, /*membershipChanged=*/false,
+		/*fingerprintsChanged=*/true),
+		"a key or archived fallback change publishes");
+	check(!HotReloadPublishPolicy::shouldEvaluateInputs(
+		/*initialPublication=*/false, /*membershipChanged=*/false,
+		/*forceSourceRefresh=*/false),
+		"an ordinary unchanged event skips fingerprint evaluation");
+
+	const std::vector<ProvisionTerminal::LocalInput> localInputs{
+		{330, "", 999},
+		{110, "alpha", 999},
+		{220, "beta", 999},
+	};
+	const ManifestStore::ArchivedGidIndex archivedGids{
+		{110, 19},
+		{220, 3},
+	};
+	check(AppInfoProvision::fingerprintIndexedLocalInputs(
+		localInputs, archivedGids) == "baba8bfd866131f5",
+		"indexed gids preserve terminal fingerprint semantics");
 
 	return failures == 0 ? 0 : 1;
 }

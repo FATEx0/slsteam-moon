@@ -14,11 +14,11 @@
 #include "base64/base64.hpp"
 #include "prewarm.hpp"
 #include "provision_cache.hpp"
-#include "provision_schedule.hpp"
 #include "synthmark.hpp"
 #include "yaml-cpp/yaml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
@@ -31,7 +31,6 @@
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <sys/stat.h>
 #include <ctime>
 #include <unistd.h>
 #include <unordered_map>
@@ -50,6 +49,14 @@ namespace
 constexpr uint32_t MAGIC_V41 = 0x07564429;
 constexpr uint32_t UNIVERSE_PUBLIC = 1;
 
+#ifdef APPINFO_VDF_TESTING
+std::function<void()>& beforeScopedPublishHook()
+{
+	static std::function<void()> hook;
+	return hook;
+}
+#endif
+
 bool parsePicsBufferName(const std::string& name, uint32_t& appId)
 {
 	constexpr std::string_view prefix = "picsbuffer_";
@@ -66,34 +73,6 @@ bool parsePicsBufferName(const std::string& name, uint32_t& appId)
 	if (result.ec != std::errc{} || result.ptr != last) return false;
 	appId = parsed;
 	return true;
-}
-
-long long provisionTtlSecsForSplice()
-{
-	if (const char* ov = std::getenv("SLSSTEAM_PROVISION_TTL"); ov && *ov)
-	{
-		try { return std::stoll(ov); } catch (...) {}
-	}
-	return 300;
-}
-
-bool shouldSkipStaleCacheForSplice(const std::string& cacheDir,
-                                    uint32_t appId,
-                                    bool explicitFallback)
-{
-	const bool asyncEnabled = AppInfoProvision::asyncProvisionEnabled(
-		g_config.asyncProvision.get(), std::getenv("SLSSTEAM_ASYNC_PROVISION"));
-	if (!AppInfoProvision::shouldSkipStaleAsyncSplice(
-			asyncEnabled, explicitFallback))
-		return false;
-
-	const auto bufferPath = cacheDir + "/picsbuffer_" +
-	                        std::to_string(appId) + ".bin";
-	struct stat st{};
-	if (::stat(bufferPath.c_str(), &st) != 0) return false;
-	return !AppInfoProvision::cache::isBufferReusable(
-		st.st_size > 0, static_cast<long long>(st.st_mtime),
-		static_cast<long long>(std::time(nullptr)), provisionTtlSecsForSplice());
 }
 
 // KV1 binary node types.
@@ -605,7 +584,7 @@ void sha1(const void* data, size_t n, uint8_t out[20])
 // Serialise the parsed AppInfoFile back to disk
 // ---------------------------------------------------------------------------
 
-bool writeV41(const std::string& path, const AppInfoFile& f, std::string& err)
+bool serializeV41(const AppInfoFile& f, std::vector<uint8_t>& out)
 {
 	std::vector<uint8_t> body;
 	body.reserve(2 * 1024 * 1024);
@@ -641,7 +620,7 @@ bool writeV41(const std::string& path, const AppInfoFile& f, std::string& err)
 	    static_cast<int64_t>(16) + static_cast<int64_t>(body.size());
 
 	// Build the final byte vector: header + body + string table
-	std::vector<uint8_t> out;
+	out.clear();
 	out.reserve(body.size() + 64 * 1024);
 	writeLE<uint32_t>(out, MAGIC_V41);
 	writeLE<uint32_t>(out, f.universe);
@@ -655,6 +634,13 @@ bool writeV41(const std::string& path, const AppInfoFile& f, std::string& err)
 		out.push_back(0);
 	}
 
+	return true;
+}
+
+bool writeV41(const std::string& path, const AppInfoFile& f, std::string& err)
+{
+	std::vector<uint8_t> out;
+	if (!serializeV41(f, out)) return false;
 	// Write to a unique temporary inode, fsync it, and publish with rename.
 	// This also prevents two setup namespaces from sharing the old fixed
 	// `appinfo.vdf.tmp` pathname.
@@ -975,6 +961,54 @@ bool publishChecked(const std::string& path, const AppInfoFile& file,
 	return false;
 }
 
+bool publishCheckedIfUnchanged(const std::string& path,
+	                            const AtomicFile::FileIdentity& expected,
+	                            const AppInfoFile& file, std::string& err)
+{
+	std::vector<uint8_t> serialized;
+	if (!serializeV41(file, serialized))
+	{
+		err = "cannot serialize v41 appinfo";
+		return false;
+	}
+	static std::atomic<unsigned long> validationSequence{0};
+	const std::string validationPath = path + ".slssteam-validate." +
+		std::to_string(static_cast<long long>(::getpid())) + "." +
+		std::to_string(validationSequence.fetch_add(1, std::memory_order_relaxed));
+	if (!AtomicFile::write(validationPath,
+		reinterpret_cast<const char*>(serialized.data()), serialized.size(), err))
+		return false;
+	AppInfoFile validation;
+	std::string validationError;
+	const bool valid = readV41(validationPath, validation, validationError);
+	std::error_code cleanupError;
+	std::filesystem::remove(validationPath, cleanupError);
+	if (!valid)
+	{
+		err = "pre-publish validation failed: " + validationError;
+		return false;
+	}
+	if (cleanupError)
+	{
+		err = "cannot remove pre-publish validation file: " +
+			cleanupError.message();
+		return false;
+	}
+
+#ifdef APPINFO_VDF_TESTING
+	{
+		auto hook = std::move(beforeScopedPublishHook());
+		beforeScopedPublishHook() = nullptr;
+		if (hook) hook();
+	}
+#endif
+
+	if (!AtomicFile::writeIfUnchanged(path, expected,
+		reinterpret_cast<const char*>(serialized.data()), serialized.size(), err))
+		return false;
+	return true;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1040,9 +1074,7 @@ bool injectApp(const std::string& path,
 	return true;
 }
 
-int injectAllCached(
-	const std::string& path,
-	const std::unordered_set<uint32_t>& explicitFallbackApps)
+int injectAllCached(const std::string& path)
 {
 	const auto cacheDir = g_config.getDir() + "/cache";
 	if (!std::filesystem::exists(cacheDir)) return 0;
@@ -1122,15 +1154,6 @@ int injectAllCached(
 			                expectedAppId, fname.c_str());
 			continue;
 		}
-		const bool explicitFallback =
-			explicitFallbackApps.count(expectedAppId) != 0;
-		if (shouldSkipStaleCacheForSplice(
-				cacheDir, expectedAppId, explicitFallback))
-		{
-			g_pLog->debug("AppInfoVdf: skipping stale async cache app=%u (%s)\n",
-			              expectedAppId, fname.c_str());
-			continue;
-		}
 		if (!loadCachedBuffer(metaPath.string(), expectedAppId, cb, err))
 		{
 			g_pLog->debug("AppInfoVdf: skip %s: %s\n",
@@ -1166,5 +1189,60 @@ int injectAllCached(
 	}
 	return injected;
 }
+
+int injectCachedApps(const std::string& path,
+	                 const std::unordered_set<uint32_t>& requestedApps)
+{
+	if (requestedApps.empty()) return 0;
+
+	ProcessLock::FileLock lock(appInfoLockPath(path));
+	if (!lock.acquired()) return 0;
+	ProcessLock::FileLock cacheLock(AppInfoProvision::cacheLockPath(), false);
+	if (!cacheLock.acquired()) return 0;
+
+	AppInfoFile file;
+	std::string readError;
+	if (!readWithRecovery(path, file, readError)) return 0;
+	AtomicFile::FileIdentity inputIdentity{};
+	if (!AtomicFile::readIdentity(path, inputIdentity)) return 0;
+
+	const auto managed = g_config.managedAppIds.get();
+	const auto cacheDir = g_config.getDir() + "/cache";
+	int injected = 0;
+	bool changed = false;
+	for (const uint32_t appId : requestedApps)
+	{
+		if (appId == 0 || managed.count(appId) == 0) continue;
+		const std::string metaPath = cacheDir + "/picsbuffer_" +
+			std::to_string(appId) + ".yaml";
+		CachedBuffer cb;
+		std::string err;
+		if (!loadCachedBuffer(metaPath, appId, cb, err)) continue;
+		bool entryChanged = false;
+		if (!mergeAppImpl(file, cb.appid, cb.change_number, cb.sha, cb.buffer,
+		                  entryChanged, err))
+			continue;
+		++injected;
+		changed = changed || entryChanged;
+	}
+	if (changed)
+	{
+		std::string writeError;
+		if (!publishCheckedIfUnchanged(path, inputIdentity, file, writeError))
+		{
+			g_pLog->warn("AppInfoVdf: scoped transaction aborted: %s\n",
+			             writeError.c_str());
+			return 0;
+		}
+	}
+	return injected;
+}
+
+#ifdef APPINFO_VDF_TESTING
+void setBeforeScopedPublishHook(std::function<void()> hook)
+{
+	beforeScopedPublishHook() = std::move(hook);
+}
+#endif
 
 } // namespace AppInfoVdf

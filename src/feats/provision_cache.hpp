@@ -8,13 +8,12 @@
 // with every game the user adds.  We short-circuit the fetch when a
 // freshly-written picsbuffer_<appid>.bin is already on disk.
 //
-// The window (TTL) is intentionally short: it must cover the re-exec storm
-// of ONE boot (so those passes reuse the buffer and Steam launches fast)
-// without surviving into a later genuine relaunch — across sessions we
-// re-fetch the live public gid, because the install-first-attempt path
-// stages whatever gid the buffer carries and Steam refreshes appinfo to
-// the live gid at install time, so a stale cross-session buffer would
-// reintroduce the gid mismatch this project already fixed.
+// The window (TTL) is intentionally short and applies only to legacy/full
+// refresh passes inside one boot. Startup splice eligibility is structural,
+// not time-based: a complete pair is validated and reused across sessions,
+// while explicit PICS change numbers schedule targeted refreshes. Install-time
+// manifest selection remains authoritative and can fall back to the locally
+// installed/archive artifact when the current public artifact is unavailable.
 //
 // This header is PURE (no I/O) so the decision is unit-testable; the
 // stat()/fetch/persist wiring lives in appinfo_provision.cpp.
@@ -28,12 +27,28 @@
 
 namespace AppInfoProvision
 {
+
+// Complete readiness classification used by the refresh scheduler. The cache
+// probe currently produces the established Missing/Fresh/ValidStale states;
+// the remaining states let later probe work distinguish contention and
+// unverified data without treating either as a normal warm cache.
+enum class CacheReadiness
+{
+	Missing,
+	Invalid,
+	Fresh,
+	ValidStale,
+	Busy,
+	Unverified,
+};
+
 namespace cache
 {
 
 struct CacheMetadataView
 {
 	std::uint32_t appId = 0;
+	std::uint32_t changeNumber = 0;
 	std::uint64_t wireSize = 0;
 	std::string_view shaBase64;
 	bool hasSynthetic = false;
@@ -111,6 +126,7 @@ inline bool parseCacheMetadata(
 				number > std::numeric_limits<std::uint32_t>::max())
 				return false;
 			changeSeen = true;
+			parsed.changeNumber = static_cast<std::uint32_t>(number);
 		}
 		else if (key == "wire_size")
 		{
@@ -163,11 +179,9 @@ inline bool parseCacheMetadata(
 	return true;
 }
 
-// Identity of the on-disk buffer used as the memoization key for its
-// expensive YAML/SHA-1/VDF validation.  Seconds plus size are not enough:
-// an atomic replacement can preserve both while changing the content within
-// the same second.  Include nanoseconds and inode so that replacement files
-// cannot inherit a previous validation result.
+// Identity of the complete on-disk pair used as the memoization key for its
+// expensive YAML/SHA-1/VDF validation. Both files participate: replacing only
+// metadata must not inherit validation from the same buffer inode.
 struct CacheValidationKey
 {
 	uint32_t appId = 0;
@@ -175,6 +189,10 @@ struct CacheValidationKey
 	long long mtimeNsecs = 0;
 	long long size = 0;
 	std::uint64_t inode = 0;
+	long long metadataMtimeSecs = 0;
+	long long metadataMtimeNsecs = 0;
+	long long metadataSize = 0;
+	std::uint64_t metadataInode = 0;
 
 	bool operator==(const CacheValidationKey& other) const noexcept
 	{
@@ -182,7 +200,11 @@ struct CacheValidationKey
 		    && mtimeSecs == other.mtimeSecs
 		    && mtimeNsecs == other.mtimeNsecs
 		    && size == other.size
-		    && inode == other.inode;
+		    && inode == other.inode
+		    && metadataMtimeSecs == other.metadataMtimeSecs
+		    && metadataMtimeNsecs == other.metadataMtimeNsecs
+		    && metadataSize == other.metadataSize
+		    && metadataInode == other.metadataInode;
 	}
 
 	bool operator<(const CacheValidationKey& other) const noexcept
@@ -192,7 +214,14 @@ struct CacheValidationKey
 		if (mtimeNsecs != other.mtimeNsecs)
 			return mtimeNsecs < other.mtimeNsecs;
 		if (size != other.size) return size < other.size;
-		return inode < other.inode;
+		if (inode != other.inode) return inode < other.inode;
+		if (metadataMtimeSecs != other.metadataMtimeSecs)
+			return metadataMtimeSecs < other.metadataMtimeSecs;
+		if (metadataMtimeNsecs != other.metadataMtimeNsecs)
+			return metadataMtimeNsecs < other.metadataMtimeNsecs;
+		if (metadataSize != other.metadataSize)
+			return metadataSize < other.metadataSize;
+		return metadataInode < other.metadataInode;
 	}
 };
 

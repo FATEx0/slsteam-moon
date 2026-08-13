@@ -20,6 +20,7 @@ enum class ProvisionOutcome
 	FallbackCache,
 	NetworkUnavailable,
 	IncompleteContent,
+	NoUsableContent,
 	NotApplicable,
 	LocalFailure,
 };
@@ -39,6 +40,21 @@ inline bool isProvisioned(ProvisionOutcome outcome)
 	    || outcome == ProvisionOutcome::FallbackCache;
 }
 
+inline bool isTerminalOutcome(ProvisionOutcome outcome)
+{
+	return outcome == ProvisionOutcome::NotApplicable ||
+	       outcome == ProvisionOutcome::NoUsableContent;
+}
+
+// Reloading Steam's live appinfo map is a recovery action for a response we
+// deliberately suppressed. It is safe only after this pass published a new,
+// validated pair; cache reuse and offline fallback must remain disk-only.
+inline bool runtimePublicationAllowed(bool requested,
+                                      ProvisionOutcome outcome) noexcept
+{
+	return requested && outcome == ProvisionOutcome::Updated;
+}
+
 inline ProvisionNotice noticeForOutcome(ProvisionOutcome outcome)
 {
 	switch (outcome)
@@ -51,6 +67,7 @@ inline ProvisionNotice noticeForOutcome(ProvisionOutcome outcome)
 		case ProvisionOutcome::NetworkUnavailable:
 			return ProvisionNotice::MetadataUnavailable;
 		case ProvisionOutcome::IncompleteContent:
+		case ProvisionOutcome::NoUsableContent:
 			return ProvisionNotice::ReviewGameData;
 		case ProvisionOutcome::LocalFailure:
 			return ProvisionNotice::LocalStorage;

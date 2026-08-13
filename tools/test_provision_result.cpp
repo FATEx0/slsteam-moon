@@ -22,7 +22,9 @@ int main()
 	using AppInfoProvision::ProvisionNotice;
 	using AppInfoProvision::classifyContentResult;
 	using AppInfoProvision::isProvisioned;
+	using AppInfoProvision::isTerminalOutcome;
 	using AppInfoProvision::noticeForOutcome;
+	using AppInfoProvision::runtimePublicationAllowed;
 	using AppInfoProvision::shouldTryProviderFallback;
 
 	CHECK(classifyContentResult(false, true) == SourceResult::Success,
@@ -67,9 +69,29 @@ int main()
 	      "virtual DLC without content is silent");
 	CHECK(!isProvisioned(ProvisionOutcome::NotApplicable),
 	      "virtual DLC is not counted as a provisioned game");
+	CHECK(isTerminalOutcome(ProvisionOutcome::NotApplicable),
+	      "virtual DLC is terminal and silent");
+	CHECK(isTerminalOutcome(ProvisionOutcome::NoUsableContent),
+	      "concrete unusable content is terminal but actionable");
+	CHECK(noticeForOutcome(ProvisionOutcome::NoUsableContent) ==
+	          ProvisionNotice::ReviewGameData,
+	      "unusable content retains the review-data notice");
+	CHECK(!isProvisioned(ProvisionOutcome::NoUsableContent),
+	      "unusable content is resolved without becoming installable");
 	CHECK(noticeForOutcome(ProvisionOutcome::LocalFailure) ==
 	          ProvisionNotice::LocalStorage,
 	      "cache write failure gets a local-storage notice");
+
+	CHECK(runtimePublicationAllowed(true, ProvisionOutcome::Updated),
+	      "a requested live publication accepts a newly published cache pair");
+	CHECK(!runtimePublicationAllowed(false, ProvisionOutcome::Updated),
+	      "an ordinary update remains disk-only");
+	CHECK(!runtimePublicationAllowed(true, ProvisionOutcome::FreshCache),
+	      "same-boot cache reuse cannot trigger a live reload");
+	CHECK(!runtimePublicationAllowed(true, ProvisionOutcome::FallbackCache),
+	      "offline fallback cannot replace live topology");
+	CHECK(!runtimePublicationAllowed(true, ProvisionOutcome::LocalFailure),
+	      "a failed publication cannot trigger a live reload");
 
 	if (g_failures == 0) { std::printf("\nALL PASS\n"); return 0; }
 	std::printf("\n%d CHECK(S) FAILED\n", g_failures);

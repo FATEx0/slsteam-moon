@@ -1,11 +1,12 @@
 // Standalone filesystem test for atomic manifest store operations.
 //
 // Build:
-//   g++ -std=c++20 -I include tools/test_manifeststore_io.cpp \
-//       -o /tmp/test_manifeststore_io && /tmp/test_manifeststore_io
+//   g++ -std=c++20 -I include tools/test_manifeststore_io.cpp -o /tmp/t
+//   /tmp/t
 
 #include "../src/feats/manifeststore_io.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -97,6 +98,34 @@ int main()
 	      "newer observation may have a numerically smaller gid");
 	CHECK(ManifestStoreIO::readPreferred(store, 220201, 0) == 3,
 	      "latest observation replaces the marker without numeric ordering");
+
+	// Fingerprint observation scans the archive once and retains the newest
+	// valid artifact for each depot. Gids are opaque: a newer artifact may
+	// legitimately carry a numerically smaller value.
+	const fs::path olderLarge = store / "440_900.manifest";
+	const fs::path newerSmall = store / "440_3.manifest";
+	const fs::path newestCorrupt = store / "440_2.manifest";
+	const fs::path otherDepot = store / "550_17.manifest";
+	writeManifest(olderLarge, 0x71F617D0u, "older-large-gid");
+	writeManifest(newerSmall, 0x71F617D0u, "newer-small-gid");
+	writeManifest(newestCorrupt, 0xDEADBEEFu, "invalid-newest");
+	writeManifest(otherDepot, 0x71F617D0u, "other-depot");
+	const auto epoch = fs::file_time_type{};
+	fs::last_write_time(olderLarge, epoch + std::chrono::seconds(10));
+	fs::last_write_time(newerSmall, epoch + std::chrono::seconds(20));
+	fs::last_write_time(newestCorrupt, epoch + std::chrono::seconds(30));
+	fs::last_write_time(otherDepot, epoch + std::chrono::seconds(15));
+	writeManifest(store / "440_4.manifest.backup", 0x71F617D0u,
+	              "wrong-name-shape");
+
+	const auto observed = ManifestStoreIO::newestValidManifestGids(store);
+	CHECK(observed.size() == 3 && observed.count(220201) != 0 &&
+	      observed.count(440) != 0 && observed.count(550) != 0,
+	      "manifest observation index includes only valid archive names");
+	CHECK(observed.count(440) != 0 && observed.at(440) == 3,
+	      "newest valid artifact wins even when its gid is numerically smaller");
+	CHECK(observed.count(550) != 0 && observed.at(550) == 17,
+	      "manifest observation index retains each depot independently");
 
 	// Atomic helpers must not leave temporary files after successful writes.
 	bool foundTmp = false;

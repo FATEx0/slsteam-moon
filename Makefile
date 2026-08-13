@@ -46,7 +46,7 @@ ifeq ($(shell type mold &> /dev/null && echo "found"),found)
 	LDFLAGS += -fuse-ld=mold
 endif
 
-.PHONY: all build rebuild clean install release test-cmwire test-cmclient-loader test-dlcids test-dlc-scope test-config-path test-config-discovery test-synthmark test-pattern-catalog test-pattern-cache test-pattern-refresh test-process-lock test-atomic-file test-cache-pair test-appinfo-transaction test-appinfo-reload test-audit-symbols test-audit-policy test-memhlp-target test-memhlp-prologue test-memhlp-pic test-utils-sha test-provision-cache test-pending-proton test-provision-schedule test-provision-pass test-runtime-dependencies test-thread-start test-steamstub-warmup test-boundedexecutor test-steamless-prewarm test-depotkey-scope test-curl-timeout test-manifest-index test-prewarm-backoff
+.PHONY: all build rebuild clean install release test-cmwire test-cmclient-loader test-dlcids test-dlc-scope test-config-path test-config-discovery test-synthmark test-pattern-catalog test-pattern-cache test-pattern-refresh test-process-lock test-atomic-file test-cache-pair test-appinfo-transaction test-appinfo-reload test-audit-symbols test-audit-policy test-memhlp-target test-memhlp-prologue test-memhlp-pic test-utils-sha test-provision-cache test-provision-refresh test-provision-result test-provision-terminal test-pending-proton test-provision-schedule test-provision-pass test-runtime-dependencies test-thread-start test-steamstub-warmup test-boundedexecutor test-steamless-prewarm test-depotkey-scope test-curl-timeout test-manifest-index test-manifeststore-io test-hotreload-inputs test-pics test-prewarm-backoff test-yaml-runtime
 .NOTPARALLEL: clean rebuild
 
 all: build
@@ -218,6 +218,22 @@ test-provision-cache:
 		tools/test_provision_cache.cpp -o /tmp/test_provision_cache
 	/tmp/test_provision_cache
 
+test-provision-refresh:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_provision_refresh.cpp -o /tmp/test_provision_refresh
+	/tmp/test_provision_refresh
+
+test-provision-result:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_provision_result.cpp -o /tmp/test_provision_result
+	/tmp/test_provision_result
+
+test-provision-terminal:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_provision_terminal.cpp src/feats/provision_terminal.cpp \
+		-o /tmp/test_provision_terminal
+	/tmp/test_provision_terminal
+
 test-pending-proton:
 	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I include \
 		tools/test_pending_proton.cpp -o /tmp/test_pending_proton
@@ -271,6 +287,22 @@ test-manifest-index:
 		tools/test_manifest_index.cpp -o /tmp/test_manifest_index
 	/tmp/test_manifest_index
 
+test-manifeststore-io:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
+		tools/test_manifeststore_io.cpp -o /tmp/test_manifeststore_io
+	/tmp/test_manifeststore_io
+
+test-hotreload-inputs:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I include -I src \
+		tools/test_hotreload_inputs.cpp src/feats/provision_terminal.cpp \
+		-o /tmp/test_hotreload_inputs
+	/tmp/test_hotreload_inputs
+
+test-pics:
+	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I include -I src \
+		tools/test_pics.cpp src/feats/provision_terminal.cpp -o /tmp/test_pics
+	/tmp/test_pics
+
 test-prewarm-backoff:
 	$(CXX) -std=c++20 -Wall -Wextra -Wpedantic -I src \
 		tools/test_prewarm_backoff.cpp -o /tmp/test_prewarm_backoff
@@ -291,13 +323,18 @@ test-cache-pair:
 		tools/test_cache_pair.cpp -o /tmp/test_cache_pair
 	/tmp/test_cache_pair
 
+test-yaml-runtime:
+	$(CXX) -m32 -std=c++20 -D_GLIBCXX_USE_CXX11_ABI=0 -I include \
+		tools/test_yaml_runtime.cpp lib/libyaml-cpp.a -o /tmp/test_yaml_runtime
+	/tmp/test_yaml_runtime
+
 # Non-LTO 32-bit object so the host linker can link the transaction test
 # without choking on LTO bytecode from a different toolchain version.
 obj/feats/appinfo_vdf_test.o: src/feats/appinfo_vdf.cpp $(deps_early)
 	@mkdir -p obj/feats
 	$(CXX) -O2 -fno-lto -fPIC -m32 -std=c++20 -fno-reorder-blocks-and-partition \
 		-Wall -Wextra -Wpedantic -Wno-error=format-security \
-		-D_GLIBCXX_USE_CXX11_ABI=0 \
+		-D_GLIBCXX_USE_CXX11_ABI=0 -DAPPINFO_VDF_TESTING \
 		-I include -isysteminclude -MMD -MP \
 		-c src/feats/appinfo_vdf.cpp -o obj/feats/appinfo_vdf_test.o
 
@@ -306,7 +343,7 @@ test-appinfo-transaction: obj/feats/appinfo_vdf_test.o obj/log.o obj/config.o \
 		obj/feats/depotkey.o obj/feats/manifestid.o \
 		obj/ownerwork.o obj/sdk/protobufs/steammessages_clientserver_appinfo.pb.o \
 		obj/sdk/protobufs/steammessages_base.pb.o
-	$(CXX) -m32 -std=c++20 -D_GLIBCXX_USE_CXX11_ABI=0 \
+	$(CXX) -m32 -std=c++20 -D_GLIBCXX_USE_CXX11_ABI=0 -DAPPINFO_VDF_TESTING \
 		-I include -isysteminclude tools/test_appinfo_transaction.cpp \
 		obj/feats/appinfo_vdf_test.o \
 		$(filter-out obj/feats/appinfo_vdf_test.o,$(filter obj/%.o,$^)) \

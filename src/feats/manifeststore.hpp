@@ -24,10 +24,13 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ManifestStore
 {
+	using ArchivedGidIndex = std::unordered_map<std::uint32_t, std::uint64_t>;
+
 	// Absolute path of the persistent store dir (created on first write).
 	// Empty if $HOME is unset.
 	std::string dir();
@@ -68,6 +71,11 @@ namespace ManifestStore
 	// public gid). Legacy compatibility fallback when no preferred metadata
 	// exists. "Best" = most recently archived. Returns 0 if none.
 	uint64_t bestArchivedGid(uint32_t depotId, uint64_t excludeGid);
+
+	// Read-only observation index for source fingerprinting. The archive is
+	// scanned once and each depot maps to its newest valid artifact by mtime.
+	// Install-time selection continues to use bestArchivedGid() unchanged.
+	ArchivedGidIndex archivedGidIndex();
 
 	// Delete every archived manifest for the given depots (LuaTools
 	// remove-game / AdditionalApps pruning).

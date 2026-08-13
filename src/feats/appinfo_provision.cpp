@@ -22,6 +22,7 @@
 #include "provision_schedule.hpp"
 #include "pending_proton.hpp"
 #include "provision_pass.hpp"
+#include "provision_terminal.hpp"
 #include "synthmark.hpp"
 #include "usabledepot.hpp"
 
@@ -94,6 +95,7 @@ struct CacheValidationResult
 
 std::mutex g_cacheValidationMu;
 std::map<cache::CacheValidationKey, CacheValidationResult> g_cacheValidationMemo;
+std::unordered_map<uint32_t, CacheProbe> g_cacheProbeMemo;
 std::mutex g_provisionPassMu;
 std::mutex g_cachePublicationMu;
 std::mutex g_cacheReadInvalidationMu;
@@ -102,16 +104,29 @@ std::unordered_map<uint32_t, std::uint64_t> g_cachePublicationGenerations;
 // Apps whose last provisioning attempt ended in a result that can never
 // publish a cache pair, keyed by the generation that produced it. Guarded by
 // g_cachePublicationMu together with the generation map above.
-std::unordered_map<uint32_t, std::uint64_t> g_terminalProvisionResults;
+struct TerminalMemoryEntry
+{
+	ProvisionTerminal::Record record;
+	std::uint64_t managedGeneration = 0;
+};
+std::unordered_map<uint32_t, TerminalMemoryEntry> g_terminalProvisionResults;
+std::unordered_set<uint32_t> g_loggedMalformedTerminal;
+// Fingerprints are refreshed by startup/worker provisioning and the hot-reload
+// coordinator.  Runtime PICS callbacks consult this memo only; they must not
+// walk ManifestStore or read terminal sidecars while Steam is handling a
+// product-info response.
+std::unordered_map<uint32_t, std::string> g_localContentFingerprints;
 std::mutex g_refreshScheduleMu;
-bool g_refreshInFlight = false;
-bool g_refreshPending = false;
-std::string g_refreshPendingPath;
-std::vector<std::uint32_t> g_refreshPendingRuntimeApps;
+RefreshQueue g_refreshQueue;
+std::string g_refreshActivePath;
 std::uint64_t g_refreshWorkerToken = 0;
 std::mutex g_coldRetryMu;
-std::chrono::steady_clock::time_point g_coldRetryAfter{};
-unsigned int g_coldRetryFailures = 0;
+struct ColdRetryState
+{
+	std::chrono::steady_clock::time_point retryAfter{};
+	unsigned int failures = 0;
+};
+std::unordered_map<std::uint32_t, ColdRetryState> g_coldRetries;
 
 void markProtonNeeded(uint32_t appId,
                       const CachePublicationToken& publication)
@@ -135,28 +150,29 @@ void markProtonNeeded(uint32_t appId,
 	g_needProton.insert(appId);
 }
 
-bool coldRetryBlocked()
+bool coldRetryBlocked(std::uint32_t appId)
 {
 	std::lock_guard<std::mutex> lock(g_coldRetryMu);
-	return g_coldRetryAfter != std::chrono::steady_clock::time_point{} &&
-	       std::chrono::steady_clock::now() < g_coldRetryAfter;
+	const auto found = g_coldRetries.find(appId);
+	return found != g_coldRetries.end() &&
+	       std::chrono::steady_clock::now() < found->second.retryAfter;
 }
 
-void noteColdRetryOutcome(bool unresolved)
+void noteColdRetryOutcome(std::uint32_t appId, bool unresolved)
 {
 	std::lock_guard<std::mutex> lock(g_coldRetryMu);
 	if (!unresolved)
 	{
-		g_coldRetryAfter = {};
-		g_coldRetryFailures = 0;
+		g_coldRetries.erase(appId);
 		return;
 	}
 
-	++g_coldRetryFailures;
+	auto& retry = g_coldRetries[appId];
+	++retry.failures;
 	const unsigned int exponent =
-		g_coldRetryFailures > 4 ? 4 : g_coldRetryFailures - 1;
+		retry.failures > 4 ? 4 : retry.failures - 1;
 	const unsigned int delaySeconds = std::min(60u, 5u << exponent);
-	g_coldRetryAfter = std::chrono::steady_clock::now() +
+	retry.retryAfter = std::chrono::steady_clock::now() +
 	                   std::chrono::seconds(delaySeconds);
 }
 
@@ -615,6 +631,8 @@ void pruneUnsupportedDepots(YAML::Node& body, uint32_t appId,
 
 // Forward declaration: defined with the on-disk cache helpers below.
 const std::string& getCacheDir();
+bool readValidatedCacheBufferLocked(uint32_t appId, std::string& wireOut,
+                                    std::string& diag);
 
 // Rebuild a missing `depots` block for a token-locked app from data we
 // already hold on disk.  Some titles (e.g. Risk of Rain 2, app 632360)
@@ -973,32 +991,31 @@ void persistPendingProtonMappings(bool waitForLock)
 // replacements.
 bool statBuffer(uint32_t appId, cache::CacheValidationKey& identityOut)
 {
-	struct stat st{};
-	if (stat(getBufferPath(appId).c_str(), &st) != 0) return false;
-	if (st.st_size <= 0) return false;
+	struct stat bufferStat{}, metadataStat{};
+	if (stat(getBufferPath(appId).c_str(), &bufferStat) != 0 ||
+		bufferStat.st_size <= 0 ||
+		stat(getMetaPath(appId).c_str(), &metadataStat) != 0 ||
+		metadataStat.st_size <= 0)
+	{
+		return false;
+	}
 	identityOut = cache::CacheValidationKey{
 	    .appId = appId,
-	    .mtimeSecs = static_cast<long long>(st.st_mtime),
-	    .mtimeNsecs = static_cast<long long>(st.st_mtim.tv_nsec),
-	    .size = static_cast<long long>(st.st_size),
-	    .inode = static_cast<std::uint64_t>(st.st_ino),
+	    .mtimeSecs = static_cast<long long>(bufferStat.st_mtime),
+	    .mtimeNsecs = static_cast<long long>(bufferStat.st_mtim.tv_nsec),
+	    .size = static_cast<long long>(bufferStat.st_size),
+	    .inode = static_cast<std::uint64_t>(bufferStat.st_ino),
+	    .metadataMtimeSecs = static_cast<long long>(metadataStat.st_mtime),
+	    .metadataMtimeNsecs = static_cast<long long>(metadataStat.st_mtim.tv_nsec),
+	    .metadataSize = static_cast<long long>(metadataStat.st_size),
+	    .metadataInode = static_cast<std::uint64_t>(metadataStat.st_ino),
 	};
 	return true;
 }
 
-bool hasBufferOnDisk(uint32_t appId)
-{
-	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
-	if (!cacheLock.acquired()) return false;
-	cache::CacheValidationKey identity{};
-	return statBuffer(appId, identity);
-}
-
-// Freshness window for the provisioning cache, in seconds.  Short by
-// design: it must cover Steam's setup() re-exec storm within one boot
-// (so the 8-app fleet is fetched once, not once per pass) without
-// surviving into a later genuine relaunch, where we re-fetch the live
-// public gid (see provision_cache.hpp for the gid-staleness rationale).
+// Freshness window for legacy/full provider passes. Startup accepts a
+// structurally validated pair regardless of age; PICS change numbers drive
+// targeted refreshes without turning every relaunch into a catalog fetch.
 // Override via SLSSTEAM_PROVISION_TTL (seconds; 0 disables the cache).
 long long provisionTtlSecs()
 {
@@ -1061,8 +1078,11 @@ bool persistBuffer(uint32_t appId, uint32_t changeNumber,
 		    appId, writeError.c_str());
 		return false;
 	}
+	ProvisionTerminal::Store(getCacheDir()).erase(appId);
+	g_terminalProvisionResults.erase(appId);
 	clearCacheReadInvalidation(appId);
-	return true;
+
+	return memoizePublishedCachePairLocked(appId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,55 +1687,98 @@ cache::CacheUse cacheUseForApp(uint32_t appId, bool refreshUnavailable)
 	return cache::chooseCacheUse(result.valid, fresh, refreshUnavailable);
 }
 
-// A warm cache is a complete, validated pair.  statBuffer() alone is not
-// enough: persistBuffer() publishes the binary before its YAML metadata, so
-// an interrupted metadata write must remain a cold-start case rather than
-// silently deferring the first usable buffer to the next Steam restart.
-bool hasReadyCacheOnDisk(uint32_t appId)
-{
-	const bool bufferExists = hasBufferOnDisk(appId);
-	bool metadataExists = false;
-	{
-		ProcessLock::FileLock cacheLock(cacheLockPath(), false);
-		if (!cacheLock.acquired()) return false;
-		struct stat st{};
-		metadataExists = stat(getMetaPath(appId).c_str(), &st) == 0 &&
-		                 st.st_size > 0;
-	}
-	if (!bufferExists || !metadataExists) return false;
-
-	// Only a complete, fresh record is warm for startup. A stale record may
-	// be used as an offline fallback after a provider failure, but it must not
-	// be spliced into async startup before the live refresh has run.
-	const bool recordFresh =
-	    cacheUseForApp(appId, false) == cache::CacheUse::Fresh;
-	return cachePairReady(bufferExists, metadataExists, recordFresh);
-}
-
 // Classify what is on disk for one app, separating "unusable" from "usable but
 // past the freshness window" so each caller can apply its own policy.
-CacheReadiness cacheReadinessOnDisk(uint32_t appId)
+CacheProbe probeCacheImpl(uint32_t appId, CacheProbeMode mode)
 {
-	const bool bufferExists = hasBufferOnDisk(appId);
-	bool metadataExists = false;
+	CacheProbe probe;
+	if (mode == CacheProbeMode::NonBlockingMemoOnly)
 	{
-		ProcessLock::FileLock cacheLock(cacheLockPath(), false);
-		if (!cacheLock.acquired()) return CacheReadiness::Missing;
-		struct stat st{};
-		metadataExists = stat(getMetaPath(appId).c_str(), &st) == 0 &&
-		                 st.st_size > 0;
+		std::unique_lock<std::mutex> validationLock(
+			g_cacheValidationMu, std::try_to_lock);
+		if (!validationLock.owns_lock())
+		{
+			probe.readiness = CacheReadiness::Busy;
+			return probe;
+		}
+		const auto found = g_cacheProbeMemo.find(appId);
+		if (found == g_cacheProbeMemo.end())
+			probe.readiness = CacheReadiness::Unverified;
+		else
+			probe = found->second;
+		return probe;
 	}
-	if (!bufferExists || !metadataExists) return CacheReadiness::Missing;
 
-	// `refreshUnavailable = true` asks the question this classification needs:
-	// is the pair itself valid? Fresh answers Fresh; a valid pair past the TTL
-	// answers Fallback, which is precisely the ValidStale case.
-	switch (cacheUseForApp(appId, true))
+	const auto remember = [appId](CacheProbe result) {
+		std::lock_guard<std::mutex> validationLock(g_cacheValidationMu);
+		g_cacheProbeMemo[appId] = result;
+		return result;
+	};
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired())
 	{
-		case cache::CacheUse::Fresh:    return CacheReadiness::Fresh;
-		case cache::CacheUse::Fallback: return CacheReadiness::ValidStale;
-		default:                        return CacheReadiness::Missing;
+		probe.readiness = CacheReadiness::Invalid;
+		return remember(probe);
 	}
+
+	struct stat bufferStat{}, metadataStat{};
+	const bool bufferExists = stat(getBufferPath(appId).c_str(), &bufferStat) == 0 &&
+		bufferStat.st_size > 0;
+	const bool metadataExists = stat(getMetaPath(appId).c_str(), &metadataStat) == 0 &&
+		metadataStat.st_size > 0;
+	if (!bufferExists && !metadataExists) return remember(probe);
+	if (!bufferExists || !metadataExists)
+	{
+		probe.readiness = CacheReadiness::Invalid;
+		return remember(probe);
+	}
+
+	cache::CacheValidationKey key{};
+	if (!statBuffer(appId, key))
+	{
+		probe.readiness = CacheReadiness::Invalid;
+		return remember(probe);
+	}
+	std::string metadataText;
+	cache::CacheMetadataView metadata;
+	if (!readCacheMetadataFile(appId, metadataText, metadata) ||
+		metadata.appId != appId || metadata.wireSize !=
+			static_cast<std::uint64_t>(key.size))
+	{
+		probe.readiness = CacheReadiness::Invalid;
+		return remember(probe);
+	}
+	probe.changeNumber = metadata.changeNumber;
+
+	CacheValidationResult validation;
+	bool memoHit = false;
+	{
+		std::lock_guard<std::mutex> validationLock(g_cacheValidationMu);
+		const auto found = g_cacheValidationMemo.find(key);
+		if (found != g_cacheValidationMemo.end())
+		{
+			validation = found->second;
+			memoHit = true;
+		}
+	}
+	if (!memoHit)
+	{
+		validation.valid = hasValidatedCachedBuffer(appId, validation.diag);
+		std::lock_guard<std::mutex> validationLock(g_cacheValidationMu);
+		g_cacheValidationMemo.emplace(key, validation);
+	}
+	if (validation.valid && !cacheMarkerAllowsRead(appId))
+		validation.valid = false;
+	if (!validation.valid)
+	{
+		probe.readiness = CacheReadiness::Invalid;
+		return remember(probe);
+	}
+	const long long now = static_cast<long long>(std::time(nullptr));
+	probe.readiness = cache::isBufferReusable(
+		true, key.mtimeSecs, now, provisionTtlSecs())
+		? CacheReadiness::Fresh : CacheReadiness::ValidStale;
+	return remember(probe);
 }
 
 // Render+prune+sha+persist a parsed appinfo node (shared tail used by
@@ -1918,6 +1981,11 @@ bool isSynthesizedAppLocked(uint32_t appId)
 
 } // namespace
 
+CacheProbe probeCache(uint32_t appId, CacheProbeMode mode)
+{
+	return probeCacheImpl(appId, mode);
+}
+
 void sha1Bytes(const void* data, std::size_t size, std::uint8_t out[20])
 {
 	sha1BytesInternal(data, size, out);
@@ -1928,6 +1996,15 @@ bool publishCachePairLocked(uint32_t appId, const std::string& wire,
                             bool markerBefore, std::string& error)
 {
 	const auto cacheDir = getCacheDir();
+	// Invalidate terminal state before replacing the pair. If the pair write
+	// fails, the old terminal verdict is gone and the app remains retryable;
+	// retaining it would allow a stale sidecar to suppress the next refresh.
+	g_terminalProvisionResults.erase(appId);
+	if (!ProvisionTerminal::Store(cacheDir).erase(appId))
+	{
+		error = "unable to invalidate terminal sidecar";
+		return false;
+	}
 	return CachePair::publish(
 		getBufferPath(appId), getMetaPath(appId), wire, metadata, synthetic,
 		markerBefore,
@@ -1936,6 +2013,49 @@ bool publishCachePairLocked(uint32_t appId, const std::string& wire,
 			               : SynthMark::unmark(cacheDir, appId);
 		},
 		[&] { return SynthMark::isMarked(cacheDir, appId); }, error);
+}
+
+bool memoizePublishedCachePairLocked(uint32_t appId)
+{
+	cache::CacheValidationKey publishedKey{};
+	const bool identityCaptured = statBuffer(appId, publishedKey);
+	std::string validationDiag;
+	std::string validatedWire;
+	const bool publishedPairValid = identityCaptured &&
+		readValidatedCacheBufferLocked(appId, validatedWire, validationDiag);
+	std::string metadataText;
+	cache::CacheMetadataView metadata;
+	const bool metadataReady = publishedPairValid &&
+		readCacheMetadataFile(appId, metadataText, metadata) &&
+		metadata.appId == appId;
+	bool memoized = false;
+	{
+		std::lock_guard<std::mutex> validationLock(g_cacheValidationMu);
+		memoized = memoizeValidatedPublication(
+			g_cacheValidationMemo, /*publicationSucceeded=*/true,
+			publishedPairValid,
+			identityCaptured
+				? std::optional<cache::CacheValidationKey>{publishedKey}
+				: std::nullopt,
+			CacheValidationResult{true, {}});
+		if (memoized && metadataReady)
+		{
+			const long long now = static_cast<long long>(std::time(nullptr));
+			g_cacheProbeMemo[appId] = CacheProbe{
+				cache::isBufferReusable(
+					true, publishedKey.mtimeSecs, now, provisionTtlSecs())
+					? CacheReadiness::Fresh : CacheReadiness::ValidStale,
+				metadata.changeNumber};
+		}
+	}
+	if (!memoized && g_pLog)
+	{
+		g_pLog->debug(
+			"AppInfoProvision: published cache pair failed post-write validation "
+			"for app=%u: %s\n", appId,
+			validationDiag.empty() ? "identity unavailable" : validationDiag.c_str());
+	}
+	return memoized;
 }
 
 bool readValidatedCacheBuffer(uint32_t appId, std::string& buffer)
@@ -1957,28 +2077,167 @@ std::uint64_t cachePublicationGenerationLocked(uint32_t appId)
 	return it == g_cachePublicationGenerations.end() ? 0 : it->second;
 }
 
-// Remember that this app cannot produce a cache pair, so later passes skip it
-// instead of paying another CM round-trip for the same answer.
-void noteTerminalProvisionResult(uint32_t appId)
+std::string localContentFingerprint(uint32_t appId)
 {
-	std::lock_guard<std::mutex> lock(g_cachePublicationMu);
-	g_terminalProvisionResults[appId] = cachePublicationGenerationLocked(appId);
+	return localContentFingerprint(appId, ManifestStore::archivedGidIndex());
 }
 
-bool terminalProvisionResultKnown(uint32_t appId)
+std::string localContentFingerprint(
+	uint32_t appId,
+	const ManifestStore::ArchivedGidIndex& archivedGids)
 {
-	std::lock_guard<std::mutex> lock(g_cachePublicationMu);
+	std::vector<ProvisionTerminal::LocalInput> inputs;
+	for (const uint32_t depotId : DepotKey::managedDepotsForApp(appId))
+	{
+		const auto key = DepotKey::getCachedKey(depotId);
+		inputs.push_back({depotId, key.key, 0});
+	}
+	const std::string result = fingerprintIndexedLocalInputs(
+		std::move(inputs), archivedGids);
+	{
+		std::lock_guard<std::mutex> lock(g_cachePublicationMu);
+		g_localContentFingerprints[appId] = result;
+	}
+	return result;
+}
+
+bool terminalMemoryAppliesLocked(uint32_t appId,
+	uint32_t observedChangeNumber, ProvisionOutcome* outcome,
+	uint32_t* recordChangeNumber)
+{
 	const auto it = g_terminalProvisionResults.find(appId);
-	return cache::terminalResultStillApplies(
-	    it != g_terminalProvisionResults.end(),
-	    it == g_terminalProvisionResults.end() ? 0 : it->second,
-	    cachePublicationGenerationLocked(appId));
+	if (it == g_terminalProvisionResults.end()) return false;
+	if (!cache::terminalResultStillApplies(
+		true, it->second.managedGeneration,
+		cachePublicationGenerationLocked(appId))) return false;
+	const auto fingerprint = g_localContentFingerprints.find(appId);
+	const std::string_view currentFingerprint = fingerprint ==
+		g_localContentFingerprints.end() ? std::string_view{} : fingerprint->second;
+	if (it->second.record.changeNumber == 0)
+	{
+		if (observedChangeNumber != 0 || it->second.record.appId != appId ||
+			(it->second.record.kind != ProvisionTerminal::Kind::VirtualDlc &&
+			 it->second.record.inputFingerprint != currentFingerprint))
+			return false;
+	}
+	else if (!ProvisionTerminal::applies(
+		it->second.record, appId,
+		observedChangeNumber == 0 ? it->second.record.changeNumber
+			: observedChangeNumber, currentFingerprint))
+		return false;
+	if (outcome)
+		*outcome = it->second.record.kind == ProvisionTerminal::Kind::VirtualDlc
+			? ProvisionOutcome::NotApplicable
+			: ProvisionOutcome::NoUsableContent;
+	if (recordChangeNumber) *recordChangeNumber = it->second.record.changeNumber;
+	return true;
 }
 
-void forgetTerminalProvisionResult(uint32_t appId)
+bool terminalProvisionResultKnown(uint32_t appId,
+	uint32_t observedChangeNumber, ProvisionOutcome* outcome)
+{
+	const std::string fingerprint = localContentFingerprint(appId);
+	// This disk-aware path is reserved for startup and detached workers. The
+	// PICS callback uses observeTerminal(), which is memo-only. Keep the lock
+	// order publication -> file so a sidecar read cannot race a publication or
+	// app removal and republish a record under a newer generation.
+	std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+	if (terminalMemoryAppliesLocked(appId, observedChangeNumber,
+		outcome, nullptr)) return true;
+	if (!g_config.isAddedAppId(appId)) return false;
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired()) return false;
+	const auto loaded = ProvisionTerminal::Store(getCacheDir()).load(appId);
+	if (loaded.status != ProvisionTerminal::LoadStatus::Valid)
+	{
+		bool logMalformed = false;
+		if (loaded.status == ProvisionTerminal::LoadStatus::Invalid)
+			logMalformed = g_loggedMalformedTerminal.insert(appId).second;
+		if (logMalformed && g_pLog)
+			g_pLog->debug("AppInfoProvision: app=%u terminal sidecar is malformed\n", appId);
+		return false;
+	}
+	if (!ProvisionTerminal::applies(loaded.record, appId,
+		observedChangeNumber == 0 ? loaded.record.changeNumber
+			: observedChangeNumber, fingerprint)) return false;
+	g_terminalProvisionResults[appId] = {
+		loaded.record, cachePublicationGenerationLocked(appId)};
+	if (outcome)
+		*outcome = loaded.record.kind == ProvisionTerminal::Kind::VirtualDlc
+			? ProvisionOutcome::NotApplicable
+			: ProvisionOutcome::NoUsableContent;
+	return true;
+}
+
+bool noteTerminalProvisionResult(uint32_t appId, SourceResult result,
+	uint32_t changeNumber, const CachePublicationToken& publication)
+{
+	if (result != SourceResult::VirtualDlc && result != SourceResult::NoUsableContent)
+		return false;
+	ProvisionTerminal::Record record{
+		.schema = ProvisionTerminal::kSchema,
+		.appId = appId,
+		.kind = result == SourceResult::VirtualDlc
+			? ProvisionTerminal::Kind::VirtualDlc
+			: ProvisionTerminal::Kind::NoUsableContent,
+		.changeNumber = changeNumber,
+		.inputFingerprint = result == SourceResult::VirtualDlc
+			? "-" : localContentFingerprint(appId),
+	};
+	std::lock_guard<std::mutex> lock(g_cachePublicationMu);
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired() || !cache::cachePublicationAllowed(
+		publication.managed, publication.generation,
+		cachePublicationGenerationLocked(appId))) return false;
+	// Remove any previous verdict before attempting the replacement. A failed
+	// sidecar write must remain retryable and must not leave an old in-memory
+	// answer authoritative for the current generation.
+	g_terminalProvisionResults.erase(appId);
+	if (!ProvisionTerminal::Store(getCacheDir()).erase(appId)) return false;
+	if (changeNumber != 0 && !ProvisionTerminal::Store(getCacheDir()).publish(record))
+		return false;
+	g_terminalProvisionResults[appId] = {record, publication.generation};
+	return true;
+}
+
+void clearTerminalProvisionResult(uint32_t appId)
 {
 	std::lock_guard<std::mutex> lock(g_cachePublicationMu);
 	g_terminalProvisionResults.erase(appId);
+	ProvisionTerminal::Store(getCacheDir()).erase(appId);
+}
+
+TerminalObservation observeTerminal(uint32_t appId,
+	uint32_t observedChangeNumber)
+{
+	TerminalObservation observation;
+	std::lock_guard<std::mutex> lock(g_cachePublicationMu);
+	observation.applies = terminalMemoryAppliesLocked(
+		appId, observedChangeNumber, &observation.outcome,
+		&observation.changeNumber);
+	return observation;
+}
+
+void primeTerminalMemo(uint32_t appId, std::string_view fingerprint)
+{
+	if (appId == 0) return;
+	std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+	g_localContentFingerprints[appId] = fingerprint;
+	if (!g_config.isAddedAppId(appId)) return;
+	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
+	if (!cacheLock.acquired()) return;
+	const auto loaded = ProvisionTerminal::Store(getCacheDir()).load(appId);
+	if (loaded.status != ProvisionTerminal::LoadStatus::Valid ||
+		!ProvisionTerminal::applies(
+			loaded.record, appId, loaded.record.changeNumber, fingerprint))
+		return;
+	g_terminalProvisionResults[appId] = {
+		loaded.record, cachePublicationGenerationLocked(appId)};
+}
+
+void primeTerminalMemo(uint32_t appId)
+{
+	primeTerminalMemo(appId, localContentFingerprint(appId));
 }
 
 CachePublicationToken snapshotCachePublication(uint32_t appId)
@@ -2004,7 +2263,8 @@ std::mutex& provisioningPassMutex()
 ProvisionOutcome provisionAppDetailed(uint32_t appId,
                                       const std::string& appinfoVdfPath,
                                       ProvisionPassState& pass,
-                                      ProvisionPassContext& context)
+                                      ProvisionPassContext& context,
+                                      bool forceRefresh = false)
 {
 	(void)appinfoVdfPath;
 	if (appId == 0) return ProvisionOutcome::IncompleteContent;
@@ -2023,16 +2283,13 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 	// HTTP GET per AddedApp — so the boot cost grew O(n_apps * n_passes)
 	// and stalled Steam's launch the more games the user added.
 	//
-	// If we already wrote picsbuffer_<appid>.bin within the (short) TTL,
-	// reuse it and skip the network: the buffer the earlier pass produced
-	// reflects the SAME live state (DepotKeys; pins are disabled), so the
-	// AppInfoVdf splice — idempotent on (appid, change, sha) — is a no-op
-	// the second time anyway.  The TTL is deliberately short so a genuine
-	// relaunch (minutes/hours later, > TTL) re-fetches the live public
-	// gid; we must NOT serve a stale cross-session buffer, or we'd
-	// reintroduce the staged-gid vs requested-gid mismatch the
-	// install-first-attempt fix resolved.
-	if (cacheUseForApp(appId, false) == cache::CacheUse::Fresh)
+	// If we already wrote picsbuffer_<appid>.bin within the short TTL,
+	// reuse it for this pass. Startup splice eligibility is decided separately
+	// by complete-pair validation; observed PICS change numbers schedule the
+	// precise background refresh. Install planning still chooses and freezes
+	// the exact public/local/archive manifest independently of this cache age.
+	if (!forceRefresh &&
+	    cacheUseForApp(appId, false) == cache::CacheUse::Fresh)
 	{
 		g_pLog->debug("AppInfoProvision: app=%u reusing validated same-boot cache\n",
 		              appId);
@@ -2074,9 +2331,11 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 				// retryable.
 				if (cmResult == SourceResult::NoUsableContent ||
 				    cmResult == SourceResult::VirtualDlc)
-					noteTerminalProvisionResult(appId);
+					noteTerminalProvisionResult(appId, cmResult, cn, publication);
 				if (cmResult == SourceResult::VirtualDlc)
 					return ProvisionOutcome::NotApplicable;
+				if (cmResult == SourceResult::NoUsableContent)
+					return ProvisionOutcome::NoUsableContent;
 				return cmResult == SourceResult::LocalFailure
 				    ? ProvisionOutcome::LocalFailure
 				    : ProvisionOutcome::IncompleteContent;
@@ -2165,6 +2424,7 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 		g_pLog->info("AppInfoProvision: app=%u parse failed: %s\n", appId, err.c_str());
 		return ProvisionOutcome::IncompleteContent;
 	}
+	const uint32_t changeNumber = pickChangeNumber(appNode);
 
 	std::string wire;
 	bool synthesized = false;
@@ -2180,8 +2440,14 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 		else if (renderResult == SourceResult::VirtualDlc)
 			reason = "DLC has no usable content depots";
 		g_pLog->info("AppInfoProvision: app=%u render stopped (%s)\n", appId, reason);
+		if (renderResult == SourceResult::VirtualDlc ||
+		    renderResult == SourceResult::NoUsableContent)
+			noteTerminalProvisionResult(
+				appId, renderResult, changeNumber, publication);
 		if (renderResult == SourceResult::VirtualDlc)
 			return ProvisionOutcome::NotApplicable;
+		if (renderResult == SourceResult::NoUsableContent)
+			return ProvisionOutcome::NoUsableContent;
 		return renderResult == SourceResult::LocalFailure
 		    ? ProvisionOutcome::LocalFailure
 		    : ProvisionOutcome::IncompleteContent;
@@ -2242,8 +2508,6 @@ ProvisionOutcome provisionAppDetailed(uint32_t appId,
 		sha20.assign(reinterpret_cast<const char*>(tmp), 20);
 	}
 
-	const uint32_t changeNumber = pickChangeNumber(appNode);
-
 	if (!persistBuffer(appId, changeNumber, sha20, wire, publication,
 	                   synthesized))
 	{
@@ -2264,12 +2528,19 @@ bool provisionApp(uint32_t appId, const std::string& appinfoVdfPath)
 		appId, appinfoVdfPath, pass, context));
 }
 
+void publishRuntimeAppInfo(
+	const std::string& appinfoVdfPath,
+	const std::vector<std::uint32_t>& requested);
+
 int provisionAppsPass(const std::string& appinfoVdfPath,
                        const std::unordered_set<uint32_t>& added,
                        bool onlyMissing, ProvisionPassContext& context,
-                       std::unordered_set<uint32_t>* fallbackApps)
+	                       std::unordered_set<uint32_t>* fallbackApps,
+	                       const char* origin)
 {
 	if (added.empty()) return 0;
+	ProvisionPassSummary summary;
+	summary.requested = added.size();
 
 	ProvisionPassCoordinator coordinator(g_provisionPassMu);
 	coordinator.snapshot([&] {
@@ -2303,9 +2574,18 @@ int provisionAppsPass(const std::string& appinfoVdfPath,
 		std::vector<uint32_t> toFetch;
 		for (uint32_t appId : added)
 		{
+			if (!onlyMissing) primeTerminalMemo(appId);
+			const bool terminalKnown = onlyMissing
+				? observeTerminal(appId, 0).applies
+				: terminalProvisionResultKnown(appId, 0, nullptr);
+			if (terminalKnown)
+				continue;
 			if (onlyMissing)
 			{
-				if (!hasReadyCacheOnDisk(appId)) toFetch.push_back(appId);
+				// Runtime cold recovery already made a nonblocking readiness
+				// decision on the callback thread. Do not turn that path back into
+				// blocking cache validation here.
+				toFetch.push_back(appId);
 			}
 			else if (cacheUseForApp(appId, false) != cache::CacheUse::Fresh)
 			{
@@ -2314,6 +2594,7 @@ int provisionAppsPass(const std::string& appinfoVdfPath,
 		}
 		if (!toFetch.empty())
 		{
+			summary.fetched = toFetch.size();
 			g_pLog->info("AppInfoProvision: fetching %zu app(s) via native CM\n",
 			             toFetch.size());
 			const auto cmResult = coordinator.network([&] {
@@ -2345,10 +2626,22 @@ int provisionAppsPass(const std::string& appinfoVdfPath,
 	while (appIt != added.end())
 	{
 		const uint32_t appId = *appIt++;
-		const ProvisionOutcome outcome =
-		    provisionAppDetailed(appId, appinfoVdfPath, pass, context);
+		ProvisionOutcome outcome = ProvisionOutcome::IncompleteContent;
+		uint32_t observedChange = 0;
+		if (const auto change = context.cmChanges.find(appId);
+			change != context.cmChanges.end()) observedChange = change->second;
+		const bool terminalKnown = onlyMissing
+			? observeTerminal(appId, observedChange).applies
+			: terminalProvisionResultKnown(appId, observedChange, &outcome);
+		if (!terminalKnown)
+			outcome = provisionAppDetailed(appId, appinfoVdfPath, pass, context);
 		if (fallbackApps && outcome == ProvisionOutcome::FallbackCache)
 			fallbackApps->insert(appId);
+		if (outcome == ProvisionOutcome::Updated) ++summary.updated;
+		else if (outcome == ProvisionOutcome::FreshCache) ++summary.ready;
+		else if (outcome == ProvisionOutcome::FallbackCache) ++summary.fallback;
+		else if (isTerminalOutcome(outcome)) ++summary.terminal;
+		else ++summary.failed;
 		if (isProvisioned(outcome))
 		{
 			++provisioned;
@@ -2401,7 +2694,7 @@ int provisionAppsPass(const std::string& appinfoVdfPath,
 			g_pLog->notifyUser(UserMsg::LocalStorageError);
 		}
 	}
-	if (provisioned > 0)
+	if (provisioned > 0 && summary.terminal == 0)
 	{
 		g_pLog->info("AppInfoProvision: %d/%zu AdditionalApps provisioned\n",
 		             provisioned, added.size());
@@ -2411,6 +2704,11 @@ int provisionAppsPass(const std::string& appinfoVdfPath,
 	// this pass.
 	context.cmBuffers.clear();
 	context.cmChanges.clear();
+	g_pLog->info(
+		"AppInfoProvision: pass origin=%s requested=%zu fetched=%zu updated=%zu "
+		"ready=%zu terminal=%zu failed=%zu\n",
+		origin, summary.requested, summary.fetched, summary.updated,
+		summary.ready + summary.fallback, summary.terminal, summary.failed);
 
 	return provisioned;
 }
@@ -2427,7 +2725,7 @@ int provisionApps(const std::string& appinfoVdfPath,
 
 	ProvisionPassContext context;
 	const int provisioned = provisionAppsPass(
-		appinfoVdfPath, addedSnapshot, onlyMissing, context, nullptr);
+		appinfoVdfPath, addedSnapshot, onlyMissing, context, nullptr, "scoped");
 	coordinator.commit([&] {
 		persistPendingProtonMappings(false);
 	});
@@ -2444,7 +2742,7 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath,
 
 	ProvisionPassContext context;
 	const int provisioned = provisionAppsPass(
-		appinfoVdfPath, added, false, context, nullptr);
+		appinfoVdfPath, added, false, context, nullptr, "startup");
 	coordinator.commit([&] {
 		if (allowConfigWrite)
 		{
@@ -2459,37 +2757,190 @@ int provisionAllAddedApps(const std::string& appinfoVdfPath,
 	return provisioned;
 }
 
+ProvisionPassSummary provisionRequestedApps(
+	const std::string& appinfoVdfPath,
+	const std::vector<RefreshRequest>& requests,
+	bool allowConfigWrite)
+{
+	ProvisionPassSummary summary;
+	if (requests.empty()) return summary;
+	ProvisionPassCoordinator coordinator(g_provisionPassMu);
+	ProvisionPassContext context;
+	std::vector<RefreshRequest> accepted;
+	coordinator.snapshot([&] {
+		const auto managed = g_config.managedAppIds.get();
+		std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
+		for (const RefreshRequest& request : requests)
+		{
+			if (request.appId == 0 || managed.count(request.appId) == 0)
+				continue;
+			const std::uint64_t generation =
+				cachePublicationGenerationLocked(request.appId);
+			if (generation != request.managedGeneration) continue;
+			context.cachePublications.emplace(request.appId,
+				CachePublicationToken{true, generation});
+			accepted.push_back(request);
+		}
+	});
+	if (accepted.empty()) return summary;
+	summary.requested = accepted.size();
+
+	std::vector<RefreshRequest> fetch;
+	fetch.reserve(accepted.size());
+	std::size_t busy = 0;
+	for (const RefreshRequest& request : accepted)
+	{
+		const CacheProbe probe = probeCache(
+			request.appId, CacheProbeMode::BlockingValidate);
+		if (probe.readiness == CacheReadiness::Busy) ++busy;
+		if (!requestNeedsFetch(request, probe.readiness, probe.changeNumber))
+		{
+			++summary.ready;
+			continue;
+		}
+		if (terminalProvisionResultKnown(
+			request.appId, request.minimumChangeNumber, nullptr))
+		{
+			++summary.terminal;
+			continue;
+		}
+		fetch.push_back(request);
+	}
+	const auto planOrigin = [](const std::vector<RefreshRequest>& batch) {
+		std::uint8_t reasons = 0;
+		for (const auto& request : batch) reasons |= request.reasons;
+		if (reasons & reasonMask(RefreshReason::ForceFull)) return "force-full";
+		if (reasons & reasonMask(RefreshReason::LocalInputs)) return "local-inputs";
+		if (reasons & reasonMask(RefreshReason::HotAdd)) return "hot-add";
+		if (reasons & reasonMask(RefreshReason::PicsChanges)) return "pics-changes";
+		return "pics-product";
+	};
+	g_pLog->info(
+		"AppInfoProvision: plan origin=%s candidates=%zu fetch=%zu ready=%zu "
+		"terminal=%zu busy=%zu\n",
+		planOrigin(accepted), accepted.size(), fetch.size(), summary.ready,
+		summary.terminal, busy);
+
+	ProvisionPassState pass;
+	if (!fetch.empty())
+	{
+		std::vector<uint32_t> appIds;
+		appIds.reserve(fetch.size());
+		for (const auto& request : fetch) appIds.push_back(request.appId);
+		summary.fetched = appIds.size();
+		const auto cmResult = coordinator.network([&] {
+			return CmClient::fetchProductInfoDetailed(
+				appIds, context.cmBuffers, &context.cmChanges);
+		});
+		if (cmResult != CmClient::FetchResult::Success)
+		{
+			context.cmBuffers.clear();
+			context.cmChanges.clear();
+			pass.noteCmBatchFailure();
+			if (cmResult == CmClient::FetchResult::NetworkUnavailable)
+				pass.noteFinalProviderFailure(NetworkFailure::Connectivity);
+		}
+	}
+
+	std::vector<uint32_t> publish;
+	for (const RefreshRequest& request : fetch)
+	{
+		ProvisionOutcome outcome = ProvisionOutcome::IncompleteContent;
+		const auto change = context.cmChanges.find(request.appId);
+		const uint32_t observed = change == context.cmChanges.end()
+			? request.minimumChangeNumber : change->second;
+		if (!terminalProvisionResultKnown(request.appId, observed, &outcome))
+			outcome = provisionAppDetailed(
+				request.appId, appinfoVdfPath, pass, context,
+				request.forceRefresh);
+		if (outcome == ProvisionOutcome::Updated) ++summary.updated;
+		else if (outcome == ProvisionOutcome::FreshCache) ++summary.ready;
+		else if (outcome == ProvisionOutcome::FallbackCache) ++summary.fallback;
+		else if (isTerminalOutcome(outcome)) ++summary.terminal;
+		else ++summary.failed;
+		if (runtimePublicationAllowed(request.publishRuntime, outcome))
+			publish.push_back(request.appId);
+	}
+
+	coordinator.commit([&] {
+		if (allowConfigWrite)
+		{
+			if (!injectProtonMappings()) persistPendingProtonMappings(true);
+		}
+		else persistPendingProtonMappings(false);
+	});
+	if (!publish.empty()) publishRuntimeAppInfo(appinfoVdfPath, publish);
+	g_pLog->info(
+		"AppInfoProvision: pass origin=targeted requested=%zu fetched=%zu "
+		"updated=%zu ready=%zu terminal=%zu failed=%zu\n",
+		summary.requested, summary.fetched, summary.updated,
+		summary.ready + summary.fallback, summary.terminal, summary.failed);
+	return summary;
+}
+
 int provisionColdStartApps(const std::string& appinfoVdfPath,
+                           const std::unordered_set<uint32_t>& candidates,
+                           ColdStartMode mode,
                            std::unordered_set<uint32_t>* sanitizedApps,
-                           bool allowConfigWrite,
-                           std::unordered_set<uint32_t>* fallbackApps)
+                           bool allowConfigWrite)
 {
 	if (sanitizedApps) sanitizedApps->clear();
-	if (fallbackApps) fallbackApps->clear();
+	std::unordered_set<uint32_t> fallbackApps;
 
 	ProvisionPassCoordinator coordinator(g_provisionPassMu);
-	const auto managedApps = coordinator.snapshot(
-		[] { return g_config.managedAppIds.get(); });
-	// The preinit pass wants the live gid before the splice, so a stale pair is
-	// worth re-fetching there. The PICS callback runs on Steam's worker thread
-	// while the user is interacting, so it must only rescue a pair that is
-	// missing or invalid; refreshing stale pairs belongs to the async worker.
-	const bool requireFresh = allowConfigWrite;
-	std::unordered_set<uint32_t> cold;
+	const auto managedApps = coordinator.snapshot([&] {
+		const auto managed = g_config.managedAppIds.get();
+		std::unordered_set<uint32_t> scoped;
+		for (const uint32_t appId : candidates)
+			if (appId != 0 && managed.count(appId) != 0) scoped.insert(appId);
+		return scoped;
+	});
+	// Disk-aware terminal priming is allowed here only during startup. Build
+	// the manifest observation index once for the whole fleet; rebuilding it
+	// inside terminalProvisionResultKnown() for every app made a network-free
+	// startup scale with apps × archived manifests. Runtime callbacks remain
+	// strictly memo-only.
+	if (coldStartPrimesTerminalMemo(mode))
+	{
+		const auto archivedGids = ManifestStore::archivedGidIndex();
+		for (const uint32_t appId : managedApps)
+		{
+			const std::string fingerprint =
+				localContentFingerprint(appId, archivedGids);
+			primeTerminalMemo(appId, fingerprint);
+		}
+	}
+	// Startup validates persisted pairs before accepting them for the splice;
+	// the PICS callback reads only its memo while the user is interacting.
+	// Both paths recover only missing or invalid pairs; a validated stale pair
+	// is already usable and must not trigger synchronous provider work.
+	std::vector<std::pair<uint32_t, CacheReadiness>> probed;
+	probed.reserve(managedApps.size());
 	std::size_t skippedTerminal = 0;
 	for (const uint32_t appId : managedApps)
 	{
-		if (!coldFallbackNeeded(cacheReadinessOnDisk(appId), requireFresh))
-			continue;
+		const CacheProbeMode probeMode = mode == ColdStartMode::StartupRequireUsablePair
+			? CacheProbeMode::BlockingValidate
+			: CacheProbeMode::NonBlockingMemoOnly;
+		const CacheProbe cacheProbe = probeCache(appId, probeMode);
 		// Apps with a terminal content verdict can never satisfy this loop, so
 		// including them would refetch the same answer on every pass and keep
 		// the pass permanently incomplete.
-		if (terminalProvisionResultKnown(appId))
+		const bool terminalKnown =
+			observeTerminal(appId, cacheProbe.changeNumber).applies;
+		if (terminalKnown)
 		{
 			++skippedTerminal;
+			noteColdRetryOutcome(appId, false);
 			continue;
 		}
-		cold.insert(appId);
+		probed.emplace_back(appId, cacheProbe.readiness);
+	}
+	std::unordered_set<uint32_t> cold = selectColdStartApps(probed, mode);
+	for (auto it = cold.begin(); it != cold.end();)
+	{
+		if (coldRetryBlocked(*it)) it = cold.erase(it);
+		else ++it;
 	}
 	if (skippedTerminal != 0)
 	{
@@ -2499,14 +2950,6 @@ int provisionColdStartApps(const std::string& appinfoVdfPath,
 	}
 	if (cold.empty())
 	{
-		noteColdRetryOutcome(false);
-		return 0;
-	}
-	if (coldRetryBlocked())
-	{
-		g_pLog->debug(
-		    "AppInfoProvision: cold-start retry backoff active; skipping %zu app(s)\n",
-		    cold.size());
 		return 0;
 	}
 
@@ -2514,12 +2957,12 @@ int provisionColdStartApps(const std::string& appinfoVdfPath,
 	             cold.size());
 	ProvisionPassContext context;
 	const int provisioned = provisionAppsPass(
-		appinfoVdfPath, cold, true, context, fallbackApps);
-	bool unresolved = false;
+		appinfoVdfPath, cold, true, context, &fallbackApps,
+		allowConfigWrite ? "startup-cold" : "runtime-cold");
+	std::size_t unresolvedCount = 0;
 	for (const uint32_t appId : cold)
 	{
-		const bool explicitFallback =
-			fallbackApps && fallbackApps->count(appId) != 0;
+		const bool explicitFallback = fallbackApps.count(appId) != 0;
 		if (explicitFallback)
 		{
 			// Keep the explicit fallback allowlist separate from the PICS
@@ -2530,26 +2973,37 @@ int provisionColdStartApps(const std::string& appinfoVdfPath,
 			if (sanitizedApps &&
 			    shouldMarkColdCacheSanitized(explicitFallback))
 				sanitizedApps->insert(appId);
+			noteColdRetryOutcome(appId, false);
 			continue;
 		}
-		if (!hasReadyCacheOnDisk(appId))
+		const CacheProbe completedProbe = probeCache(
+			appId, CacheProbeMode::NonBlockingMemoOnly);
+		const bool completedReady =
+			completedProbe.readiness == CacheReadiness::Fresh ||
+			completedProbe.readiness == CacheReadiness::ValidStale;
+		if (!completedReady)
 		{
 			// A terminal verdict is resolved, not pending: there is nothing a
 			// retry could produce. Counting it as unresolved armed the backoff
 			// forever and made every later PICS response repeat the pass.
-			if (!terminalProvisionResultKnown(appId)) unresolved = true;
+			const auto completedTerminal =
+				observeTerminal(appId, completedProbe.changeNumber);
+			const bool unresolved = !completedTerminal.applies;
+			noteColdRetryOutcome(appId, unresolved);
+			if (unresolved) ++unresolvedCount;
 			continue;
 		}
 		if (sanitizedApps &&
 		    shouldMarkColdCacheSanitized(explicitFallback))
 			sanitizedApps->insert(appId);
+		noteColdRetryOutcome(appId, false);
 	}
-	noteColdRetryOutcome(unresolved);
-	if (unresolved)
+	if (unresolvedCount != 0)
 	{
 		g_pLog->debug(
-		    "AppInfoProvision: cold-start fallback incomplete; subsequent PICS "
-		    "responses are temporarily rate-limited\n");
+		    "AppInfoProvision: cold-start fallback incomplete for %zu app(s); "
+		    "their subsequent PICS responses are temporarily rate-limited\n",
+		    unresolvedCount);
 	}
 
 	coordinator.commit([&] {
@@ -2613,12 +3067,9 @@ void publishRuntimeAppInfo(
 	if (selected.empty())
 		return;
 
-	// A pre-existing validated synthetic pair is an explicit fallback for this
-	// just-added app even when its async freshness window elapsed.  The splice
-	// remains transactional and AppInfoVdf revalidates the complete pair.
-	const std::unordered_set<std::uint32_t> explicitFallback(
+	const std::unordered_set<std::uint32_t> scoped(
 		selected.begin(), selected.end());
-	if (AppInfoVdf::injectAllCached(appinfoVdfPath, explicitFallback) == 0)
+	if (AppInfoVdf::injectCachedApps(appinfoVdfPath, scoped) == 0)
 	{
 		g_pLog->warn(
 			"AppInfoProvision: live synthetic appinfo splice failed for %zu app(s); "
@@ -2669,30 +3120,22 @@ void refreshWorkerStartFailed() noexcept
 		    "will retry on the next refresh request\n");
 }
 
-void resetRefreshAfterStartFailure(std::uint64_t token) noexcept
-{
-	std::lock_guard<std::mutex> lock(g_refreshScheduleMu);
-	if (g_refreshInFlight && g_refreshWorkerToken == token)
-		g_refreshInFlight = false;
-}
-
 void finishRefresh(const std::string& completedPath, std::uint64_t token);
 
 RefreshWorkerStartResult startRefreshWorker(
     const std::string& appinfoVdfPath, std::uint64_t token,
-    const std::vector<std::uint32_t>& runtimePublishApps)
+    const std::vector<RefreshRequest>& requests)
 {
 	bool workerMayStillExist = false;
 	const bool started = ThreadStart::startDetached(
-		[path = appinfoVdfPath, token, runtimePublishApps]
+		[path = appinfoVdfPath, token, requests]
 		{
 			ThreadStart::runGuarded(
-				[path, runtimePublishApps]
+				[path, requests]
 				{
 					ScopedNotifySuppression suppression;
 					BootProf::Span profile(g_pLog.get(), "provision.async");
-					provisionAllAddedApps(path, false);
-					publishRuntimeAppInfo(path, runtimePublishApps);
+					(void)provisionRequestedApps(path, requests, false);
 				},
 				[]
 				{
@@ -2715,14 +3158,12 @@ RefreshWorkerStartResult startRefreshWorker(
 	if (workerMayStillExist)
 		return RefreshWorkerStartResult::Uncertain;
 
-	resetRefreshAfterStartFailure(token);
 	return RefreshWorkerStartResult::NotStarted;
 }
 
-void retainRefreshAfterFailedStart(const std::string& appinfoVdfPath,
-                                   std::uint64_t token,
+void retainRefreshAfterFailedStart(std::uint64_t token,
                                    RefreshWorkerStartResult result,
-                                   const std::vector<std::uint32_t>& runtimePublishApps)
+                                   const std::vector<RefreshRequest>& requests)
 {
 	if (result != RefreshWorkerStartResult::NotStarted ||
 	    !shouldRequeueRefreshAfterStartFailure(/*workerMayStillExist=*/false))
@@ -2733,99 +3174,51 @@ void retainRefreshAfterFailedStart(const std::string& appinfoVdfPath,
 	// unbounded retry loop. Keep the request dormant until the next PICS or
 	// config-watcher refresh request reopens the gate.
 	std::lock_guard<std::mutex> lock(g_refreshScheduleMu);
-	if (g_refreshInFlight || g_refreshWorkerToken != token)
-		return;
-	g_refreshPending = true;
-	if (g_refreshPendingPath.empty())
-		g_refreshPendingPath = appinfoVdfPath;
-	g_refreshPendingRuntimeApps = mergeRuntimePublishCandidates(
-		std::move(g_refreshPendingRuntimeApps), runtimePublishApps);
+	if (g_refreshWorkerToken != token) return;
+	g_refreshQueue.restoreAfterStartFailure(requests);
+	g_refreshActivePath.clear();
 }
 
 void finishRefresh(const std::string& completedPath, std::uint64_t token)
 {
 	std::string nextPath;
-	std::vector<std::uint32_t> nextRuntimePublishApps;
+	std::vector<RefreshRequest> nextRequests;
 	std::uint64_t nextToken = 0;
 	{
 		std::lock_guard<std::mutex> lock(g_refreshScheduleMu);
-		if (!g_refreshInFlight || g_refreshWorkerToken != token)
-			return;
-
-		const bool asyncEnabled = asyncProvisioningEnabled();
-		const bool hasManagedApps = !g_config.managedAppIds.get().empty();
-		if (!shouldRerunPendingRefresh(
-		        asyncEnabled, hasManagedApps, g_refreshPending))
+		if (g_refreshWorkerToken != token || !g_refreshQueue.active()) return;
+		nextRequests = g_refreshQueue.finishActive();
+		if (nextRequests.empty())
 		{
-			g_refreshPending = false;
-			g_refreshPendingPath.clear();
-			g_refreshPendingRuntimeApps.clear();
-			g_refreshInFlight = false;
+			g_refreshActivePath.clear();
 			return;
 		}
-
-		nextPath = g_refreshPendingPath.empty()
-		               ? completedPath
-		               : g_refreshPendingPath;
-		nextRuntimePublishApps = std::move(g_refreshPendingRuntimeApps);
-		g_refreshPending = false;
-		g_refreshPendingPath.clear();
-		g_refreshPendingRuntimeApps.clear();
-		// Keep the gate closed while handing the queued request to the next
-		// worker. A request arriving in this window queues behind that worker.
+		nextPath = g_refreshActivePath.empty() ? completedPath : g_refreshActivePath;
 		nextToken = ++g_refreshWorkerToken;
 	}
 
-	const auto startResult = startRefreshWorker(
-		nextPath, nextToken, nextRuntimePublishApps);
-	retainRefreshAfterFailedStart(
-		nextPath, nextToken, startResult, nextRuntimePublishApps);
-}
-
-void refreshInBackground(const std::string& appinfoVdfPath)
-{
-	refreshInBackground(appinfoVdfPath, {});
+	const auto startResult = startRefreshWorker(nextPath, nextToken, nextRequests);
+	retainRefreshAfterFailedStart(nextToken, startResult, nextRequests);
 }
 
 void refreshInBackground(
 	const std::string& appinfoVdfPath,
-	const std::vector<std::uint32_t>& runtimePublishApps)
+	const std::vector<RefreshRequest>& requests)
 {
-	std::string workerPath = appinfoVdfPath;
-	std::vector<std::uint32_t> workerRuntimePublishApps;
+	if (requests.empty() || !asyncProvisioningEnabled()) return;
+	std::vector<RefreshRequest> batch;
 	std::uint64_t token = 0;
 	{
 		std::lock_guard<std::mutex> lock(g_refreshScheduleMu);
-		const bool asyncEnabled = asyncProvisioningEnabled();
-		const bool hasManagedApps = !g_config.managedAppIds.get().empty();
-		const auto action = refreshScheduleAction(
-		    asyncEnabled, hasManagedApps, g_refreshInFlight);
-		if (action == RefreshScheduleAction::Ignore)
-			return;
-		if (action == RefreshScheduleAction::Queue)
-		{
-			g_refreshPending = true;
-			g_refreshPendingPath = appinfoVdfPath;
-			g_refreshPendingRuntimeApps = mergeRuntimePublishCandidates(
-				std::move(g_refreshPendingRuntimeApps), runtimePublishApps);
-			return;
-		}
-
-		if (!g_refreshPendingPath.empty())
-			workerPath = g_refreshPendingPath;
-		workerRuntimePublishApps = mergeRuntimePublishCandidates(
-			std::move(g_refreshPendingRuntimeApps), runtimePublishApps);
-		g_refreshInFlight = true;
-		g_refreshPending = false;
-		g_refreshPendingPath.clear();
-		g_refreshPendingRuntimeApps.clear();
+		const RefreshQueueDecision decision = g_refreshQueue.enqueue(requests);
+		if (decision.action != RefreshQueueAction::Start) return;
+		batch = decision.batch;
+		g_refreshActivePath = appinfoVdfPath;
 		token = ++g_refreshWorkerToken;
 	}
 
-	const auto startResult = startRefreshWorker(
-		workerPath, token, workerRuntimePublishApps);
-	retainRefreshAfterFailedStart(
-		workerPath, token, startResult, workerRuntimePublishApps);
+	const auto startResult = startRefreshWorker(appinfoVdfPath, token, batch);
+	retainRefreshAfterFailedStart(token, startResult, batch);
 }
 
 DlcInjectionIds collectDlcAppIdsForAddedApps(bool* complete)
@@ -2843,6 +3236,19 @@ DlcInjectionIds collectDlcAppIdsForAddedApps(bool* complete)
 		return {};
 	}
 
+	// Terminal lookup takes the publication mutex. Resolve it before taking
+	// the cache file lock so every path preserves publication -> file order.
+	std::unordered_set<uint32_t> terminalApps;
+	const auto archivedGids = ManifestStore::archivedGidIndex();
+	for (const uint32_t appId : added)
+	{
+		const std::string fingerprint =
+			localContentFingerprint(appId, archivedGids);
+		primeTerminalMemo(appId, fingerprint);
+		if (observeTerminal(appId, 0).applies)
+			terminalApps.insert(appId);
+	}
+
 	ProcessLock::FileLock cacheLock(cacheLockPath(), false);
 	if (!cacheLock.acquired())
 	{
@@ -2858,57 +3264,17 @@ DlcInjectionIds collectDlcAppIdsForAddedApps(bool* complete)
 
 	for (uint32_t appId : added)
 	{
-		// Validate the complete cache pair, not just the current .bin size.
-		// A file can be truncated before this snapshot opens while remaining
-		// syntactically parseable; the metadata size and SHA-1 are authoritative.
+		if (terminalApps.count(appId) != 0) continue;
+		// Validate and retain the wire in one read. Reopening every pair after
+		// hashing/parsing it doubled startup I/O for large managed libraries.
 		std::string validationDiag;
-		if (!hasValidatedCachedBuffer(appId, validationDiag))
+		std::string wire;
+		if (!readValidatedCacheBufferLocked(appId, wire, validationDiag))
 		{
 			if (g_pLog)
 				g_pLog->debug(
 				    "AppInfoProvision: DLC snapshot rejected cache pair for app=%u: %s\n",
 				    appId, validationDiag.c_str());
-			return {};
-		}
-
-		const auto path = getBufferPath(appId);
-		std::ifstream ifs(path, std::ios::binary | std::ios::ate);
-		if (!ifs.is_open())
-		{
-			if (g_pLog)
-				g_pLog->debug(
-				    "AppInfoProvision: DLC snapshot missing buffer for app=%u\n",
-				    appId);
-			return {};
-		}
-
-		const std::streamsize sz = ifs.tellg();
-		if (sz <= 0 || sz > (64LL << 20))
-		{
-			if (g_pLog)
-				g_pLog->debug(
-				    "AppInfoProvision: DLC snapshot rejected buffer size for app=%u\n",
-				    appId);
-			return {};
-		}
-		std::string wire;
-		wire.resize(static_cast<std::size_t>(sz));
-		ifs.seekg(0);
-		if (!ifs)
-		{
-			if (g_pLog)
-				g_pLog->debug(
-				    "AppInfoProvision: DLC snapshot could not seek buffer for app=%u\n",
-				    appId);
-			return {};
-		}
-		ifs.read(wire.data(), sz);
-		if (ifs.gcount() != sz || !ifs)
-		{
-			if (g_pLog)
-				g_pLog->debug(
-				    "AppInfoProvision: DLC snapshot read failed for app=%u\n",
-				    appId);
 			return {};
 		}
 
@@ -2988,6 +3354,10 @@ bool forgetAppImpl(uint32_t appId, bool preserveTicketArtifacts)
 		g_needProton.erase(appId);
 		g_pendingProtonRemovals.insert(appId);
 	}
+	{
+		std::lock_guard<std::mutex> validationLock(g_cacheValidationMu);
+		g_cacheProbeMemo.erase(appId);
+	}
 
 	const auto cacheDir = getCacheDir();
 	bool pendingMappingRemoved = false;
@@ -2996,6 +3366,7 @@ bool forgetAppImpl(uint32_t appId, bool preserveTicketArtifacts)
 		std::lock_guard<std::mutex> publicationLock(g_cachePublicationMu);
 		ProcessLock::FileLock cacheLock(cacheLockPath(), false);
 		if (!cacheLock.acquired()) return false;
+		ProvisionTerminal::Store(cacheDir).erase(appId);
 		// Decide marker retention only after both publication and cache locks are
 		// held. A concurrent synthetic publication must be visible here before
 		// the cleanup chooses whether its protection marker is preserved.

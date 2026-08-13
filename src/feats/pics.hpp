@@ -22,6 +22,8 @@
 
 #pragma once
 
+#include "provision_refresh.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <unordered_set>
@@ -44,6 +46,68 @@ namespace PICS
 	inline bool legacyManifestStagingEnabled(const char* envValue)
 	{
 		return envValue && envValue[0] == '1' && envValue[1] == '\0';
+	}
+
+	inline std::unordered_set<uint32_t> selectManagedResponseApps(
+	    const std::unordered_set<uint32_t>& managed,
+	    const std::vector<uint32_t>& responseAppIds)
+	{
+		std::unordered_set<uint32_t> selected;
+		for (const uint32_t appId : responseAppIds)
+			if (managed.count(appId) != 0) selected.insert(appId);
+		return selected;
+	}
+
+	inline bool rawResponseCanRepairCache(
+		bool hasBuffer, AppInfoProvision::CacheReadiness readiness) noexcept
+	{
+		return hasBuffer &&
+			(readiness == AppInfoProvision::CacheReadiness::Missing ||
+			 readiness == AppInfoProvision::CacheReadiness::Invalid ||
+			 readiness == AppInfoProvision::CacheReadiness::Busy ||
+			 readiness == AppInfoProvision::CacheReadiness::Unverified);
+	}
+
+	inline bool rawCacheItemShouldReplace(
+		std::uint64_t pendingGeneration, std::uint32_t pendingChange,
+		std::uint64_t incomingGeneration, std::uint32_t incomingChange) noexcept
+	{
+		if (incomingGeneration != pendingGeneration)
+			return incomingGeneration > pendingGeneration;
+		return incomingChange >= pendingChange;
+	}
+
+	inline bool rawCacheWorkerShouldContinueAfterDeferral(
+		bool hadConcurrentPending) noexcept
+	{
+		// A deferred-only batch waits for a later event instead of spinning on a
+		// persistent failure. An arrival queued while the batch was running must
+		// be drained by the current worker so it cannot become stranded.
+		return hadConcurrentPending;
+	}
+
+	inline std::vector<AppInfoProvision::RefreshRequest>
+	excludeRefreshRequestsForApps(
+	    const std::vector<AppInfoProvision::RefreshRequest>& requests,
+	    const std::unordered_set<uint32_t>& excluded)
+	{
+		std::vector<AppInfoProvision::RefreshRequest> pending;
+		pending.reserve(requests.size());
+		for (const auto& request : requests)
+			if (excluded.count(request.appId) == 0) pending.push_back(request);
+		return pending;
+	}
+
+	inline std::vector<AppInfoProvision::RefreshRequest>
+	markRuntimePublicationForSuppressedApps(
+		const std::vector<AppInfoProvision::RefreshRequest>& requests,
+		const std::unordered_set<uint32_t>& suppressed)
+	{
+		auto tagged = requests;
+		for (auto& request : tagged)
+			request.publishRuntime = request.publishRuntime ||
+				suppressed.count(request.appId) != 0;
+		return tagged;
 	}
 
 	// --- Pure install-staging planning (unit-tested in tools/test_pics.cpp) --

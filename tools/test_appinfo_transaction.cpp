@@ -95,6 +95,17 @@ std::string readAll(const std::string& path)
 	return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+bool hasScopedValidationArtifact(const std::string& directory)
+{
+	for (const auto& entry : std::filesystem::directory_iterator(directory))
+	{
+		if (entry.path().filename().string().find(".slssteam-validate.") !=
+			std::string::npos)
+			return true;
+	}
+	return false;
+}
+
 } // namespace
 
 namespace AppInfoProvision
@@ -156,6 +167,37 @@ int main()
 	assert(!published.empty());
 	assert(std::filesystem::exists(appinfo + ".slssteam-previous"));
 
+	// Runtime publication is targeted: a refresh for 1001 must not splice the
+	// separately valid cache pair for 1002 into Steam's backing file.
+	const auto scopedAppinfo = root + "/appcache/scoped.vdf";
+	createEmptyAppInfo(scopedAppinfo);
+	assert(AppInfoVdf::injectCachedApps(
+		scopedAppinfo, std::unordered_set<uint32_t>{1001, 1003, 1004}) == 1);
+	const auto scopedBytes = readAll(scopedAppinfo);
+	assert(scopedBytes.find("456") != std::string::npos);
+	assert(scopedBytes.find("789") == std::string::npos);
+	assert(!hasScopedValidationArtifact(root + "/appcache"));
+
+	// A concurrent Steam writer wins the file identity race. The scoped path
+	// must not replace that file or create/overwrite its rollback snapshot.
+	const auto racedAppinfo = root + "/appcache/raced.vdf";
+	createEmptyAppInfo(racedAppinfo);
+	const auto raceRollback = racedAppinfo + ".slssteam-previous";
+	std::string rollbackSeedError;
+	assert(AtomicFile::write(
+		raceRollback, "existing rollback", rollbackSeedError));
+#ifdef APPINFO_VDF_TESTING
+	AppInfoVdf::setBeforeScopedPublishHook([&] {
+		std::string raceError;
+		assert(AtomicFile::write(racedAppinfo, "steam writer", raceError));
+	});
+#endif
+	assert(AppInfoVdf::injectCachedApps(
+		racedAppinfo, std::unordered_set<uint32_t>{1001}) == 0);
+	assert(readAll(racedAppinfo) == "steam writer");
+	assert(readAll(raceRollback) == "existing rollback");
+	assert(!hasScopedValidationArtifact(root + "/appcache"));
+
 	// A second pass is idempotent and must not produce another visible rewrite.
 	assert(AppInfoVdf::injectAllCached(appinfo) == 2);
 	assert(readAll(appinfo) == published);
@@ -171,12 +213,12 @@ int main()
 
 	const auto filteredAppinfo = root + "/appcache/filtered.vdf";
 	createEmptyAppInfo(filteredAppinfo);
-	assert(AppInfoVdf::injectAllCached(filteredAppinfo) == 1);
+	// A complete validated pair remains splice-eligible after its TTL expires.
+	assert(AppInfoVdf::injectAllCached(filteredAppinfo) == 2);
 
 	const auto fallbackAppinfo = root + "/appcache/fallback.vdf";
 	createEmptyAppInfo(fallbackAppinfo);
-	const std::unordered_set<uint32_t> explicitFallback{1001};
-	assert(AppInfoVdf::injectAllCached(fallbackAppinfo, explicitFallback) == 2);
+	assert(AppInfoVdf::injectAllCached(fallbackAppinfo) == 2);
 
 	unsetenv("SLSSTEAM_ASYNC_PROVISION");
 	unsetenv("SLSSTEAM_PROVISION_TTL");

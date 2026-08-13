@@ -3,10 +3,19 @@
 
 namespace HotReloadPublishPolicy
 {
-inline constexpr bool shouldPublish(
+inline constexpr bool shouldEvaluateInputs(
+	bool initialPublication,
 	bool membershipChanged,
 	bool forceSourceRefresh) noexcept
 {
-	return membershipChanged || forceSourceRefresh;
+	return initialPublication || membershipChanged || forceSourceRefresh;
+}
+
+inline constexpr bool shouldPublish(
+	bool initialPublication,
+	bool membershipChanged,
+	bool fingerprintsChanged) noexcept
+{
+	return initialPublication || membershipChanged || fingerprintsChanged;
 }
 } // namespace HotReloadPublishPolicy

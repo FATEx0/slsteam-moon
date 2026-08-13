@@ -8,6 +8,7 @@
 #include "hotreload_inputs.hpp"
 #include "hotreload_publish_policy.hpp"
 #include "libraryremoval.hpp"
+#include "manifeststore.hpp"
 
 #include "../config.hpp"
 #include "../log.hpp"
@@ -16,6 +17,8 @@
 #include <algorithm>
 #include <iterator>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -27,6 +30,7 @@ struct CoordinatorState
 	bool initialized = false;
 	std::uint64_t generation = 0;
 	std::unordered_set<std::uint32_t> managedAppIds;
+	std::unordered_map<std::uint32_t, std::string> contentFingerprints;
 };
 
 CoordinatorState& coordinator()
@@ -67,13 +71,35 @@ bool publishLocked(
 	bool force,
 	bool allowBackgroundRefresh)
 {
+	const bool initialPublication = state.generation == 0;
 	const bool membershipChanged = managedAppIds != state.managedAppIds;
-	if (!HotReloadPublishPolicy::shouldPublish(membershipChanged, force))
+	if (!HotReloadPublishPolicy::shouldEvaluateInputs(
+		initialPublication, membershipChanged, force))
 		return false;
 
 	const auto added = difference(managedAppIds, state.managedAppIds);
 	const auto removed = difference(state.managedAppIds, managedAppIds);
 	const std::uint64_t nextGeneration = state.generation + 1;
+	std::unordered_map<std::uint32_t, std::string> nextFingerprints;
+	std::vector<std::uint32_t> locallyChanged;
+	const auto archivedGids = ManifestStore::archivedGidIndex();
+	for (const std::uint32_t appId : managedAppIds)
+	{
+		const std::string current =
+			AppInfoProvision::localContentFingerprint(appId, archivedGids);
+		const auto old = state.contentFingerprints.find(appId);
+		if (old == state.contentFingerprints.end() || old->second != current)
+			locallyChanged.push_back(appId);
+		nextFingerprints.emplace(appId, current);
+	}
+	const bool fingerprintsChanged = !locallyChanged.empty();
+	if (!HotReloadPublishPolicy::shouldPublish(
+		initialPublication, membershipChanged, fingerprintsChanged))
+	{
+		return false;
+	}
+	for (const auto& [appId, fingerprint] : nextFingerprints)
+		AppInfoProvision::primeTerminalMemo(appId, fingerprint);
 	auto built = HotReloadInputs::buildFromCaches(
 		nextGeneration, managedAppIds);
 	if (!built.valid)
@@ -106,6 +132,7 @@ bool publishLocked(
 
 	state.managedAppIds = managedAppIds;
 	state.generation = nextGeneration;
+	state.contentFingerprints = std::move(nextFingerprints);
 	for (const std::uint32_t appId : removed)
 		LibraryRemoval::queue(appId);
 
@@ -121,14 +148,30 @@ bool publishLocked(
 			built.snapshot.metadataComplete ? "complete" : "pending");
 	}
 
-	if (allowBackgroundRefresh && !added.empty())
+	if (allowBackgroundRefresh && (!added.empty() || !locallyChanged.empty()))
 	{
 		const std::string appinfoPath = AppInfoVdf::findExistingPath();
 		if (!appinfoPath.empty())
 		{
 			// Best effort only.  Live readiness is driven by the appinfo hook;
 			// this detached pass merely publishes a reusable disk cache.
-			AppInfoProvision::refreshInBackground(appinfoPath, added);
+			std::unordered_set<std::uint32_t> addedSet(added.begin(), added.end());
+			std::vector<AppInfoProvision::RefreshRequest> requests;
+			requests.reserve(added.size() + locallyChanged.size());
+			for (const std::uint32_t appId : added)
+				requests.push_back({appId, 0,
+					AppInfoProvision::snapshotCachePublication(appId).generation,
+					AppInfoProvision::reasonMask(
+						AppInfoProvision::RefreshReason::HotAdd), true, true});
+			for (const std::uint32_t appId : locallyChanged)
+			{
+				if (addedSet.count(appId) != 0) continue;
+				requests.push_back({appId, 0,
+					AppInfoProvision::snapshotCachePublication(appId).generation,
+					AppInfoProvision::reasonMask(
+						AppInfoProvision::RefreshReason::LocalInputs), true, true});
+			}
+			AppInfoProvision::refreshInBackground(appinfoPath, requests);
 		}
 	}
 

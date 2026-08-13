@@ -216,6 +216,13 @@ namespace ManifestStore
 		return best;
 	}
 
+	ArchivedGidIndex archivedGidIndex()
+	{
+		const std::string store = dir();
+		if (store.empty()) return {};
+		return ManifestStoreIO::newestValidManifestGids(store);
+	}
+
 	void purgeDepots(const std::vector<uint32_t>& depotIds)
 	{
 		const std::string store = dir();

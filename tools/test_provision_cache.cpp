@@ -23,9 +23,13 @@
 // Build (from repo root):
 //   g++ -std=c++20 -I include tools/test_provision_cache.cpp -o /tmp/test_provision_cache && /tmp/test_provision_cache
 
+#include "../src/feats/appinfo_provision.hpp"
 #include "../src/feats/provision_cache.hpp"
+#include "../src/feats/provision_schedule.hpp"
 
 #include <cstdio>
+#include <map>
+#include <optional>
 
 static int g_failures = 0;
 
@@ -37,6 +41,8 @@ static int g_failures = 0;
 
 int main()
 {
+	using AppInfoProvision::CacheReadiness;
+	using AppInfoProvision::coldFallbackNeeded;
 	using AppInfoProvision::cache::CacheUse;
 	using AppInfoProvision::cache::CacheMetadataView;
 	using AppInfoProvision::cache::CacheRecordFacts;
@@ -55,6 +61,17 @@ int main()
 	using AppInfoProvision::cache::shouldPreserveCacheFromRawPics;
 	using AppInfoProvision::cache::shouldPreserveSyntheticMarker;
 	using AppInfoProvision::cache::wireSizeMatches;
+
+	CHECK(!coldFallbackNeeded(CacheReadiness::Busy),
+	      "busy runtime cache never becomes synchronous network work");
+	CHECK(!coldFallbackNeeded(CacheReadiness::Unverified),
+	      "unverified runtime cache defers to background validation");
+	CHECK(coldFallbackNeeded(CacheReadiness::Missing),
+	      "confirmed runtime miss remains recoverable");
+	CHECK(coldFallbackNeeded(CacheReadiness::Invalid),
+	      "confirmed invalid runtime pair remains recoverable");
+	CHECK(!coldFallbackNeeded(CacheReadiness::ValidStale),
+	      "validated stale cache remains usable at startup");
 
 	CacheMetadataView metadata{};
 	CHECK(!parseCacheMetadata("", metadata),
@@ -78,7 +95,8 @@ int main()
 	          "sha_b64: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\nnormalized: true\n"
 	          "synthetic: false\n",
 	          metadata) &&
-	      metadata.appId == 3405340 && metadata.wireSize == 8192 &&
+	      metadata.appId == 3405340 && metadata.changeNumber == 1 &&
+	      metadata.wireSize == 8192 &&
 	      metadata.hasSynthetic && !metadata.synthetic,
 	      "generated cache metadata is parsed without yaml-cpp");
 	CHECK(parseCacheMetadata(
@@ -114,6 +132,60 @@ int main()
 		CHECK(!(changed == fileIdentity),
 		      "size change invalidates cache identity");
 	}
+	{
+		auto changed = fileIdentity;
+		++changed.metadataInode;
+		CHECK(!(changed == fileIdentity),
+		      "metadata replacement invalidates cache identity");
+	}
+	{
+		auto changed = fileIdentity;
+		++changed.metadataMtimeNsecs;
+		CHECK(!(changed == fileIdentity),
+		      "metadata same-second rewrite invalidates cache identity");
+	}
+	const auto publishedIdentity =
+		AppInfoProvision::validatedPublicationIdentity(
+			/*publicationSucceeded=*/true,
+			/*validationSucceeded=*/true,
+			std::optional<CacheValidationKey>{fileIdentity});
+	CHECK(publishedIdentity && *publishedIdentity == fileIdentity,
+	      "successful publication exposes its exact post-write identity");
+	CHECK(!AppInfoProvision::validatedPublicationIdentity(
+			/*publicationSucceeded=*/false,
+			/*validationSucceeded=*/true,
+			std::optional<CacheValidationKey>{fileIdentity}),
+	      "failed publication cannot seed the validation memo");
+	CHECK(!AppInfoProvision::validatedPublicationIdentity(
+			/*publicationSucceeded=*/true,
+			/*validationSucceeded=*/false,
+			std::optional<CacheValidationKey>{fileIdentity}),
+	      "unvalidated publication cannot seed the validation memo");
+	CHECK(!AppInfoProvision::validatedPublicationIdentity(
+			/*publicationSucceeded=*/true,
+			/*validationSucceeded=*/true, std::nullopt),
+	      "publication without a post-write identity cannot seed the memo");
+	std::map<CacheValidationKey, bool> publicationMemo;
+	CHECK(AppInfoProvision::memoizeValidatedPublication(
+			publicationMemo, /*publicationSucceeded=*/true,
+			/*validationSucceeded=*/true,
+			std::optional<CacheValidationKey>{fileIdentity}, true) &&
+	      publicationMemo.size() == 1 && publicationMemo.at(fileIdentity),
+	      "successful validation memoizes the exact post-publication identity");
+	auto rejectedIdentity = fileIdentity;
+	++rejectedIdentity.inode;
+	CHECK(!AppInfoProvision::memoizeValidatedPublication(
+			publicationMemo, /*publicationSucceeded=*/false,
+			/*validationSucceeded=*/true,
+			std::optional<CacheValidationKey>{rejectedIdentity}, true) &&
+	      publicationMemo.size() == 1,
+	      "failed publication leaves the validation memo unchanged");
+	CHECK(!AppInfoProvision::memoizeValidatedPublication(
+			publicationMemo, /*publicationSucceeded=*/true,
+			/*validationSucceeded=*/false,
+			std::optional<CacheValidationKey>{rejectedIdentity}, true) &&
+	      publicationMemo.size() == 1,
+	      "failed validation leaves the validation memo unchanged");
 
 	const long long ttl = 300; // 5 minutes
 	const long long now = 1'000'000;

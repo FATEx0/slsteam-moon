@@ -189,7 +189,8 @@ namespace SynthMark
 			// without an explicit app-to-depot relation.
 			return parseCacheAppId(filename, "synthetic_", "", appId) ||
 			       parseCacheAppId(filename, "picsbuffer_", ".bin", appId) ||
-			       parseCacheAppId(filename, "picsbuffer_", ".yaml", appId);
+			       parseCacheAppId(filename, "picsbuffer_", ".yaml", appId) ||
+			       parseCacheAppId(filename, "terminal_", ".state", appId);
 		}
 
 		inline bool renameNoReplace(const std::filesystem::path& original,
@@ -277,6 +278,7 @@ namespace SynthMark
 		const std::string id = std::to_string(appId);
 		add("picsbuffer_" + id + ".bin");
 		add("picsbuffer_" + id + ".yaml");
+		add("terminal_" + id + ".state");
 		if (includeSyntheticMarker)
 			add("synthetic_" + id);
 		if (includeTicketArtifacts)

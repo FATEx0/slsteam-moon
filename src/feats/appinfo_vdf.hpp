@@ -49,8 +49,10 @@
 #pragma once
 
 #include <cstdint>
+#ifdef APPINFO_VDF_TESTING
+#include <functional>
+#endif
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -80,13 +82,15 @@ namespace AppInfoVdf
 	// `<config>/cache/picsbuffer_*.{bin,yaml}` and inject each one into
 	// the appinfo.vdf at `path`.  Returns the number of entries
 	// successfully injected (or unchanged-already-present).
-	int injectAllCached(
-	    const std::string& path,
-	    const std::unordered_set<uint32_t>& explicitFallbackApps);
+	int injectAllCached(const std::string& path);
 
-	inline int injectAllCached(const std::string& path)
-	{
-		static const std::unordered_set<uint32_t> noFallback;
-		return injectAllCached(path, noFallback);
-	}
+	// Runtime publication is deliberately narrower than startup injection:
+	// merge only the requested currently-managed cache pairs, and fail closed if
+	// Steam replaces appinfo.vdf while this transaction is in flight.
+	int injectCachedApps(const std::string& path,
+	                     const std::unordered_set<uint32_t>& requestedApps);
+
+#ifdef APPINFO_VDF_TESTING
+	void setBeforeScopedPublishHook(std::function<void()> hook);
+#endif
 }

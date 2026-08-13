@@ -41,18 +41,133 @@
 #pragma once
 
 #include "dlcids.hpp"
+#include "manifeststore.hpp"
+#include "provision_cache.hpp"
+#include "provision_refresh.hpp"
+#include "provision_result.hpp"
+#include "provision_terminal.hpp"
 #include "../config_path.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace AppInfoProvision
 {
+
+enum class CacheProbeMode { BlockingValidate, NonBlockingMemoOnly };
+
+struct CacheProbe
+{
+	CacheReadiness readiness = CacheReadiness::Missing;
+	std::uint32_t changeNumber = 0;
+};
+
+CacheProbe probeCache(std::uint32_t appId, CacheProbeMode mode);
+std::string localContentFingerprint(std::uint32_t appId);
+std::string localContentFingerprint(
+	std::uint32_t appId,
+	const ManifestStore::ArchivedGidIndex& archivedGids);
+inline std::string fingerprintIndexedLocalInputs(
+	std::vector<ProvisionTerminal::LocalInput> inputs,
+	const ManifestStore::ArchivedGidIndex& archivedGids)
+{
+	for (auto& input : inputs)
+	{
+		const auto found = archivedGids.find(input.depotId);
+		input.manifestGid = found == archivedGids.end() ? 0 : found->second;
+	}
+	return ProvisionTerminal::fingerprint(std::move(inputs));
+}
+
+inline std::optional<cache::CacheValidationKey> validatedPublicationIdentity(
+	bool publicationSucceeded,
+	bool validationSucceeded,
+	std::optional<cache::CacheValidationKey> postPublicationIdentity) noexcept
+{
+	if (!publicationSucceeded || !validationSucceeded ||
+		!postPublicationIdentity)
+	{
+		return std::nullopt;
+	}
+	return postPublicationIdentity;
+}
+
+template <typename Memo, typename Value>
+inline bool memoizeValidatedPublication(
+	Memo& memo,
+	bool publicationSucceeded,
+	bool validationSucceeded,
+	std::optional<cache::CacheValidationKey> postPublicationIdentity,
+	Value&& value)
+{
+	const auto identity = validatedPublicationIdentity(
+		publicationSucceeded, validationSucceeded,
+		std::move(postPublicationIdentity));
+	if (!identity) return false;
+	memo[*identity] = std::forward<Value>(value);
+	return true;
+}
+
+// Populate the process-local terminal memo from a persisted sidecar.  This is
+// intended for startup and watcher/worker contexts; PICS callbacks use only
+// the already-populated memo through observeTerminal().
+void primeTerminalMemo(std::uint32_t appId, std::string_view fingerprint);
+void primeTerminalMemo(std::uint32_t appId);
+
+inline bool requestNeedsFetch(const RefreshRequest& request,
+	CacheReadiness readiness,
+	std::uint32_t cachedChangeNumber) noexcept
+{
+	if (request.appId == 0) return false;
+	if (request.forceRefresh) return true;
+	if (readiness == CacheReadiness::Missing ||
+	    readiness == CacheReadiness::Invalid ||
+	    readiness == CacheReadiness::Unverified ||
+	    readiness == CacheReadiness::Busy)
+		return true;
+	return request.minimumChangeNumber > cachedChangeNumber;
+}
+
+enum class ColdStartMode { StartupRequireUsablePair, RuntimeMissingOnly };
+
+inline bool coldStartPrimesTerminalMemo(ColdStartMode mode) noexcept
+{
+	return mode == ColdStartMode::StartupRequireUsablePair;
+}
+
+inline std::unordered_set<std::uint32_t> selectColdStartApps(
+	const std::vector<std::pair<std::uint32_t, CacheReadiness>>& candidates,
+	ColdStartMode /*mode*/)
+{
+	std::unordered_set<std::uint32_t> selected;
+	for (const auto& [appId, readiness] : candidates)
+	{
+		if (appId == 0) continue;
+		const bool recoveryNeeded = readiness == CacheReadiness::Missing ||
+			readiness == CacheReadiness::Invalid;
+		if (recoveryNeeded)
+			selected.insert(appId);
+	}
+	return selected;
+}
+
+struct TerminalObservation
+{
+	bool applies = false;
+	std::uint32_t changeNumber = 0;
+	ProvisionOutcome outcome = ProvisionOutcome::IncompleteContent;
+};
+
+TerminalObservation observeTerminal(
+	std::uint32_t appId, std::uint32_t observedChangeNumber);
 
 // Serialize state snapshots, Proton-state transitions, and commit sections.
 // CM/provider I/O, retry sleeps, and cache-pair writes must not run while this
@@ -104,6 +219,22 @@ bool provisionApp(uint32_t appId, const std::string& appinfoVdfPath);
 int provisionAllAddedApps(const std::string& appinfoVdfPath,
                           bool allowConfigWrite = true);
 
+struct ProvisionPassSummary
+{
+	std::size_t requested = 0;
+	std::size_t fetched = 0;
+	std::size_t updated = 0;
+	std::size_t ready = 0;
+	std::size_t fallback = 0;
+	std::size_t terminal = 0;
+	std::size_t failed = 0;
+};
+
+ProvisionPassSummary provisionRequestedApps(
+	const std::string& appinfoVdfPath,
+	const std::vector<RefreshRequest>& requests,
+	bool allowConfigWrite = false);
+
 // Apply Proton mappings deferred by runtime provisioning. This is called from
 // setup() before Steam starts its live ConfigStore writers.
 void flushPendingProtonMappings();
@@ -113,28 +244,25 @@ void flushPendingProtonMappings();
 // called at runtime, or during setup() before the appinfo splice when
 // `allowConfigWrite` is true. It publishes a normalized cache pair;
 // `sanitizedApps`, when supplied, receives ids successfully normalized during
-// this invocation. `fallbackApps`, when supplied, receives ids for which a
-// valid stale pair was accepted as `FallbackCache`; those ids are safe to
-// splice during this restart but remain stale for future refresh decisions.
+// this invocation. Offline fallback bookkeeping stays pass-local: startup
+// splicing independently revalidates every complete pair before merging it.
 int provisionColdStartApps(
     const std::string& appinfoVdfPath,
+    const std::unordered_set<std::uint32_t>& candidates,
+    ColdStartMode mode,
     std::unordered_set<uint32_t>* sanitizedApps = nullptr,
-    bool allowConfigWrite = false,
-    std::unordered_set<uint32_t>* fallbackApps = nullptr);
+    bool allowConfigWrite = false);
 
 // Resolve the config/env gate for the asynchronous refresh path.
 bool asyncProvisioningEnabled();
 
-// Start one detached refresh pass from a post-setup worker context, such as
-// the PICS receive path or the config watcher. Never call it from setup() or
-// the LD_AUDIT la_preinit path. Existing buffers are refreshed asynchronously;
-// the next Steam start consumes the new pair. The overload carrying
-// `runtimePublishApps` also asks Steam's live appinfo cache to re-read validated
-// synthetic entries for exactly those newly managed ids.
-void refreshInBackground(const std::string& appinfoVdfPath);
+// Start one detached, AppID-scoped refresh pass from a post-setup worker
+// context, such as the PICS receive path or the config watcher. Never call it
+// from setup() or the LD_AUDIT la_preinit path. The request vector controls
+// exactly which managed generations may be fetched and published.
 void refreshInBackground(
     const std::string& appinfoVdfPath,
-    const std::vector<uint32_t>& runtimePublishApps);
+    const std::vector<RefreshRequest>& requests);
 
 // Common lock held while the cache's .bin/.yaml pair is read or published.
 // Keep this inline because AppInfoVdf's standalone transaction test links
@@ -172,6 +300,10 @@ bool cacheMarkerAllowsRead(uint32_t appId);
 bool publishCachePairLocked(uint32_t appId, const std::string& wire,
                             const std::string& metadata, bool synthetic,
                             bool markerBefore, std::string& error);
+
+// Validate a just-published pair and memoize its exact bin+yaml identity.
+// Callers hold cachePublicationMutex() and cacheLockPath().
+bool memoizePublishedCachePairLocked(uint32_t appId);
 
 // Read a cache pair only after validating metadata, SHA-1, VDF structure and
 // usable depot content. The helper acquires the cross-process cache lock and

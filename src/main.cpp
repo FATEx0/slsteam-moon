@@ -326,7 +326,6 @@ static void setup()
 		{
 			const auto preinitAction =
 			    AppInfoProvision::preinitProvisionAction(asyncProvision);
-			std::unordered_set<uint32_t> coldFallbackApps;
 			if (preinitAction ==
 			    AppInfoProvision::PreinitProvisionAction::SynchronousProvision)
 			{
@@ -346,12 +345,17 @@ static void setup()
 				DepotKey::importLuaScripts();
 				ManifestId::importLuaScripts();
 				BootProf::Span provisionProfile(g_pLog.get(), "provision.cold_preinit");
+				const auto startupCandidates = g_config.managedAppIds.get();
 				AppInfoProvision::provisionColdStartApps(
-				    candidate, nullptr, true, &coldFallbackApps);
+				    candidate,
+				    startupCandidates,
+				    AppInfoProvision::ColdStartMode::StartupRequireUsablePair,
+				    nullptr,
+				    true);
 			}
 
 			BootProf::Span spliceProfile(g_pLog.get(), "appinfo.splice_preinit");
-			AppInfoVdf::injectAllCached(candidate, coldFallbackApps);
+			AppInfoVdf::injectAllCached(candidate);
 		}
 	}
 

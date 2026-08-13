@@ -6,16 +6,60 @@
 #pragma once
 
 #include <atomic>
+#include <charconv>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <unistd.h>
 
 namespace ManifestStoreIO
 {
 	namespace fs = std::filesystem;
+	using ArchivedGidIndex = std::unordered_map<std::uint32_t, std::uint64_t>;
+
+	inline bool parseManifestName(std::string_view name,
+	                              std::uint32_t& depotId,
+	                              std::uint64_t& gid) noexcept
+	{
+		constexpr std::string_view suffix = ".manifest";
+		if (!name.ends_with(suffix)) return false;
+		name.remove_suffix(suffix.size());
+		const std::size_t separator = name.find('_');
+		if (separator == std::string_view::npos || separator == 0 ||
+			separator + 1 >= name.size() ||
+			name.find('_', separator + 1) != std::string_view::npos)
+		{
+			return false;
+		}
+
+		std::uint64_t parsedDepot = 0;
+		const std::string_view depotText = name.substr(0, separator);
+		const auto depotResult = std::from_chars(
+			depotText.data(), depotText.data() + depotText.size(), parsedDepot);
+		if (depotResult.ec != std::errc{} ||
+			depotResult.ptr != depotText.data() + depotText.size() ||
+			parsedDepot == 0 ||
+			parsedDepot > std::numeric_limits<std::uint32_t>::max())
+		{
+			return false;
+		}
+
+		const std::string_view gidText = name.substr(separator + 1);
+		const auto gidResult = std::from_chars(
+			gidText.data(), gidText.data() + gidText.size(), gid);
+		if (gidResult.ec != std::errc{} ||
+			gidResult.ptr != gidText.data() + gidText.size() || gid == 0)
+		{
+			return false;
+		}
+		depotId = static_cast<std::uint32_t>(parsedDepot);
+		return true;
+	}
 
 	inline fs::path uniqueTempPath(const fs::path& target)
 	{
@@ -35,6 +79,50 @@ namespace ManifestStoreIO
 		uint32_t magic = 0;
 		if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic))) return false;
 		return magic == 0x71F617D0u;
+	}
+
+	inline ArchivedGidIndex newestValidManifestGids(const fs::path& storeDir)
+	{
+		struct Observation
+		{
+			std::uint64_t gid = 0;
+			fs::file_time_type mtime{};
+		};
+		std::unordered_map<std::uint32_t, Observation> observations;
+		std::error_code ec;
+		if (!fs::is_directory(storeDir, ec) || ec) return {};
+
+		fs::directory_iterator it(storeDir, ec);
+		const fs::directory_iterator end;
+		while (!ec && it != end)
+		{
+			const fs::path path = it->path();
+			std::uint32_t depotId = 0;
+			std::uint64_t gid = 0;
+			const std::string name = path.filename().string();
+			if (parseManifestName(name, depotId, gid) &&
+				isValidManifest(path))
+			{
+				std::error_code timeError;
+				const fs::file_time_type mtime = fs::last_write_time(path, timeError);
+				if (!timeError)
+				{
+					auto found = observations.find(depotId);
+					if (found == observations.end() ||
+						mtime > found->second.mtime)
+					{
+						observations[depotId] = {gid, mtime};
+					}
+				}
+			}
+			it.increment(ec);
+		}
+
+		ArchivedGidIndex result;
+		result.reserve(observations.size());
+		for (const auto& [depotId, observation] : observations)
+			result.emplace(depotId, observation.gid);
+		return result;
 	}
 
 	inline bool atomicCopy(const fs::path& source, const fs::path& target)

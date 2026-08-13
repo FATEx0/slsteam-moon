@@ -249,11 +249,13 @@ int main()
 	};
 	const std::vector<std::string> managedFiles = {
 		"picsbuffer_100.bin", "picsbuffer_100.yaml", "synthetic_100",
+		"terminal_100.state",
 	};
 	for (const auto& name : managedFiles) touch(quarantineDir / name);
 
 	const std::vector<std::string> orphanFiles = {
 		"picsbuffer_200.bin", "picsbuffer_200.yaml", "synthetic_200",
+		"terminal_200.state",
 	};
 	for (const auto& name : orphanFiles) touch(quarantineDir / name);
 	// These caches are not app-scoped: manifestid_<n> uses a depot id,
@@ -297,6 +299,7 @@ int main()
 	const uint32_t forgottenApp = 321;
 	const std::vector<std::string> forgottenFiles = {
 		"picsbuffer_321.bin", "picsbuffer_321.yaml", "synthetic_321",
+		"terminal_321.state",
 		"ticket_321.yaml", "encryptedTicket_321.yaml",
 		"manifestid_987654.yaml",
 	};
@@ -381,6 +384,24 @@ int main()
 	CHECK(SynthMark::hasAppArtifacts(
 		      quarantineDir.string(), blockedApp, std::vector<uint32_t>{}),
 	      "remaining app artifact is observable after partial quarantine");
+
+	const uint32_t blockedTerminalApp = 327;
+	touch(quarantineDir / "terminal_327.state");
+	for (unsigned int attempt = 0; attempt < 1024; ++attempt)
+	{
+		const auto suffix = attempt == 0
+			? std::string{".blocked-terminal"}
+			: ".blocked-terminal." + std::to_string(attempt);
+		touch(quarantineDir / ("terminal_327.state" + suffix));
+	}
+	auto blockedTerminal = SynthMark::quarantineAppArtifacts(
+		quarantineDir.string(), blockedTerminalApp, std::vector<uint32_t>{},
+		".blocked-terminal");
+	CHECK(blockedTerminal.empty(),
+	      "blocked terminal sidecar reports no successful move");
+	CHECK(SynthMark::hasAppArtifacts(
+		      quarantineDir.string(), blockedTerminalApp, std::vector<uint32_t>{}),
+	      "remaining terminal sidecar makes cleanup incomplete");
 
 	std::error_code ec;
 	fs::remove_all(quarantineDir, ec);

@@ -14,9 +14,9 @@
 #include "../config.hpp"
 #include "../globals.hpp"
 #include "../log.hpp"
-#include "../bootprof.hpp"
 #include "../ownerwork.hpp"
 #include "../sdk/CProtoBufMsgBase.hpp"
+#include "../thread_start.hpp"
 #include "../update.hpp"
 
 #include "../utils/ManifestFetch.hpp"
@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -125,10 +126,9 @@ bool hasNormalizedCache(uint32_t appId)
 }
 
 bool persistAppBuffer(uint32_t appId, uint32_t changeNumber,
-                      const std::string& sha, const std::string& buffer)
+                      const std::string& sha, const std::string& buffer,
+                      const AppInfoProvision::CachePublicationToken& publication)
 {
-	const auto publication =
-		AppInfoProvision::snapshotCachePublication(appId);
 	if (!publication.managed)
 	{
 		g_pLog->debug("PICS: ignoring stale response for removed app=%u\n", appId);
@@ -189,6 +189,8 @@ bool persistAppBuffer(uint32_t appId, uint32_t changeNumber,
 		return false;
 	}
 	AppInfoProvision::clearCacheReadInvalidation(appId);
+	if (!AppInfoProvision::memoizePublishedCachePairLocked(appId))
+		return false;
 
 	g_pLog->debug("PICS: cached app=%u change=%u buffer=%zu bytes -> %s\n",
 	              appId, changeNumber, buffer.size(), bufPath.c_str());
@@ -250,32 +252,171 @@ void cleanShaderHitCache(uint32_t appId)
 	}
 }
 
-void refreshDlcInjectionAfterColdProvision()
+struct RawCacheItem
+{
+	uint32_t appId = 0;
+	uint32_t changeNumber = 0;
+	std::string sha;
+	std::string buffer;
+	std::string appinfoVdfPath;
+	AppInfoProvision::CachePublicationToken publication;
+};
+
+std::mutex g_rawCacheQueueMu;
+std::map<uint32_t, RawCacheItem> g_rawCachePending;
+bool g_rawCacheWorkerActive = false;
+
+void refreshDlcInjectionAfterCachePublication()
 {
 	std::lock_guard<std::mutex> passLock(
-	    AppInfoProvision::provisioningPassMutex());
+		AppInfoProvision::provisioningPassMutex());
 	bool complete = false;
 	const auto dlcIds = AppInfoProvision::collectDlcAppIdsForAddedApps(&complete);
-	if (!complete)
-	{
-		g_pLog->debug(
-		    "PICS: DLC cache snapshot incomplete; retaining existing "
-		    "DLC/package-0 injection\n");
-		return;
-	}
+	if (!complete) return;
 	PackagePatch::setExtraAppIds(dlcIds.package0);
 	Apps::setAddedAppDlcIds(dlcIds.appDlc);
-
-	const auto added = g_config.addedAppIds.get();
 	const auto ids = AppInfoProvision::mergePackage0AppIds(
-	    added, dlcIds.package0);
-	if (ids.empty()) return;
+		g_config.addedAppIds.get(), dlcIds.package0);
+	if (!ids.empty()) (void)OwnerWork::submitHotAdd(ids);
+}
 
-	const auto mode = OwnerWork::submitHotAdd(ids);
-	g_pLog->debug(
-	    "PICS: refreshed DLC/package-0 injection after cold provisioning "
-	    "(package0 DLC=%zu, mode=%s)\n",
-	    dlcIds.package0.size(), OwnerWork::modeName(mode));
+void runRawCacheWorker()
+{
+	for (;;)
+	{
+		std::map<uint32_t, RawCacheItem> batch;
+		{
+			std::lock_guard<std::mutex> lock(g_rawCacheQueueMu);
+			if (g_rawCachePending.empty())
+			{
+				g_rawCacheWorkerActive = false;
+				return;
+			}
+			batch.swap(g_rawCachePending);
+		}
+
+		bool publishedAny = false;
+		std::map<uint32_t, RawCacheItem> deferred;
+		for (auto& [appId, item] : batch)
+		{
+			(void)appId;
+			bool persisted = false;
+			try
+			{
+				persisted = persistAppBuffer(
+					item.appId, item.changeNumber, item.sha, item.buffer,
+					item.publication);
+			}
+			catch (...)
+			{
+				persisted = false;
+			}
+			if (persisted)
+			{
+				publishedAny = true;
+				try { cleanShaderHitCache(item.appId); }
+				catch (...) {}
+			}
+			else
+			{
+				bool recoveryHandled = false;
+				try
+				{
+					const auto probe = AppInfoProvision::probeCache(
+						item.appId,
+						AppInfoProvision::CacheProbeMode::BlockingValidate);
+					if (probe.readiness == AppInfoProvision::CacheReadiness::Fresh ||
+						probe.readiness == AppInfoProvision::CacheReadiness::ValidStale)
+					{
+						recoveryHandled = true;
+					}
+					else
+					{
+						AppInfoProvision::refreshInBackground(
+							item.appinfoVdfPath,
+							{{item.appId, item.changeNumber,
+							  item.publication.generation,
+							  AppInfoProvision::reasonMask(
+								  AppInfoProvision::RefreshReason::CacheRepair),
+							  true, false}});
+						recoveryHandled = true;
+					}
+				}
+				catch (...) {}
+				if (!recoveryHandled)
+					deferred[item.appId] = std::move(item);
+			}
+		}
+		if (publishedAny)
+		{
+			try { refreshDlcInjectionAfterCachePublication(); }
+			catch (...) {}
+		}
+		if (!deferred.empty())
+		{
+			std::lock_guard<std::mutex> lock(g_rawCacheQueueMu);
+			const bool hadConcurrentPending = !g_rawCachePending.empty();
+			for (auto& [appId, item] : deferred)
+			{
+				auto found = g_rawCachePending.find(appId);
+				if (found == g_rawCachePending.end() ||
+					rawCacheItemShouldReplace(
+						found->second.publication.generation,
+						found->second.changeNumber,
+						item.publication.generation, item.changeNumber))
+				{
+					g_rawCachePending[appId] = std::move(item);
+				}
+			}
+			if (rawCacheWorkerShouldContinueAfterDeferral(hadConcurrentPending))
+				continue;
+			g_rawCacheWorkerActive = false;
+			return;
+		}
+	}
+}
+
+bool enqueueRawCacheItems(std::vector<RawCacheItem> items)
+{
+	if (items.empty()) return false;
+	bool startWorker = false;
+	{
+		std::lock_guard<std::mutex> lock(g_rawCacheQueueMu);
+		for (auto& item : items)
+		{
+			auto found = g_rawCachePending.find(item.appId);
+			if (found == g_rawCachePending.end() ||
+				rawCacheItemShouldReplace(
+					found->second.publication.generation,
+					found->second.changeNumber,
+					item.publication.generation,
+					item.changeNumber))
+			{
+				g_rawCachePending[item.appId] = std::move(item);
+			}
+		}
+		if (!g_rawCacheWorkerActive)
+		{
+			g_rawCacheWorkerActive = true;
+			startWorker = true;
+		}
+	}
+	if (!startWorker) return true;
+
+	return ThreadStart::startDetached(
+		[] {
+			ThreadStart::runGuarded(
+				runRawCacheWorker,
+				[] {
+					std::lock_guard<std::mutex> lock(g_rawCacheQueueMu);
+					g_rawCacheWorkerActive = false;
+				},
+				[] {});
+		},
+		[] {
+			std::lock_guard<std::mutex> lock(g_rawCacheQueueMu);
+			g_rawCacheWorkerActive = false;
+		});
 }
 
 } // namespace
@@ -283,6 +424,14 @@ void refreshDlcInjectionAfterColdProvision()
 void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 {
 	if (!resp) return;
+
+	const auto managed = g_config.managedAppIds.get();
+	std::vector<uint32_t> responseAppIds;
+	responseAppIds.reserve(static_cast<std::size_t>(resp->apps_size()));
+	for (int i = 0; i < resp->apps_size(); ++i)
+		responseAppIds.push_back(resp->apps(i).appid());
+	const auto responseManagedApps =
+		selectManagedResponseApps(managed, responseAppIds);
 
 	g_pLog->debug
 	(
@@ -301,27 +450,12 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 	    legacyStaging ? "legacy synchronous + prewarm"
 	                  : "event-driven Steam install plan");
 
-	// A genuinely missing provisioned buffer is the one case that remains
-	// synchronous. During the normal startup pass it is handled before
-	// appinfo.vdf is spliced; this callback-side path remains for a late
-	// hot-add or an interrupted/invalid publication. It runs on this real
-	// Steam worker thread and persists a complete cache pair for the next
-	// setup pass. Never rewrite Steam's live appinfo file from this callback:
-	// its ConfigStore writers do not share our lock and the current process
-	// has already loaded its in-memory map.
+	// Observe and queue only. Missing/invalid pairs are repaired by detached
+	// workers below; no provider, cache write, or filesystem scan may block
+	// Steam's product-info receive thread.
 	const std::string appinfoVdfPath = AppInfoVdf::findExistingPath();
-	std::unordered_set<uint32_t> coldSanitizedApps;
-	std::unordered_set<uint32_t> coldFallbackApps;
-	int coldProvisioned = 0;
-	{
-		BootProf::Span profile(g_pLog.get(), "provision.cold_sync");
-		coldProvisioned = AppInfoProvision::provisionColdStartApps(
-		    appinfoVdfPath, &coldSanitizedApps, false, &coldFallbackApps);
-	}
-	if (coldProvisioned > 0)
-	{
-		refreshDlcInjectionAfterColdProvision();
-	}
+	std::vector<RawCacheItem> rawCacheItems;
+	std::unordered_set<uint32_t> rawCacheRepairs;
 
 	// Rollback-only collection for the old architecture. In normal operation
 	// PICS still persists and supplies product info, but performs no manifest
@@ -374,23 +508,18 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 			// instead — ManifestCode's GetManifestRequestCode /
 			// BYldRequestDepotManifest hooks redirect the actual
 			// manifest request to the pinned gid — so dropping the
-			// product-info rewrite loses nothing.  A successful cold pass already
-			// wrote the normalized provider buffer. Keep this callback's raw
-			// response from overwriting that sanitized pair; a later refresh can
-			// replace it through the same normalization path.
-			if (coldSanitizedApps.count(app->appid()) == 0)
+			// product-info rewrite loses nothing. Copy the exact unmodified response
+			// for off-thread persistence only when it repairs a confirmed miss.
+			const auto probe = AppInfoProvision::probeCache(
+				app->appid(), AppInfoProvision::CacheProbeMode::NonBlockingMemoOnly);
+			if (rawResponseCanRepairCache(true, probe.readiness))
 			{
-				persistAppBuffer(app->appid(), app->change_number(),
-				                 app->sha(), app->buffer());
+				rawCacheItems.push_back({
+					app->appid(), app->change_number(), app->sha(), app->buffer(),
+					appinfoVdfPath,
+					AppInfoProvision::snapshotCachePublication(app->appid())});
+				rawCacheRepairs.insert(app->appid());
 			}
-			else
-			{
-				g_pLog->debug(
-				    "PICS: retaining normalized cold cache for app=%u\n",
-				    app->appid());
-			}
-
-			cleanShaderHitCache(app->appid());
 		}
 
 		if (!legacyStaging)
@@ -550,6 +679,8 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 		// behavior only; event-driven staging never starts the worker.
 		Prewarm::ensureStarted();
 	}
+	const bool rawCacheWorkerAvailable =
+		enqueueRawCacheItems(std::move(rawCacheItems));
 
 	if (resp->unknown_appids_size() > 0)
 	{
@@ -562,10 +693,31 @@ void recvProductInfoResponse(CMsgClientPICSProductInfoResponse* resp)
 		g_pLog->debug("PICS: unknown_appids=[%s]\n", ss.str().c_str());
 	}
 
-	// Existing buffers are refreshed asynchronously from this sanctioned PICS
-	// worker-thread entry point. The worker never runs from setup()/load(); its
-	// output is consumed by AppInfoVdf::injectAllCached on the next Steam start.
-	AppInfoProvision::refreshInBackground(appinfoVdfPath);
+	std::vector<AppInfoProvision::ObservedAppState> observed;
+	observed.reserve(responseManagedApps.size());
+	for (int i = 0; i < resp->apps_size(); ++i)
+	{
+		const auto& app = resp->apps(i);
+		if (responseManagedApps.count(app.appid()) == 0) continue;
+		const auto probe = AppInfoProvision::probeCache(
+			app.appid(), AppInfoProvision::CacheProbeMode::NonBlockingMemoOnly);
+		const auto terminal = AppInfoProvision::observeTerminal(
+			app.appid(), app.change_number());
+		const auto publication =
+			AppInfoProvision::snapshotCachePublication(app.appid());
+		observed.push_back({
+			app.appid(), publication.generation, probe.changeNumber,
+			app.change_number(), probe.readiness, terminal.applies,
+			terminal.changeNumber});
+	}
+	const auto plan = AppInfoProvision::selectRefreshRequests(
+		observed, AppInfoProvision::RefreshReason::PicsProductInfo);
+	const auto refreshRequests = excludeRefreshRequestsForApps(
+		plan.requests,
+		rawCacheWorkerAvailable ? rawCacheRepairs
+		                        : std::unordered_set<uint32_t>{});
+	if (!refreshRequests.empty())
+		AppInfoProvision::refreshInBackground(appinfoVdfPath, refreshRequests);
 
 	// Refresh the safe-mode-hash cache (updates.yaml) off the boot path.
 	// init() served it from disk synchronously so Steam's launch never
@@ -578,13 +730,38 @@ void recvChangesSinceResponse(CMsgClientPICSChangesSinceResponse* resp)
 {
 	if (!resp) return;
 
+	const auto managed = g_config.managedAppIds.get();
+	std::vector<AppInfoProvision::ObservedAppState> managedChanges;
+	std::unordered_set<uint32_t> suppressedSyntheticApps;
+	managedChanges.reserve(static_cast<std::size_t>(resp->app_changes_size()));
+	for (int i = 0; i < resp->app_changes_size(); ++i)
+	{
+		const auto& change = resp->app_changes(i);
+		if (managed.count(change.appid()) == 0) continue;
+		const auto probe = AppInfoProvision::probeCache(
+			change.appid(), AppInfoProvision::CacheProbeMode::NonBlockingMemoOnly);
+		const auto terminal = AppInfoProvision::observeTerminal(
+			change.appid(), change.change_number());
+		const auto publication =
+			AppInfoProvision::snapshotCachePublication(change.appid());
+		managedChanges.push_back({
+			change.appid(), publication.generation, probe.changeNumber,
+			change.change_number(), probe.readiness, terminal.applies,
+			terminal.changeNumber});
+	}
+
 	int stripped = 0;
 	for (int i = resp->app_changes_size() - 1; i >= 0; --i)
 	{
-		if (AppInfoProvision::isSynthesizedApp(resp->app_changes(i).appid()))
+		const uint32_t appId = resp->app_changes(i).appid();
+		// Unmanaged changelist rows can never carry one of our synthetic pairs.
+		// Avoid publication-lock and marker/metadata I/O for Steam's library.
+		if (managed.count(appId) != 0 &&
+			AppInfoProvision::isSynthesizedApp(appId))
 		{
+			suppressedSyntheticApps.insert(appId);
 			g_pLog->debug("PICS: stripping synthetic app %u from changelist\n",
-			              resp->app_changes(i).appid());
+			              appId);
 			resp->mutable_app_changes()->DeleteSubrange(i, 1);
 			++stripped;
 		}
@@ -593,6 +770,34 @@ void recvChangesSinceResponse(CMsgClientPICSChangesSinceResponse* resp)
 	{
 		g_pLog->info("PICS: filtered %d synthetic app(s) from changelist (%d remaining)\n",
 		             stripped, resp->app_changes_size());
+	}
+
+	std::vector<AppInfoProvision::RefreshRequest> refreshRequests;
+	if (resp->force_full_app_update())
+	{
+		refreshRequests.reserve(suppressedSyntheticApps.size());
+		for (const uint32_t appId : suppressedSyntheticApps)
+		{
+			const auto publication =
+				AppInfoProvision::snapshotCachePublication(appId);
+			refreshRequests.push_back({
+				appId, resp->current_change_number(), publication.generation,
+				AppInfoProvision::reasonMask(
+					AppInfoProvision::RefreshReason::ForceFull),
+				true, true});
+		}
+	}
+	else
+	{
+		refreshRequests = markRuntimePublicationForSuppressedApps(
+			AppInfoProvision::selectRefreshRequests(
+				managedChanges, AppInfoProvision::RefreshReason::PicsChanges).requests,
+			suppressedSyntheticApps);
+	}
+	if (!refreshRequests.empty())
+	{
+		const std::string appinfoVdfPath = AppInfoVdf::findExistingPath();
+		AppInfoProvision::refreshInBackground(appinfoVdfPath, refreshRequests);
 	}
 }
 
